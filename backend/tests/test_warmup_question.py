@@ -14,7 +14,6 @@ The tests stay 100% backward-compatible: legacy sessions without a
 
 from __future__ import annotations
 
-import os
 
 from candidate.service import next_question_payload
 from utils.warmup import (

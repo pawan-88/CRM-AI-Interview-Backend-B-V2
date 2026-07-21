@@ -14,7 +14,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params, role_required
+from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params
 from models import (
     Opportunity,
     OpportunityActivityLog,

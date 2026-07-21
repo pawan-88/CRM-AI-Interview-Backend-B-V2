@@ -616,7 +616,7 @@ def _expand_skill_aliases(skills: List[str]) -> List[str]:
 
 def rewrite_generic_as_scenario(question: str, skill: str, difficulty: str) -> str:
     """Attempt to rewrite a generic question as a scenario-based one."""
-    q = (question or "").strip()
+    (question or "").strip()
     sk = (skill or "").strip()
     diff = (difficulty or "medium").strip().lower()
 

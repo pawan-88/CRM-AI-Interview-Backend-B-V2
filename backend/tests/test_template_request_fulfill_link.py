@@ -1,9 +1,7 @@
 """Template-request opportunity link + fulfill stamps job template opportunityId."""
 from __future__ import annotations
 
-from datetime import date
-from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI

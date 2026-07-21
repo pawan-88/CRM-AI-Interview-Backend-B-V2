@@ -11,11 +11,11 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, gated_read, gated_write, get_crm_db, get_current_user,
-    page_params, require_access, role_required,
+    CurrentUser, PageParams, gated_write, get_crm_db, get_current_user,
+    page_params, require_access,
 )
 from models import (
-    AttendanceStatus, Employee, EntryLocation, Invoice, InvoiceLine, PaymentStatus, Project,
+    Employee, EntryLocation, Invoice, InvoiceLine, PaymentStatus, Project,
     ProjectEmployee, PurchaseOrder, Timesheet, TimesheetActivityLog, TimesheetAttachment,
     TimesheetEntry, TimesheetStatus,
 )
@@ -31,10 +31,10 @@ from services.notify import notify_role, notify_user
 from services.timesheets import (
     accrue_comp_off, approvals_report_rows, attachment_out, build_generated_entry,
     compute_billables, day_name, due_report_rows, effective_billing_policy,
-    employee_display_name, employee_for_user, entry_out, for_submission_report_rows,
+    employee_for_user, entry_out, for_submission_report_rows,
     get_timesheet_or_404, holidays_for_project_period, linked_invoice_for, list_attachments,
     month_days, period_label, resolve_entry_fields, timesheet_detail_out,
-    timesheet_invoice_preview, timesheet_out, timesheet_report_out, timesheet_summary, _due_rows,
+    timesheet_invoice_preview, timesheet_out, timesheet_summary, _due_rows,
 )
 
 router = APIRouter(prefix="/api/timesheets", tags=["CRM: Timesheets"])

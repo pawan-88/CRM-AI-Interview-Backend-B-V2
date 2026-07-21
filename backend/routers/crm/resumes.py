@@ -20,7 +20,7 @@ from schemas.common import envelope
 from schemas.resumes import AI_INTERVIEW_STATUS_VALUES, ATS_STATUS_VALUES, ResumeScanResult
 from services.ai_interview_bridge import ai_interview_autosend_enabled, schedule_l1_interview
 from services.candidate_comms import interview_link_message, notify_candidate
-from services.crm_common import log_activity, paginate, save_upload, save_upload_hashed
+from services.crm_common import log_activity, paginate, save_upload_hashed
 from services.requirements import get_requirement_or_404
 from services.resumes import enrich_resumes_with_ai, run_ats_scan, serialize_resume
 from services.slot_booking import (

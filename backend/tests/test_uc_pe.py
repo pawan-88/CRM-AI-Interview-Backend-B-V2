@@ -83,7 +83,7 @@ from services.timesheets import (                                      # noqa: E
     month_days, day_name,
 )
 from services.finance import (                                         # noqa: E402
-    assert_po_allows_new_drawdown, active_po_allocation_for_project,
+    assert_po_allows_new_drawdown,
 )
 from fastapi import HTTPException                                       # noqa: E402
 
@@ -593,8 +593,8 @@ def test_uc11_carry_forward_cap_and_expiry(db, s):
 def test_uc12_group_by_employee(db, s):
     from services.project_employees import group_pe_rows_by_employee
 
-    pe1 = _map_pe(db, s.avinash, s.proj_x, onboarding=date(2026, 7, 1), rate="8000")
-    pe3 = _map_pe(db, s.avinash, s.proj_y, onboarding=date(2026, 1, 1), rate="10000")
+    _map_pe(db, s.avinash, s.proj_x, onboarding=date(2026, 7, 1), rate="8000")
+    _map_pe(db, s.avinash, s.proj_y, onboarding=date(2026, 1, 1), rate="10000")
 
     rows = db.execute(ProjectEmployee.__table__.select().where(
         ProjectEmployee.employee_id == s.avinash.id)).fetchall()

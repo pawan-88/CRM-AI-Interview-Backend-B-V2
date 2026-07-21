@@ -2,7 +2,6 @@
 
 import importlib
 
-import pytest
 from fastapi.responses import JSONResponse
 
 

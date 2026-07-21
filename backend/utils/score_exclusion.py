@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
 
 from ai import (
     answer_turn_is_valid_for_scoring,

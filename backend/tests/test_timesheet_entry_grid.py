@@ -55,7 +55,7 @@ from crm_deps import CurrentUser  # noqa: E402
 import routers.crm.timesheets as ts_router  # noqa: E402
 from services.timesheets import (  # noqa: E402
     attendance_from_hours_worked, classify_calendar_day, display_billable_day,
-    effective_billing_policy, month_days, resolve_entry_fields, timesheet_summary,
+    resolve_entry_fields, timesheet_summary,
 )
 
 

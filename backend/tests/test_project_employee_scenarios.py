@@ -12,7 +12,6 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 from services import project_employee_billing as eng
 from services.project_employee_leave_credit import (

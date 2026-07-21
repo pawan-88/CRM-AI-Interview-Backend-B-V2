@@ -609,7 +609,7 @@ def patch_branch_holiday_year(branch_id: int, year_id: int, body: _HolidayYearPa
                               db: Session = Depends(get_crm_db),
                               user: CurrentUser = Depends(write_branch_policy)):
     from models import BranchHolidayYear
-    from services.branch_policy import branch_holiday_years, ensure_year_editable
+    from services.branch_policy import branch_holiday_years
     row = db.get(BranchHolidayYear, year_id)
     if row is None or row.branch_id != branch_id:
         raise HTTPException(status_code=404, detail="Holiday year not found")

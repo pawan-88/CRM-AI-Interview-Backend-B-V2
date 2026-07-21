@@ -13,8 +13,6 @@ structurally); the extension fields live in the CRM `user_profiles` table.
 """
 from __future__ import annotations
 
-import hmac
-import os
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile

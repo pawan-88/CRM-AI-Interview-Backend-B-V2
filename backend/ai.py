@@ -2786,7 +2786,7 @@ def _enrich_summary_from_transcript(result: dict, questions: List[str], answers:
     weak: List[str] = []
     for i, q in enumerate(qs[:12]):
         a = (ans[i] or "").strip()
-        ql = (q or "").lower()
+        (q or "").lower()
         if not answer_turn_is_valid_for_scoring(a):
             continue
         profile = _answer_signal_profile(a)

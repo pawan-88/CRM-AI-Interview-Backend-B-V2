@@ -50,7 +50,6 @@ from models.customers import BranchHolidayYear, Customer, CustomerBranch  # noqa
 from models.leave import Holiday, HolidayName  # noqa: E402
 from models.opportunities import Opportunity, OppType  # noqa: E402
 from models.projects import Project  # noqa: E402
-from models.hr import Employee  # noqa: E402
 from models.timesheets import AttendanceStatus, DayType  # noqa: E402
 
 import crm_deps  # noqa: E402

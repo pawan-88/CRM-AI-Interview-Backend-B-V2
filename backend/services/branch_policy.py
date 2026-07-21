@@ -18,8 +18,7 @@ The resolver maps them explicitly so callers see one canonical shape.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session

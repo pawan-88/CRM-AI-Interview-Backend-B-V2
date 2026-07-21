@@ -13,7 +13,6 @@ Run:  python -m pytest tests/test_branch_e2e.py -q
 """
 from __future__ import annotations
 
-from datetime import date
 from decimal import Decimal
 
 import pytest

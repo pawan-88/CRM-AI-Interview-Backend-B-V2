@@ -344,7 +344,7 @@ def ats_score(
         return scores[cache_key]
 
     text_lower = doc.lower()
-    jd_lower = (jd_text or "").lower()
+    (jd_text or "").lower()
 
     # Keyword matching: exact hits in resume+answers, weighted by required skills.
     matched_exact: list[str] = []

@@ -22,7 +22,6 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import psycopg2
 
 from paths import ROOT_DIR
 

@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 from crm_deps import CurrentUser, get_crm_db, role_required
 from models import Requirement, RequirementActivityLog, RequirementStatus, Resume
 from schemas.common import envelope
-from services.crm_common import log_activity, save_upload, save_upload_hashed
+from services.crm_common import log_activity, save_upload_hashed
 
 router = APIRouter(tags=["CRM: Apply"])
 

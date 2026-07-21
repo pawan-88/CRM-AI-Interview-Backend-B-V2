@@ -8,7 +8,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params, role_required,
+    CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params,
 )
 from models import (
     Customer, CustomerLeavePolicy, Employee, Project, ProjectCommunicationMatrix,

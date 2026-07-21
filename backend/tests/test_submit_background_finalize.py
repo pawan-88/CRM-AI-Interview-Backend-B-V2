@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import copy
-from unittest.mock import MagicMock
 
-import pytest
 
 from main import _append_pending_answer_on_submit, _background_finalize_report
 
@@ -38,7 +36,7 @@ def test_background_finalize_calls_evaluate(monkeypatch):
     monkeypatch.setattr("main.append_from_evaluation", lambda *a, **k: None)
     monkeypatch.setattr("main.get_interview_record_payload", lambda *a, **k: None)
     monkeypatch.setattr("main._persist_interview_progress", lambda *a, **k: None)
-    monkeypatch.setattr("main.upsert_hr_record", lambda *a, **k: None)
+    monkeypatch.setattr("main._persist_hr_record_mirror", lambda *a, **k: None)
     monkeypatch.setattr("main.upsert_interview_record_snapshot", lambda *a, **k: None)
     monkeypatch.setattr("main.invalidate_hr_dashboard_cache", lambda *a, **k: None)
 

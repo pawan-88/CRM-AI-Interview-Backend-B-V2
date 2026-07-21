@@ -59,14 +59,6 @@ def test_ensure_question_sw_fills_high_score_weaknesses(monkeypatch):
 
 def test_ensure_question_sw_skipped_template(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "")
-    item = {
-        "question_index": 3,
-        "question": "UDS?",
-        "answer": "skip",
-        "question_strengths": [],
-        "question_weaknesses": [],
-        "score": 0,
-    }
     out = attach_strengths_weaknesses_analysis(
         {"per_question": [{"score": 0, "strengths": [], "weaknesses": []}]},
         ["UDS?"],

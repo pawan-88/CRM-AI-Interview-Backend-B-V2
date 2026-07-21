@@ -55,7 +55,6 @@ from ai import (
     generate_followup_fallback,
     generate_followup_with_model,
     generate_questions_fallback,
-    generate_questions_with_model,
     detect_skill_from_question,
     question_matches_skill,
     question_too_similar,
@@ -127,7 +126,6 @@ from auth_db import (
     set_hr_candidate_decision,
     upsert_master_value,
     update_interview_hr_status,
-    mark_interview_progress_report_status,
     upsert_interview_record_snapshot,
     upsert_interview_progress,
     verify_login,
@@ -139,14 +137,12 @@ from hr.repository import (
     delete_records_for_candidate,
     list_records_for_candidate,
     load_hr_records,
-    upsert_hr_record,
     upsert_hr_record_async,
 )
 from email_smtp import send_interview_invite_email, send_password_reset_email, smtp_configured
 from hr.service import (
     build_hr_records_summary,
     build_report_record,
-    build_submitted_record,
     find_hr_record,
 )
 from candidate.service import next_question_payload
@@ -179,17 +175,9 @@ from utils.warmup import (
     inject_warmup,
     is_warmup_index,
     stamp_introduction_question_types,
-    warmup_enabled,
 )
 from prompt_logger import (
     init_prompt_log_table,
-    query_prompt_logs,
-    get_prompt_log_by_id,
-    get_token_usage_stats,
-    cleanup_old_file_logs,
-    cleanup_old_db_logs,
-    get_distinct_values,
-    prompt_logger_status,
 )
 import response_cache
 import password_hashing as pwh
@@ -1398,7 +1386,7 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         show_spoken_text = bool(invite_cfg.get("show_spoken_text"))
     else:
         show_spoken_text = bool((job or {}).get("enableTranscriptInput", (job or {}).get("showSpokenText", False)))
-    coach = coach_hints_text()
+    coach_hints_text()
 
     exp_min = int((job or {}).get("expMin") or 0)
     exp_max = int((job or {}).get("expMax") or 0)
@@ -2650,7 +2638,7 @@ async def setup(
         }
 
     warning = ""
-    coach = coach_hints_text()
+    coach_hints_text()
     num_q = clamp_count_mode_questions(num_q or 1)
     pool_q = pool_questions_for_timing(num_q, timing_mode_val, time_limit_sec=time_limit_sec_val)
     setup_domains: list[str] = []
@@ -5534,7 +5522,7 @@ async def template_sample_questions(
 
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     has_ai = bool(api_key and api_key != "your_key_here")
-    coach = coach_hints_text()
+    coach_hints_text()
     model = str(os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
     safe_mode_on = str(os.getenv("INTERVIEW_SAFE_MODE", "false")).lower() in {"1", "true", "yes", "on"}
     resolved_domains = _resolve_domain_titles([str(cid).strip() for cid in cat_ids if str(cid).strip()])
@@ -7386,7 +7374,7 @@ def interview_integrity_logs(request: Request):
     logs = []
     terminated = []
     for full in rows:
-        violation_count = int(full.get("violation_count") or 0)
+        int(full.get("violation_count") or 0)
         events = _parse_violations_log(full.get("violations_log"))
         policy_violation_count = _count_integrity_violations(events)
         tab_switch_count = sum(

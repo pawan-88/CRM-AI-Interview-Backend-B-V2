@@ -6,7 +6,6 @@ top, per tab/field. Admin/CEO always resolve to FULL (unrestricted).
 """
 from __future__ import annotations
 
-import json
 
 from fastapi import HTTPException
 from sqlalchemy import select
