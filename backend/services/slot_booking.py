@@ -1,0 +1,197 @@
+"""Shared automated-pipeline services: candidate creation from a resume,
+profile bootstrap, slot-booking invites and the ATS auto-threshold hook.
+
+Used by routers/crm/resumes.py (manual scheduling + scan hooks) and
+routers/crm/slots.py (public booking confirmation) so the find-or-create
+logic lives in exactly one place.
+"""
+from __future__ import annotations
+
+import logging
+import secrets
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from models import (
+    AtsStatus, Candidate, CandidateProfile, InterviewSlot, PipelineStatus, Requirement,
+    RequirementActivityLog, Resume, SlotBooking,
+)
+from services.candidate_comms import notify_candidate, slot_invite_message
+from services.crm_common import get_app_setting, log_activity
+from services.notify import notify_role
+
+logger = logging.getLogger("karnex.crm.slot_booking")
+
+BOOKING_PATH_PREFIX = "/book/"
+
+
+# ------------------------------------------------------- candidate / profile
+
+def split_candidate_name(full_name: str) -> tuple[str, str | None]:
+    parts = (full_name or "").strip().split(None, 1)
+    if not parts:
+        return "Unknown", None
+    return parts[0], (parts[1] if len(parts) > 1 else None)
+
+
+def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candidate:
+    """Match an existing Candidate by email (or full name when no email),
+    else create one. candidates.email is NOT NULL + unique, so a placeholder
+    is synthesized when the resume has no email. Flushes; caller commits."""
+    candidate = None
+    email = (resume.email or "").strip().lower()
+    first, last = split_candidate_name(resume.candidate_name)
+    if email:
+        candidate = db.execute(
+            select(Candidate).where(func.lower(Candidate.email) == email)
+        ).scalars().first()
+    else:
+        stmt = select(Candidate).where(func.lower(Candidate.first_name) == first.lower())
+        if last:
+            stmt = stmt.where(func.lower(func.coalesce(Candidate.last_name, "")) == last.lower())
+        candidate = db.execute(stmt).scalars().first()
+    if candidate is not None:
+        return candidate
+    candidate = Candidate(
+        first_name=first,
+        last_name=last,
+        email=email or f"resume-{resume.id}@noemail.karnex.local",
+        phone=resume.phone,
+        cv_url=resume.resume_file_url,
+    )
+    db.add(candidate)
+    db.flush()
+    return candidate
+
+
+def get_or_create_profile(db: Session, candidate: Candidate,
+                          requirement: Requirement) -> CandidateProfile:
+    """Profile for (candidate, requirement.opportunity) — created in
+    Technical_Screening (or bumped from Sourcing). Flushes; caller commits."""
+    profile = db.execute(
+        select(CandidateProfile).where(
+            CandidateProfile.candidate_id == candidate.id,
+            CandidateProfile.opportunity_id == requirement.opportunity_id,
+        )
+    ).scalars().first()
+    if profile is None:
+        profile = CandidateProfile(
+            candidate_id=candidate.id,
+            opportunity_id=requirement.opportunity_id,
+            expected_ctc=candidate.expected_ctc,
+            pipeline_status=PipelineStatus.TECHNICAL_SCREENING,
+        )
+        db.add(profile)
+        db.flush()
+    elif profile.pipeline_status == PipelineStatus.SOURCING:
+        profile.pipeline_status = PipelineStatus.TECHNICAL_SCREENING
+    return profile
+
+
+# ------------------------------------------------------------- slot booking
+
+def get_or_create_booking(db: Session, resume: Resume) -> SlotBooking:
+    """One SlotBooking per resume; token is an opaque urlsafe secret.
+    Flushes; caller commits."""
+    booking = db.execute(
+        select(SlotBooking).where(SlotBooking.resume_id == resume.id)
+    ).scalars().first()
+    if booking is not None:
+        return booking
+    booking = SlotBooking(
+        token=secrets.token_urlsafe(24),
+        resume_id=resume.id,
+        requirement_id=resume.requirement_id,
+        candidate_id=resume.candidate_id,
+    )
+    db.add(booking)
+    db.flush()
+    return booking
+
+
+def booking_url_for(base_url: str, booking: SlotBooking) -> str:
+    return f"{(base_url or '').rstrip('/')}{BOOKING_PATH_PREFIX}{booking.token}"
+
+
+def send_slot_invite(db: Session, resume: Resume, requirement: Requirement,
+                     base_url: str) -> tuple[SlotBooking, dict]:
+    """Create the booking (if missing) and send the slot-invite message to the
+    candidate's email/WhatsApp. Returns (booking, per-channel results).
+    Flushes; caller commits."""
+    booking = get_or_create_booking(db, resume)
+    url = booking_url_for(base_url, booking)
+    msg = slot_invite_message(resume.candidate_name, requirement.title, url)
+    results = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"])
+    return booking, results
+
+
+def upcoming_open_slots(db: Session, requirement_id: int) -> list[InterviewSlot]:
+    """Future slots on the requirement that still have capacity left."""
+    return db.execute(
+        select(InterviewSlot)
+        .where(
+            InterviewSlot.requirement_id == requirement_id,
+            InterviewSlot.slot_at > func.now(),
+            InterviewSlot.booked_count < InterviewSlot.capacity,
+        )
+        .order_by(InterviewSlot.slot_at.asc())
+    ).scalars().all()
+
+
+# ------------------------------------------------------ ATS threshold hook
+
+def auto_pipeline_after_scan(db: Session, resume: Resume, requirement: Requirement,
+                             user_id: int, base_url: str = "") -> dict:
+    """ATS auto-threshold hook, called right after a successful scan.
+
+    When ats_auto_invite is enabled and the score clears ats_auto_threshold:
+      * auto-shortlist the resume (Scored -> Shortlisted) + activity log,
+      * create the slot booking and send the invite (email/WhatsApp) when the
+        resume has contact info; otherwise notify TA to follow up manually.
+
+    NEVER raises — the scan result must be returned normally regardless.
+    Returns {"auto_shortlisted": bool, "slot_invite_sent": bool, ...details}.
+    """
+    info: dict = {"auto_shortlisted": False, "slot_invite_sent": False}
+    try:
+        if (get_app_setting(db, "ats_auto_invite", "true") or "").strip().lower() != "true":
+            return info
+        try:
+            threshold = float(get_app_setting(db, "ats_auto_threshold", "50") or "50")
+        except (TypeError, ValueError):
+            threshold = 50.0
+        if resume.ats_score is None or float(resume.ats_score) < threshold:
+            return info
+        if resume.ats_status != AtsStatus.SCORED:
+            return info
+
+        resume.ats_status = AtsStatus.SHORTLISTED
+        resume.screened_by = resume.screened_by or user_id
+        info["auto_shortlisted"] = True
+        score = float(resume.ats_score)
+        log_activity(db, RequirementActivityLog, "requirement_id", requirement.id, user_id,
+                     "ATS_AUTO_SHORTLISTED",
+                     f"ATS_AUTO_SHORTLISTED (score {score:g}%) — {resume.candidate_name} "
+                     f"cleared the auto threshold ({threshold:g}%)")
+
+        if (resume.email or "").strip() or (resume.phone or "").strip():
+            booking, results = send_slot_invite(db, resume, requirement, base_url)
+            channels = [ch for ch, res in results.items() if res.get("sent")]
+            info["slot_invite_sent"] = bool(channels)
+            info["booking_id"] = booking.id
+            info["notified"] = results
+            log_activity(db, RequirementActivityLog, "requirement_id", requirement.id, user_id,
+                         "SLOT_INVITE_SENT",
+                         f"SLOT_INVITE_SENT ({'/'.join(channels) if channels else 'no channel delivered'}) "
+                         f"to {resume.candidate_name} — booking #{booking.id}")
+        else:
+            notify_role(db, "TA",
+                        f"Auto-shortlisted, manual follow-up needed: {resume.candidate_name}",
+                        f"ATS score {score:g}% cleared the auto threshold but the resume has "
+                        f"no email/phone — send the slot invite manually.",
+                        f"/admin?view=crm&p=requirements/{requirement.id}")
+    except Exception as exc:  # pragma: no cover — must never break the scan
+        logger.error("ATS auto-pipeline hook failed for resume %s: %s", resume.id, exc)
+        info["error"] = str(exc)
+    return info

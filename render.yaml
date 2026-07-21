@@ -7,8 +7,10 @@ services:
     runtime: docker
     plan: free
     region: oregon
-    healthCheckPath: /health/live
+    healthCheckPath: /health/ready
     envVars:
+      - key: KARNEX_ENV
+        value: production
       - key: UVICORN_WORKERS
         value: "1"
       - key: PROMPT_LOG_ENABLED
@@ -18,7 +20,7 @@ services:
       - key: SMTP_ENABLED
         value: "false"
       - key: ALLOW_PUBLIC_HR_REGISTRATION
-        value: "true"
+        value: "false"
       - key: AUTH_SECRET
         generateValue: true
       - key: REPORT_CODE

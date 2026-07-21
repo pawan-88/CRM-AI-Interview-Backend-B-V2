@@ -1,0 +1,57 @@
+"""Resume / ATS pipeline table."""
+from __future__ import annotations
+
+import enum
+
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import relationship
+
+from models.base import Base, USERS_FK, pg_enum
+
+
+class AtsStatus(str, enum.Enum):
+    PENDING_SCAN = "Pending_Scan"
+    SCORED = "Scored"
+    SHORTLISTED = "Shortlisted"
+    REJECTED = "Rejected"
+
+
+class AiInterviewStatus(str, enum.Enum):
+    NOT_SCHEDULED = "Not_Scheduled"
+    SCHEDULED = "Scheduled"
+    COMPLETED = "Completed"
+    PASSED = "Passed"
+    FAILED = "Failed"
+
+
+class Resume(Base):
+    __tablename__ = "resumes"
+    id = sa.Column(sa.Integer, primary_key=True)
+    requirement_id = sa.Column(sa.Integer, sa.ForeignKey("requirements.id"), nullable=False, index=True)
+    candidate_id = sa.Column(sa.Integer, sa.ForeignKey("candidates.id"), nullable=True, index=True)
+    candidate_name = sa.Column(sa.String(255), nullable=False)
+    email = sa.Column(sa.String(255), nullable=True)
+    phone = sa.Column(sa.String(32), nullable=True)
+    source_portal = sa.Column(sa.String(64), nullable=True)
+    applicant_experience = sa.Column(sa.String(64), nullable=True)  # self-reported years, from apply form
+    # Extended fields captured by the public apply form (education, notice period,
+    # technical domain, skills, current/expected CTC, preferred location, ...).
+    application_details = sa.Column(JSONB, nullable=True)
+    resume_file_url = sa.Column(sa.String(1024), nullable=False)
+    # SHA-256 of the uploaded file bytes — integrity (verify on read) + dedupe.
+    file_sha256 = sa.Column(sa.String(64), nullable=True, index=True)
+    file_size = sa.Column(sa.Integer, nullable=True)
+    received_date = sa.Column(sa.Date, server_default=sa.func.current_date(), nullable=False)
+    ats_score = sa.Column(sa.Numeric(5, 2), nullable=True)
+    ats_score_breakdown = sa.Column(JSONB, nullable=True)
+    ats_status = sa.Column(pg_enum(AtsStatus, "ats_status"), nullable=False,
+                           server_default=AtsStatus.PENDING_SCAN.value, index=True)
+    screened_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    ai_interview_status = sa.Column(pg_enum(AiInterviewStatus, "ai_interview_status"), nullable=False,
+                                    server_default=AiInterviewStatus.NOT_SCHEDULED.value)
+    ai_interview_scheduled_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+
+    requirement = relationship("Requirement")
+    candidate = relationship("Candidate")

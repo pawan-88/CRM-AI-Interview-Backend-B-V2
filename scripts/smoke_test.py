@@ -30,7 +30,7 @@ def post_form(path: str, payload: dict[str, str], token: str = "") -> dict:
         method="POST",
         headers=headers,
     )
-    with urlopen(req, timeout=20) as resp:
+    with urlopen(req, timeout=300) as resp:
         raw = resp.read().decode("utf-8")
     return json.loads(raw)
 
@@ -40,7 +40,7 @@ def get_json(path: str, token: str = "") -> dict:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = Request(f"{BASE_URL}{path}", method="GET", headers=headers)
-    with urlopen(req, timeout=20) as resp:
+    with urlopen(req, timeout=300) as resp:
         raw = resp.read().decode("utf-8")
     return json.loads(raw)
 

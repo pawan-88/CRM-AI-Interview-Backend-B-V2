@@ -27,6 +27,7 @@ set "LOGDIR=%ROOT%logs"
 
 if exist "%ROOT%.env" (
   for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b /i "FRONTEND_DIR=" "%ROOT%.env" 2^>nul`) do set "FRONTEND_DIR=%%B"
+  for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b /i "PUBLIC_BASE_URL=" "%ROOT%.env" 2^>nul`) do set "PUBLIC_BASE_URL=%%B"
 )
 if not defined FRONTEND_DIR (
   if exist "%ROOT%frontend\index.html" (
@@ -118,6 +119,14 @@ if /I "%MODE%"=="http" if exist "%LOGDIR%\server.log" (
   if exist "%LOGDIR%\server.log" ren "%LOGDIR%\server.log" server.log.bak >nul 2>&1
 )
 
+echo Applying database migrations (alembic upgrade head)...
+pushd "%BACKEND%"
+python -m alembic upgrade head
+if errorlevel 1 (
+  echo WARNING: Database migration failed. CRM APIs may return 500 until fixed.
+)
+popd
+
 echo Starting backend (%SCHEME%) on port %PORT%...
 if /I "%MODE%"=="https" (
   start "karnex AI HR Backend" /min cmd /c ""%ROOT%scripts\run_backend.cmd" "%BACKEND%" %PORT% "!LOGFILE!" https "%CERTDIR%""
@@ -154,7 +163,15 @@ for /f "usebackq delims=" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass
 
 if "%OPEN_BROWSER%"=="1" (
   echo Opening app in browser...
-  if defined LAN_IP (
+  if defined PUBLIC_BASE_URL (
+    if /I not "!PUBLIC_BASE_URL!"=="auto" (
+      start "" "!PUBLIC_BASE_URL!"
+    ) else if defined LAN_IP (
+      start "" "%SCHEME%://%LAN_IP%:%PORT%"
+    ) else (
+      start "" "%SCHEME%://127.0.0.1:%PORT%"
+    )
+  ) else if defined LAN_IP (
     start "" "%SCHEME%://%LAN_IP%:%PORT%"
   ) else (
     start "" "%SCHEME%://127.0.0.1:%PORT%"
@@ -163,9 +180,19 @@ if "%OPEN_BROWSER%"=="1" (
 
 echo.
 echo Backend ready.
+if defined PUBLIC_BASE_URL (
+  if /I not "!PUBLIC_BASE_URL!"=="auto" (
+    echo Network URL: !PUBLIC_BASE_URL!
+  )
+)
 echo Local URL:  %SCHEME%://127.0.0.1:%PORT%
 if defined LAN_IP echo LAN URL:     %SCHEME%://%LAN_IP%:%PORT%
 echo Admin:      %SCHEME%://127.0.0.1:%PORT%/admin
+if defined PUBLIC_BASE_URL (
+  if /I not "!PUBLIC_BASE_URL!"=="auto" (
+    echo Admin LAN: "!PUBLIC_BASE_URL!/admin"
+  )
+)
 echo Logs:       !LOGFILE!
 echo.
 echo Build UI first from frontend repo:  cd ..\AI-Interview-Model-F-V2 ^& start_frontend.bat

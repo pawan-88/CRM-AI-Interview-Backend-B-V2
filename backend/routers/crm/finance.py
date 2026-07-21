@@ -1,0 +1,775 @@
+"""Finance module: purchase orders, allocations, invoices, payments, TDS.
+
+Writes: Finance (Admin implicit). Reads: Finance + Sales_Head.
+All GST/TDS math and balance mutations go through services/tax.py.
+"""
+from __future__ import annotations
+
+from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params
+from models import (
+    Customer,
+    Invoice,
+    InvoiceLine,
+    InvoicePayment,
+    PaymentStatus,
+    POProjectAllocation,
+    POStatus,
+    Project,
+    PurchaseOrder,
+    TdsPayment,
+    TdsRecord,
+    TdsStatus,
+)
+from schemas.common import envelope
+from schemas.finance import (
+    AllocationHsnUpdate,
+    AllocationIn,
+    InvoiceCreate,
+    InvoiceUpdate,
+    PaymentIn,
+    ProjectCreatePOIn,
+    PurchaseOrderCreate,
+    PurchaseOrderUpdate,
+    TdsCreateIn,
+    TdsPaymentIn,
+)
+from services import tax
+from services.crm_common import next_sequence_number, paginate, save_upload
+from services.finance import (
+    apply_gst_split,
+    assert_po_allows_new_drawdown,
+    ensure_unique_invoice_number,
+    ensure_unique_po_number,
+    fetch_po_activity_log,
+    get_invoice_or_404,
+    get_po_or_404,
+    get_project_or_404,
+    log_invoice_created_on_po,
+    log_po_activity,
+    po_invoice_rows,
+    primary_branch,
+    primary_contact,
+    serialize_allocation,
+    serialize_invoice,
+    serialize_payment,
+    serialize_po,
+    serialize_tds,
+    serialize_tds_payment,
+    validate_branch,
+    validate_contact,
+    validate_customer,
+)
+from services.invoice_pdf import generate_invoice_pdf
+
+router = APIRouter(prefix="/api", tags=["CRM: Finance"])
+
+PO_WRITE = gated_write("pos", "Finance")
+PO_READ = gated_read("pos", "Finance", "Sales_Head")
+INV_WRITE = gated_write("invoices", "Finance")
+INV_READ = gated_read("invoices", "Finance", "Sales_Head")
+TDS_READ = gated_read("tds", "Finance")
+
+
+def _enum_or_400(enum_cls, value: str, field: str):
+    try:
+        return enum_cls(value)
+    except ValueError:
+        allowed = ", ".join(m.value for m in enum_cls)
+        raise HTTPException(status_code=400, detail=f"Invalid {field} '{value}'. Allowed: {allowed}")
+
+
+def _status_value(status) -> str:
+    return status.value if hasattr(status, "value") else str(status)
+
+
+# ===========================================================================
+# Purchase orders
+# ===========================================================================
+
+@router.post("/purchase-orders")
+def create_purchase_order(body: PurchaseOrderCreate, db: Session = Depends(get_crm_db),
+                          user: CurrentUser = Depends(PO_WRITE)):
+    validate_customer(db, body.customer_id)
+    validate_branch(db, body.customer_id, body.billing_branch_id)
+    validate_branch(db, body.customer_id, body.delivery_branch_id)
+    validate_contact(db, body.customer_id, body.contact_person_id)
+
+    po_number = (body.po_number or "").strip() or next_sequence_number(
+        db, PurchaseOrder, PurchaseOrder.po_number, "PO")
+    ensure_unique_po_number(db, po_number)
+
+    po = PurchaseOrder(
+        po_number=po_number,
+        customer_id=body.customer_id,
+        billing_branch_id=body.billing_branch_id,
+        delivery_branch_id=body.delivery_branch_id,
+        received_date=body.received_date,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        contact_person_id=body.contact_person_id,
+        po_type=body.po_type,
+        payment_terms=body.payment_terms,
+        terms_conditions=body.terms_conditions,
+        tax_slab=body.tax_slab,
+        total_value=body.total_value,
+        consumed_value=Decimal("0"),
+        balance_value=body.total_value,  # total - consumed(0)
+        status=POStatus.ACTIVE,
+    )
+    apply_gst_split(po, body.inter_state)
+    db.add(po)
+    db.flush()
+    log_po_activity(db, po.id, user.id, "PO_CREATED",
+                    comment=f"Purchase order {po.po_number} created")
+    db.commit()
+    db.refresh(po)
+    return envelope(serialize_po(po, detail=True, db=db), "Purchase order created")
+
+
+@router.get("/purchase-orders")
+def list_purchase_orders(status: str | None = None, customer_id: int | None = None,
+                         pp: PageParams = Depends(page_params),
+                         db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(PO_READ)):
+    stmt = select(PurchaseOrder)
+    if status:
+        stmt = stmt.where(PurchaseOrder.status == _enum_or_400(POStatus, status, "status"))
+    if customer_id is not None:
+        stmt = stmt.where(PurchaseOrder.customer_id == customer_id)
+    if pp.search:
+        stmt = stmt.where(PurchaseOrder.po_number.ilike(f"%{pp.search}%"))
+    stmt = stmt.order_by(PurchaseOrder.id.desc())
+    items, meta = paginate(db, stmt, pp.page, pp.limit)
+    return envelope([serialize_po(po) for po in items], meta=meta)
+
+
+# NOTE: this static route MUST be declared before GET /purchase-orders/{po_id}
+# below, otherwise FastAPI would try to match "reports" as po_id (422).
+@router.get("/purchase-orders/reports/expiry")
+def po_expiry_report(db: Session = Depends(get_crm_db), user: CurrentUser = Depends(PO_READ)):
+    """Active POs past (expired) or within 30 days of (expiring_soon) their end_date.
+
+    Reporting-only: PO status is never auto-flipped (POStatus enum unchanged).
+    """
+    today = date.today()
+    horizon = today + timedelta(days=30)
+    rows = db.execute(
+        select(PurchaseOrder, Customer.name)
+        .join(Customer, Customer.id == PurchaseOrder.customer_id)
+        .where(
+            PurchaseOrder.status == POStatus.ACTIVE,
+            PurchaseOrder.end_date.is_not(None),
+            PurchaseOrder.end_date <= horizon,
+        )
+        .order_by(PurchaseOrder.end_date, PurchaseOrder.id)
+    ).all()
+
+    expired: list[dict] = []
+    expiring_soon: list[dict] = []
+    for po, customer_name in rows:
+        row = {
+            "id": po.id,
+            "po_number": po.po_number,
+            "customer_name": customer_name,
+            "end_date": po.end_date.isoformat(),
+            "balance_value": float(po.balance_value) if po.balance_value is not None else None,
+            "total_value": float(po.total_value) if po.total_value is not None else None,
+        }
+        if po.end_date < today:
+            row["days_overdue"] = (today - po.end_date).days
+            expired.append(row)
+        else:
+            row["days_left"] = (po.end_date - today).days
+            expiring_soon.append(row)
+    return envelope({"expired": expired, "expiring_soon": expiring_soon})
+
+
+@router.get("/purchase-orders/{po_id}")
+def get_purchase_order(po_id: int, db: Session = Depends(get_crm_db),
+                       user: CurrentUser = Depends(PO_READ)):
+    po = get_po_or_404(db, po_id)
+    return envelope(serialize_po(po, detail=True, db=db))
+
+
+@router.put("/purchase-orders/{po_id}")
+def update_purchase_order(po_id: int, body: PurchaseOrderUpdate,
+                          db: Session = Depends(get_crm_db),
+                          user: CurrentUser = Depends(PO_WRITE)):
+    po = get_po_or_404(db, po_id)
+    if _status_value(po.status) == POStatus.CANCELLED.value:
+        raise HTTPException(status_code=400, detail="Cannot update a cancelled purchase order")
+    data = body.model_dump(exclude_unset=True)
+
+    if "po_number" in data and data["po_number"]:
+        new_number = data["po_number"].strip()
+        ensure_unique_po_number(db, new_number, exclude_id=po.id)
+        po.po_number = new_number
+    if "billing_branch_id" in data:
+        validate_branch(db, po.customer_id, data["billing_branch_id"])
+        po.billing_branch_id = data["billing_branch_id"]
+    if "delivery_branch_id" in data:
+        validate_branch(db, po.customer_id, data["delivery_branch_id"])
+        po.delivery_branch_id = data["delivery_branch_id"]
+    if "contact_person_id" in data:
+        validate_contact(db, po.customer_id, data["contact_person_id"])
+        po.contact_person_id = data["contact_person_id"]
+    for field in ("received_date", "start_date", "end_date", "po_type",
+                  "payment_terms", "terms_conditions"):
+        if field in data:
+            setattr(po, field, data[field])
+
+    if "total_value" in data and data["total_value"] is not None:
+        new_total = Decimal(str(data["total_value"]))
+        if new_total < Decimal(str(po.consumed_value or 0)):
+            raise HTTPException(status_code=400,
+                                detail="total_value cannot be below already consumed value")
+        po.total_value = new_total
+        # Recompute balance through the tax layer (delta 0 re-derives balance/status).
+        tax.apply_po_consumption(po, 0)
+
+    if "tax_slab" in data or "inter_state" in data:
+        if "tax_slab" in data:
+            po.tax_slab = data["tax_slab"]
+        inter_state = data.get("inter_state")
+        if inter_state is None:
+            inter_state = bool(po.igst and Decimal(str(po.igst)) > 0)
+        apply_gst_split(po, inter_state)
+
+    changed = ", ".join(sorted(data.keys())) or "nothing"
+    log_po_activity(db, po.id, user.id, "PO_UPDATED",
+                    comment=f"Purchase order {po.po_number} updated ({changed})")
+    db.commit()
+    db.refresh(po)
+    return envelope(serialize_po(po, detail=True, db=db), "Purchase order updated")
+
+
+@router.delete("/purchase-orders/{po_id}")
+def delete_purchase_order(po_id: int, db: Session = Depends(get_crm_db),
+                          user: CurrentUser = Depends(PO_WRITE)):
+    po = get_po_or_404(db, po_id)
+    if po.invoices:
+        raise HTTPException(status_code=400,
+                            detail="Cannot delete a PO with invoices raised against it")
+    db.delete(po)
+    db.commit()
+    return envelope(message="Purchase order deleted")
+
+
+@router.post("/purchase-orders/{po_id}/allocate-project")
+def allocate_project(po_id: int, body: AllocationIn, db: Session = Depends(get_crm_db),
+                     user: CurrentUser = Depends(PO_WRITE)):
+    po = get_po_or_404(db, po_id)
+    get_project_or_404(db, body.project_id)
+
+    allocated_sum = db.execute(
+        select(func.coalesce(func.sum(POProjectAllocation.allocated_amount), 0))
+        .where(POProjectAllocation.po_id == po.id)
+    ).scalar() or Decimal("0")
+    if Decimal(str(allocated_sum)) + body.allocated_amount > Decimal(str(po.total_value)):
+        raise HTTPException(status_code=400,
+                            detail="Total allocations would exceed the PO total value")
+
+    alloc = db.execute(
+        select(POProjectAllocation).where(
+            POProjectAllocation.po_id == po.id,
+            POProjectAllocation.project_id == body.project_id,
+        )
+    ).scalar_one_or_none()
+    if alloc is None:
+        alloc = POProjectAllocation(po_id=po.id, project_id=body.project_id,
+                                    allocated_amount=body.allocated_amount,
+                                    consumed_amount=Decimal("0"),
+                                    hsn_sac=body.hsn_sac)
+        db.add(alloc)
+    else:
+        alloc.allocated_amount = Decimal(str(alloc.allocated_amount)) + body.allocated_amount
+        if body.hsn_sac is not None:
+            alloc.hsn_sac = body.hsn_sac
+    db.flush()
+    log_po_activity(db, po.id, user.id, "PROJECT_ALLOCATED",
+                    comment=f"Project #{body.project_id} allocated "
+                            f"{float(body.allocated_amount):.2f} on PO {po.po_number}",
+                    section="allocations", record_id=alloc.id)
+    db.commit()
+    db.refresh(alloc)
+    return envelope(serialize_allocation(alloc), "Project allocation saved")
+
+
+@router.put("/purchase-orders/{po_id}/allocations/{allocation_id}")
+def update_allocation(po_id: int, allocation_id: int, body: AllocationHsnUpdate,
+                      db: Session = Depends(get_crm_db),
+                      user: CurrentUser = Depends(PO_WRITE)):
+    """Update an allocation's HSN/SAC code."""
+    po = get_po_or_404(db, po_id)
+    alloc = db.get(POProjectAllocation, allocation_id)
+    if alloc is None or alloc.po_id != po.id:
+        raise HTTPException(status_code=404, detail="Allocation not found on this purchase order")
+    alloc.hsn_sac = body.hsn_sac
+    log_po_activity(db, po.id, user.id, "ALLOCATION_UPDATED",
+                    comment=f"HSN/SAC set to '{body.hsn_sac or ''}' on allocation "
+                            f"#{alloc.id} (project #{alloc.project_id})",
+                    section="allocations", record_id=alloc.id)
+    db.commit()
+    db.refresh(alloc)
+    return envelope(serialize_allocation(alloc), "Allocation updated")
+
+
+@router.post("/purchase-orders/{po_id}/cancel")
+def cancel_purchase_order(po_id: int, db: Session = Depends(get_crm_db),
+                          user: CurrentUser = Depends(PO_WRITE)):
+    po = get_po_or_404(db, po_id)
+    if po.invoices:
+        raise HTTPException(status_code=400,
+                            detail="Cannot cancel a PO with invoices raised against it")
+    po.status = POStatus.CANCELLED
+    log_po_activity(db, po.id, user.id, "PO_CANCELLED",
+                    comment=f"Purchase order {po.po_number} cancelled")
+    db.commit()
+    return envelope(serialize_po(po), "Purchase order cancelled")
+
+
+@router.get("/purchase-orders/{po_id}/invoices")
+def list_po_invoices(po_id: int, db: Session = Depends(get_crm_db),
+                     user: CurrentUser = Depends(PO_READ)):
+    """Tab 10 'Invoices' grid: every invoice raised against this PO."""
+    po = get_po_or_404(db, po_id)
+    return envelope(po_invoice_rows(db, po))
+
+
+@router.post("/purchase-orders/{po_id}/attachments")
+def add_po_attachment(po_id: int, file: UploadFile = File(...),
+                      db: Session = Depends(get_crm_db),
+                      user: CurrentUser = Depends(PO_WRITE)):
+    """Upload a PO attachment; kind is inferred from the content type."""
+    po = get_po_or_404(db, po_id)
+    kind = "image" if (file.content_type or "").lower().startswith("image/") else "file"
+    url = save_upload(file, "po_attachments")
+    entry = {"name": file.filename or "attachment", "url": url, "kind": kind}
+    po.attachments = list(po.attachments or []) + [entry]  # reassign: JSONB change tracking
+    log_po_activity(db, po.id, user.id, "ATTACHMENT_ADDED",
+                    comment=f"Attachment '{entry['name']}' ({kind}) added",
+                    section="attachments", record_id=len(po.attachments) - 1)
+    db.commit()
+    return envelope({"attachment": entry, "attachments": po.attachments},
+                    "Attachment uploaded")
+
+
+@router.delete("/purchase-orders/{po_id}/attachments/{index}")
+def delete_po_attachment(po_id: int, index: int, db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(PO_WRITE)):
+    po = get_po_or_404(db, po_id)
+    attachments = list(po.attachments or [])
+    if index < 0 or index >= len(attachments):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    removed = attachments.pop(index)
+    po.attachments = attachments  # reassign: JSONB change tracking
+    log_po_activity(db, po.id, user.id, "ATTACHMENT_REMOVED",
+                    comment=f"Attachment '{(removed or {}).get('name')}' removed",
+                    section="attachments", record_id=index)
+    db.commit()
+    return envelope({"attachments": po.attachments}, "Attachment removed")
+
+
+@router.get("/purchase-orders/{po_id}/activity-log")
+def get_po_activity_log(po_id: int, db: Session = Depends(get_crm_db),
+                        user: CurrentUser = Depends(PO_READ)):
+    get_po_or_404(db, po_id)
+    return envelope(fetch_po_activity_log(db, po_id))
+
+
+@router.post("/projects/{project_id}/create-po")
+def create_po_from_project(project_id: int, body: ProjectCreatePOIn,
+                           db: Session = Depends(get_crm_db),
+                           user: CurrentUser = Depends(PO_WRITE)):
+    """One-click PO: customer/branch/contact derived from the project; full allocation."""
+    project = get_project_or_404(db, project_id)
+    branch = primary_branch(db, project.customer_id)
+    contact = primary_contact(db, project.customer_id, branch.id if branch else None)
+
+    po = PurchaseOrder(
+        po_number=next_sequence_number(db, PurchaseOrder, PurchaseOrder.po_number, "PO"),
+        customer_id=project.customer_id,
+        billing_branch_id=branch.id if branch else None,
+        delivery_branch_id=branch.id if branch else None,
+        received_date=body.received_date,
+        contact_person_id=contact.id if contact else None,
+        po_type=body.po_type,
+        payment_terms=body.payment_terms,
+        tax_slab=body.tax_slab,
+        total_value=body.total_value,
+        consumed_value=Decimal("0"),
+        balance_value=body.total_value,
+        status=POStatus.ACTIVE,
+    )
+    apply_gst_split(po, body.inter_state)
+    db.add(po)
+    db.flush()
+    alloc = POProjectAllocation(po_id=po.id, project_id=project.id,
+                                allocated_amount=body.total_value,
+                                consumed_amount=Decimal("0"))
+    db.add(alloc)
+    db.flush()
+    log_po_activity(db, po.id, user.id, "PO_CREATED",
+                    comment=f"Purchase order {po.po_number} created from project "
+                            f"'{project.name}' (full allocation)")
+    log_po_activity(db, po.id, user.id, "PROJECT_ALLOCATED",
+                    comment=f"Project #{project.id} allocated "
+                            f"{float(body.total_value):.2f} on PO {po.po_number}",
+                    section="allocations", record_id=alloc.id)
+    db.commit()
+    db.refresh(po)
+    return envelope(serialize_po(po, detail=True, db=db), "Purchase order created from project")
+
+
+# ===========================================================================
+# Invoices
+# ===========================================================================
+
+@router.post("/invoices")
+def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
+                   user: CurrentUser = Depends(INV_WRITE)):
+    get_project_or_404(db, body.project_id)
+
+    po = None
+    if body.po_id is not None:
+        po = get_po_or_404(db, body.po_id)
+        if _status_value(po.status) != POStatus.ACTIVE.value:
+            raise HTTPException(status_code=400, detail="PO is not active")
+        assert_po_allows_new_drawdown(po, action="create invoice")
+
+    invoice_number = (body.invoice_number or "").strip() or next_sequence_number(
+        db, Invoice, Invoice.invoice_number, "INV")
+    ensure_unique_invoice_number(db, invoice_number)
+
+    # Line items: amounts are always computed server-side as qty x rate.
+    # sub_total precedence: explicit body.sub_total, else the sum of line amounts.
+    line_rows: list[InvoiceLine] = []
+    lines_total = Decimal("0")
+    for i, line in enumerate(body.lines or [], start=1):
+        amount = (line.qty * line.rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        lines_total += amount
+        line_rows.append(InvoiceLine(s_no=i, description=line.description,
+                                     qty=line.qty, rate=line.rate, amount=amount))
+    if body.sub_total is not None:
+        sub_total = body.sub_total
+    elif line_rows:
+        sub_total = lines_total
+    else:
+        raise HTTPException(status_code=400,
+                            detail="Provide either sub_total or at least one line item")
+    if sub_total <= 0:
+        raise HTTPException(status_code=400, detail="sub_total must be positive")
+
+    if body.tax_amount is not None:
+        tax_amount = body.tax_amount
+    elif po is not None and po.tax_slab is not None:
+        tax_amount = tax.gst_amount(sub_total, po.tax_slab)
+    else:
+        tax_amount = Decimal("0")
+    grand_total = sub_total + tax_amount
+
+    if po is not None and Decimal(str(po.balance_value)) < grand_total:
+        raise HTTPException(status_code=400, detail="PO balance insufficient")
+
+    invoice = Invoice(
+        invoice_number=invoice_number,
+        po_id=body.po_id,
+        project_id=body.project_id,
+        invoice_date=body.invoice_date,
+        due_date=body.due_date,
+        sub_total=sub_total,
+        tax_amount=tax_amount,
+        grand_total=grand_total,
+        paid_amount=Decimal("0"),
+        balance_amount=grand_total,
+        payment_status=PaymentStatus.UNPAID,
+        lines=line_rows,
+    )
+    db.add(invoice)
+
+    if po is not None:
+        tax.apply_po_consumption(po, grand_total)
+        alloc = db.execute(
+            select(POProjectAllocation).where(
+                POProjectAllocation.po_id == po.id,
+                POProjectAllocation.project_id == body.project_id,
+            )
+        ).scalar_one_or_none()
+        if alloc is not None:
+            alloc.consumed_amount = Decimal(str(alloc.consumed_amount)) + grand_total
+
+    db.flush()
+    log_invoice_created_on_po(db, po, invoice, user.id)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(serialize_invoice(invoice, detail=True, db=db), "Invoice created")
+
+
+@router.get("/invoices")
+def list_invoices(payment_status: str | None = None, project_id: int | None = None,
+                  po_id: int | None = None, pp: PageParams = Depends(page_params),
+                  db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
+    stmt = select(Invoice)
+    if payment_status:
+        stmt = stmt.where(
+            Invoice.payment_status == _enum_or_400(PaymentStatus, payment_status, "payment_status"))
+    if project_id is not None:
+        stmt = stmt.where(Invoice.project_id == project_id)
+    if po_id is not None:
+        stmt = stmt.where(Invoice.po_id == po_id)
+    if pp.search:
+        stmt = stmt.where(Invoice.invoice_number.ilike(f"%{pp.search}%"))
+    stmt = stmt.order_by(Invoice.id.desc())
+    items, meta = paginate(db, stmt, pp.page, pp.limit)
+    return envelope([serialize_invoice(inv) for inv in items], meta=meta)
+
+
+@router.get("/invoices/{invoice_id}")
+def get_invoice(invoice_id: int, db: Session = Depends(get_crm_db),
+                user: CurrentUser = Depends(INV_READ)):
+    invoice = get_invoice_or_404(db, invoice_id)
+    return envelope(serialize_invoice(invoice, detail=True, db=db))
+
+
+@router.put("/invoices/{invoice_id}")
+def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(get_crm_db),
+                   user: CurrentUser = Depends(INV_WRITE)):
+    invoice = get_invoice_or_404(db, invoice_id)
+    data = body.model_dump(exclude_unset=True)
+    for field in ("invoice_date", "due_date"):
+        if field in data:
+            setattr(invoice, field, data[field])
+    db.commit()
+    db.refresh(invoice)
+    return envelope(serialize_invoice(invoice, detail=True, db=db), "Invoice updated")
+
+
+@router.delete("/invoices/{invoice_id}")
+def delete_invoice(invoice_id: int, db: Session = Depends(get_crm_db),
+                   user: CurrentUser = Depends(INV_WRITE)):
+    invoice = get_invoice_or_404(db, invoice_id)
+    if invoice.payments:
+        raise HTTPException(status_code=400, detail="Cannot delete an invoice with recorded payments")
+    if invoice.tds_record is not None:
+        raise HTTPException(status_code=400, detail="Cannot delete an invoice with a TDS record")
+    if invoice.po_id is not None:
+        po = db.get(PurchaseOrder, invoice.po_id)
+        if po is not None:
+            tax.apply_po_consumption(po, -Decimal(str(invoice.grand_total)))
+            alloc = db.execute(
+                select(POProjectAllocation).where(
+                    POProjectAllocation.po_id == po.id,
+                    POProjectAllocation.project_id == invoice.project_id,
+                )
+            ).scalar_one_or_none()
+            if alloc is not None:
+                alloc.consumed_amount = max(
+                    Decimal(str(alloc.consumed_amount)) - Decimal(str(invoice.grand_total)),
+                    Decimal("0"),
+                )
+    db.delete(invoice)
+    db.commit()
+    return envelope(message="Invoice deleted")
+
+
+@router.post("/invoices/{invoice_id}/generate-pdf")
+def generate_invoice_pdf_endpoint(invoice_id: int, db: Session = Depends(get_crm_db),
+                                  user: CurrentUser = Depends(INV_WRITE)):
+    invoice = get_invoice_or_404(db, invoice_id)
+    project = db.get(Project, invoice.project_id)
+    po = db.get(PurchaseOrder, invoice.po_id) if invoice.po_id else None
+    customer_id = po.customer_id if po else (project.customer_id if project else None)
+    customer = db.get(Customer, customer_id) if customer_id else None
+
+    branch = None
+    if po is not None and po.billing_branch_id:
+        from models import CustomerBranch
+        branch = db.get(CustomerBranch, po.billing_branch_id)
+    if branch is None and customer_id:
+        branch = primary_branch(db, customer_id)
+
+    # Tax breakdown: SGST/CGST/IGST from the PO slab via tax.split_gst,
+    # otherwise the invoice tax_amount as a lump line.
+    tax_lines: list = []
+    if po is not None and po.tax_slab is not None:
+        inter_state = bool(po.igst and Decimal(str(po.igst)) > 0)
+        parts = tax.split_gst(po.tax_slab, inter_state=inter_state)
+        if inter_state:
+            tax_lines.append((f"IGST @ {parts['igst']}%",
+                              tax.gst_amount(invoice.sub_total, parts["igst"])))
+        else:
+            tax_lines.append((f"SGST @ {parts['sgst']}%",
+                              tax.gst_amount(invoice.sub_total, parts["sgst"])))
+            tax_lines.append((f"CGST @ {parts['cgst']}%",
+                              tax.gst_amount(invoice.sub_total, parts["cgst"])))
+    elif invoice.tax_amount and Decimal(str(invoice.tax_amount)) > 0:
+        tax_lines.append(("Tax", invoice.tax_amount))
+
+    customer_name = None
+    if customer is not None:
+        customer_name = customer.legal_entity_name or customer.name
+
+    url = generate_invoice_pdf({
+        "invoice_number": invoice.invoice_number,
+        "invoice_date": invoice.invoice_date.isoformat() if invoice.invoice_date else None,
+        "due_date": invoice.due_date.isoformat() if invoice.due_date else None,
+        "customer_name": customer_name,
+        "billing_address": branch.billing_address if branch else None,
+        "gstin": branch.gstin if branch else None,
+        "project_name": project.name if project else None,
+        "po_number": po.po_number if po else None,
+        "payment_terms": po.payment_terms if po else None,
+        "tax_lines": tax_lines,
+        "lines": [
+            {"s_no": l.s_no, "description": l.description, "qty": l.qty,
+             "rate": l.rate, "amount": l.amount}
+            for l in invoice.lines
+        ],
+        "sub_total": invoice.sub_total,
+        "grand_total": invoice.grand_total,
+    })
+    invoice.invoice_pdf_url = url
+    db.commit()
+    return envelope({"invoice_pdf_url": url}, "Invoice PDF generated")
+
+
+@router.post("/invoices/{invoice_id}/record-payment")
+def record_payment(invoice_id: int, body: PaymentIn, db: Session = Depends(get_crm_db),
+                   user: CurrentUser = Depends(INV_WRITE)):
+    invoice = get_invoice_or_404(db, invoice_id)
+    if body.amount <= 0 or body.amount > Decimal(str(invoice.balance_amount)):
+        raise HTTPException(status_code=400,
+                            detail="Payment amount must be positive and not exceed the balance amount")
+    payment = InvoicePayment(
+        invoice_id=invoice.id,
+        payment_date=body.payment_date,
+        amount=body.amount,
+        payment_mode=body.payment_mode,
+        reference_number=body.reference_number,
+        notes=body.notes,
+        attachment_url=body.attachment_url,
+    )
+    db.add(payment)
+    tax.apply_invoice_payment(invoice, body.amount)
+    db.commit()
+    db.refresh(payment)
+    return envelope(
+        {"payment": serialize_payment(payment), "invoice": serialize_invoice(invoice)},
+        "Payment recorded",
+    )
+
+
+@router.post("/invoices/{invoice_id}/payments/upload")
+def upload_payment_proof(invoice_id: int, file: UploadFile = File(...),
+                         db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(INV_WRITE)):
+    """Upload a payment proof first; pass the returned url as attachment_url
+    when recording the payment (record-payment / tds-payment)."""
+    get_invoice_or_404(db, invoice_id)
+    url = save_upload(file, "payment_proofs")
+    return envelope({"url": url}, "Payment proof uploaded")
+
+
+# ===========================================================================
+# TDS
+# ===========================================================================
+
+@router.post("/invoices/{invoice_id}/record-tds")
+def record_tds(invoice_id: int, body: TdsCreateIn, db: Session = Depends(get_crm_db),
+               user: CurrentUser = Depends(gated_write("tds", "Finance"))):
+    invoice = get_invoice_or_404(db, invoice_id)
+    if invoice.tds_record is not None:
+        raise HTTPException(status_code=409, detail="TDS record already exists for this invoice")
+    tds_amount = body.tds_amount if body.tds_amount is not None else tax.tds_amount(invoice.sub_total)
+    record = TdsRecord(
+        invoice_id=invoice.id,
+        tds_amount=tds_amount,
+        tds_paid=Decimal("0"),
+        tds_balance=tds_amount - Decimal("0"),
+        tds_status=TdsStatus.PENDING,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return envelope(serialize_tds(record, invoice_number=invoice.invoice_number), "TDS recorded")
+
+
+@router.post("/invoices/{invoice_id}/tds-payment")
+def tds_payment(invoice_id: int, body: TdsPaymentIn, db: Session = Depends(get_crm_db),
+                user: CurrentUser = Depends(gated_write("tds", "Finance"))):
+    invoice = get_invoice_or_404(db, invoice_id)
+    record = invoice.tds_record
+    if record is None:
+        raise HTTPException(status_code=404, detail="No TDS record for this invoice")
+    if body.amount <= 0 or body.amount > Decimal(str(record.tds_balance)):
+        raise HTTPException(status_code=400,
+                            detail="TDS payment must be positive and not exceed the TDS balance")
+    payment = TdsPayment(
+        tds_record_id=record.id,
+        payment_date=body.payment_date or date.today(),
+        amount=body.amount,
+        transaction_id=body.transaction_id,
+        attachment_url=body.attachment_url,
+        notes=body.notes,
+    )
+    db.add(payment)
+    tax.apply_tds_payment(record, body.amount)
+    db.commit()
+    db.refresh(record)
+    db.refresh(payment)
+    data = serialize_tds(record, invoice_number=invoice.invoice_number)
+    data["payment"] = serialize_tds_payment(payment)
+    return envelope(data, "TDS payment recorded")
+
+
+@router.get("/invoices/{invoice_id}/tds-payments")
+def list_tds_payments(invoice_id: int, db: Session = Depends(get_crm_db),
+                      user: CurrentUser = Depends(INV_READ)):
+    invoice = get_invoice_or_404(db, invoice_id)
+    record = invoice.tds_record
+    if record is None:
+        return envelope([])
+    return envelope([serialize_tds_payment(p) for p in record.payments])
+
+
+@router.get("/tds")
+def list_tds(tds_status: str | None = None, pp: PageParams = Depends(page_params),
+             db: Session = Depends(get_crm_db), user: CurrentUser = Depends(TDS_READ)):
+    stmt = (
+        select(TdsRecord)
+        .join(Invoice, Invoice.id == TdsRecord.invoice_id)
+        .join(Project, Project.id == Invoice.project_id)
+        .join(Customer, Customer.id == Project.customer_id)
+    )
+    if tds_status:
+        stmt = stmt.where(TdsRecord.tds_status == _enum_or_400(TdsStatus, tds_status, "tds_status"))
+    if pp.search:
+        stmt = stmt.where(Invoice.invoice_number.ilike(f"%{pp.search}%"))
+    stmt = stmt.order_by(TdsRecord.id.desc())
+    items, meta = paginate(db, stmt, pp.page, pp.limit)
+
+    # Batch-resolve invoice numbers + customer names for the page of records.
+    invoice_ids = {r.invoice_id for r in items}
+    lookup: dict = {}
+    if invoice_ids:
+        rows = db.execute(
+            select(Invoice.id, Invoice.invoice_number, Customer.name)
+            .join(Project, Project.id == Invoice.project_id)
+            .join(Customer, Customer.id == Project.customer_id)
+            .where(Invoice.id.in_(invoice_ids))
+        ).all()
+        lookup = {row[0]: (row[1], row[2]) for row in rows}
+    data = [
+        serialize_tds(r,
+                      invoice_number=lookup.get(r.invoice_id, (None, None))[0],
+                      customer_name=lookup.get(r.invoice_id, (None, None))[1])
+        for r in items
+    ]
+    return envelope(data, meta=meta)

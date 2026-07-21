@@ -7,7 +7,13 @@ pypdf
 openpyxl
 tzdata
 PyJWT
+bcrypt>=4.0.1
 psycopg2-binary
 supabase
 cryptography>=42.0.0
 pytest>=8.0.0
+# --- Karnex CRM (Phase 2+) ---
+SQLAlchemy>=2.0
+alembic>=1.13
+python-docx
+reportlab

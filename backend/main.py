@@ -12,6 +12,7 @@ import time
 import logging
 import secrets
 import hashlib
+import hmac
 import random
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import urlparse
@@ -119,6 +120,10 @@ from auth_db import (
     upsert_job_template,
     delete_job_template,
     register_user,
+    get_user_by_email,
+    create_password_reset,
+    consume_password_reset,
+    update_user_password,
     set_hr_candidate_decision,
     upsert_master_value,
     update_interview_hr_status,
@@ -137,7 +142,7 @@ from hr.repository import (
     upsert_hr_record,
     upsert_hr_record_async,
 )
-from email_smtp import send_interview_invite_email, smtp_configured
+from email_smtp import send_interview_invite_email, send_password_reset_email, smtp_configured
 from hr.service import (
     build_hr_records_summary,
     build_report_record,
@@ -187,6 +192,7 @@ from prompt_logger import (
     prompt_logger_status,
 )
 import response_cache
+import password_hashing as pwh
 import rate_limit as _rl
 from template_prompt import (
     build_default_template_prompt,
@@ -533,7 +539,9 @@ def _try_build_admin_dashboard_nolock(dashboard: Path) -> bool:
         )
         return False
     lockfile = dashboard / "package-lock.json"
-    install_cmd = ["npm", "ci"] if lockfile.is_file() else ["npm", "install"]
+    # Use the RESOLVED npm path: on Windows npm is npm.cmd, and CreateProcess
+    # cannot launch the bare "npm" string without a shell (WinError 2).
+    install_cmd = [npm, "ci"] if lockfile.is_file() else [npm, "install"]
     logger.info("Building admin dashboard at %s …", dashboard)
     try:
         r = subprocess.run(
@@ -549,7 +557,7 @@ def _try_build_admin_dashboard_nolock(dashboard: Path) -> bool:
             logger.error("Admin dashboard npm install failed (exit %s). Output tail:\n%s", r.returncode, tail)
             return _admin_dashboard_assets_ok()
         r = subprocess.run(
-            ["npm", "run", "build"],
+            [npm, "run", "build"],
             cwd=str(dashboard),
             check=False,
             capture_output=True,
@@ -807,6 +815,22 @@ def _allow_public_hr_registration() -> bool:
 def _persist_hr_record_mirror(record: dict) -> None:
     """Postgres is authoritative; JSON file is a best-effort mirror."""
     upsert_hr_record_async(DATA_FILE, record)
+    _crm_sync_interview_async(record)
+
+
+def _crm_sync_interview_async(record: dict) -> None:
+    """Karnex CRM write-back (Phase 5): when this interview belongs to a CRM
+    candidate profile (ai_interview_links, joined by invite_token), push the
+    score/result into the CRM in a background thread. No-op for standalone
+    interviews or when the CRM is unconfigured; never raises."""
+    def _run() -> None:
+        try:
+            from services.ai_interview_bridge import sync_completed_interview
+            sync_completed_interview(record)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("CRM interview sync skipped: %s", exc)
+
+    threading.Thread(target=_run, daemon=True, name="crm-interview-sync").start()
 
 
 def _enforce_invite_device_binding(request: Request, payload: dict | None) -> JSONResponse | None:
@@ -1646,6 +1670,22 @@ def _require_user(request: Request, allowed_roles: set[str] | None = None):
     return payload, None
 
 
+def _enforce_crm_roles(request: Request, *allowed: str) -> None:
+    """Apply Karnex CRM role-based access to a legacy Interview Platform endpoint.
+
+    Mirrors the frontend RBAC (frontend admin-dashboard src/lib/rbac.ts). Raises
+    HTTPException(403) when the caller has CRM roles that don't match `allowed`.
+    Fails OPEN (no-op) when the CRM DB is unconfigured or the user has no CRM role
+    yet, so existing HR logins keep working. Admin always passes. Call this AFTER
+    the endpoint's own `_require_user(...)` check.
+    """
+    try:
+        from crm_deps import enforce_roles
+    except Exception:
+        return
+    enforce_roles(request, *allowed)
+
+
 def _parse_cors_origins() -> list[str]:
     raw = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
     if not raw:
@@ -2476,6 +2516,23 @@ async def auth_login_rate_limit(request: Request, call_next):
                 status_code=429,
             )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Baseline browser hardening. Deliberately omits a strict script-src CSP so
+    the SPA and interview portal keep working; frame-ancestors gives clickjacking
+    protection equivalent to X-Frame-Options. HSTS is inert over plain HTTP and
+    takes effect automatically once the app is served behind TLS (see docs)."""
+    response = await call_next(request)
+    headers = response.headers
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    headers.setdefault("Permissions-Policy", "geolocation=(), payment=()")
+    headers.setdefault("Content-Security-Policy", "frame-ancestors 'self'")
+    headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 @app.post("/setup")
@@ -3853,7 +3910,7 @@ def report(request: Request, secret: str = Form(...)):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    if secret != _effective_report_code():
+    if not hmac.compare_digest(str(secret or ""), str(_effective_report_code() or "")):
         return {"error": "Unauthorized"}
 
     s = _latest_submitted_session()
@@ -4303,6 +4360,7 @@ def hr_candidate_suggest(request: Request, q: str = "", limit: int = 10):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Reports: Admin/TA/HR/RMG
     return {"candidates": search_candidate_suggestions(AUTH_DB_TARGET, q, limit)}
 
 
@@ -4760,6 +4818,7 @@ def hr_candidate_interviews(request: Request, candidate_id: str, limit: int = 50
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Reports: Admin/TA/HR/RMG
 
     cid = (candidate_id or "").strip().lower()
     if not cid:
@@ -4816,6 +4875,7 @@ def hr_candidate_interview_detail(request: Request, candidate_id: str, interview
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Reports: Admin/TA/HR/RMG
     rec = get_interview_record_payload(AUTH_DB_TARGET, interview_id)
     if not rec:
         rec = find_hr_record(load_hr_records(DATA_FILE), interview_id)
@@ -4863,6 +4923,7 @@ def hr_candidate_strengths_weaknesses(request: Request, candidate_id: str, inter
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Reports: Admin/TA/HR/RMG
     rec = get_interview_record_payload(AUTH_DB_TARGET, interview_id)
     if not rec:
         rec = find_hr_record(load_hr_records(DATA_FILE), interview_id)
@@ -5006,6 +5067,7 @@ def hr_put_candidate_hr_decision(request: Request, candidate_id: str, payload: d
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Reports: Admin/TA/HR/RMG
     cid = (candidate_id or "").strip().lower()
     if not cid:
         return JSONResponse({"error": "Candidate id is required."}, status_code=400)
@@ -5051,6 +5113,7 @@ def hr_candidate_delete(request: Request, candidate_id: str):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR")  # Reports (destructive): Admin/TA/HR
 
     cid = (candidate_id or "").strip().lower()
     if not cid:
@@ -5268,6 +5331,7 @@ async def job_config(
     user_payload, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "RMG")  # Template management: Admin/RMG
     weights_obj = {}
     try:
         weights_obj = json.loads(weights) if (weights or "").strip() else {}
@@ -5393,6 +5457,7 @@ async def template_sample_questions(
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "RMG")  # Template authoring: Admin/RMG
     required_list = [s.strip().lower() for s in str(requiredSkills or "").split(",") if s.strip()]
     optional_list = [s.strip().lower() for s in str(optionalSkills or "").split(",") if s.strip()]
     if not required_list:
@@ -5584,6 +5649,7 @@ async def template_prompt_preview(
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "RMG")  # Template authoring: Admin/RMG
     mode = normalize_interview_mode(interviewMode)
     ctx = build_template_prompt_context(
         role=jobTitle,
@@ -5647,6 +5713,7 @@ async def template_test_prompt(
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "RMG")  # Template authoring: Admin/RMG
     required_list = [s.strip().lower() for s in str(requiredSkills or "").split(",") if s.strip()]
     optional_list = [s.strip().lower() for s in str(optionalSkills or "").split(",") if s.strip()]
     skills = []
@@ -5756,11 +5823,29 @@ def job_configs(request: Request):
     return {"jobs": list_job_templates(AUTH_DB_TARGET)}
 
 
+@app.get("/job/config/{jobId}")
+def job_config_get(request: Request, jobId: str):
+    # Load a single template for the edit form. The absence of this route was the
+    # root cause of "template details disappear after saving": the frontend edit
+    # form fetched /job/config/{id}, got a 404/HTML miss, fell back to a list
+    # endpoint that never returns {"job": ...}, so the form was never hydrated and
+    # a subsequent Save overwrote the record with empty values.
+    _, auth_err = _require_user(request, {"hr", "manager", "admin"})
+    if auth_err:
+        return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Template read: Admin/TA/HR/RMG
+    job = get_job_template(AUTH_DB_TARGET, jobId)
+    if not job:
+        return JSONResponse({"error": "Template not found."}, status_code=404)
+    return {"job": job}
+
+
 @app.delete("/job/config/{jobId}")
 def job_config_delete(request: Request, jobId: str):
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "RMG")  # Template management: Admin/RMG
     ok = delete_job_template(AUTH_DB_TARGET, jobId)
     if not ok:
         return JSONResponse({"error": "Template not found."}, status_code=404)
@@ -5785,6 +5870,7 @@ async def ats_score_api(
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # ATS: Admin/TA/HR/RMG
 
     cfg = get_job_template(AUTH_DB_TARGET, jobId) if (jobId or "").strip() else None
     if cfg:
@@ -5845,6 +5931,7 @@ async def ats_score_upload(
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # ATS: Admin/TA/HR/RMG
     jd_text = await _extract_text_from_upload(jd_file, model, False)
     if jd_text.startswith("__ERR__"):
         return {"error": jd_text.replace("__ERR__", "", 1)}
@@ -5876,6 +5963,7 @@ def candidates_ranked(request: Request, jobId: str = "", limit: int = 200):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Ranked candidates (ATS)
     cfg = get_job_template(AUTH_DB_TARGET, jobId) if (jobId or "").strip() else None
     if not cfg:
         return {"error": "jobId is required. Configure a job first via /job/config."}
@@ -6485,6 +6573,72 @@ def auth_login(
     }
 
 
+@app.post("/auth/forgot-password")
+@_rl.limit("5/minute")
+def auth_forgot_password(
+    request: Request,
+    email: str = Form(""),
+):
+    """Start an email-based password reset. Always returns the same generic
+    response so callers cannot enumerate which emails are registered."""
+    generic = {"status": "ok", "message": "If that email exists, a reset link has been sent."}
+    email_clean = (email or "").strip().lower()
+    if not email_clean:
+        return generic
+    try:
+        user = get_user_by_email(AUTH_DB_TARGET, email_clean)
+        if not user:
+            return generic
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat()
+        create_password_reset(AUTH_DB_TARGET, int(user["id"]), token_hash, expires_at)
+        base = _invite_base_url(request)
+        reset_url = f"{base}/?reset_token={token}"
+        if smtp_configured():
+            mail_res = send_password_reset_email(email_clean, str(user.get("full_name") or ""), reset_url)
+            if not mail_res.get("ok"):
+                logger.warning("Password reset email send failed for %s: %s", email_clean, mail_res.get("error"))
+                # Still surface the link to the server log so an admin can hand it over.
+                logger.info("PASSWORD RESET LINK (SMTP send failed) for %s: %s", email_clean, reset_url)
+        else:
+            logger.info("PASSWORD RESET LINK (SMTP disabled) for %s: %s", email_clean, reset_url)
+        logger.info(
+            "auth.forgot_password.issued",
+            extra={"event": "auth.forgot_password.issued", "candidate_name": str(user.get("full_name") or "")},
+        )
+    except Exception as exc:  # never leak internals; response stays generic
+        logger.warning("auth.forgot_password.error: %s", exc)
+    return generic
+
+
+@app.post("/auth/reset-password")
+@_rl.limit("5/minute")
+def auth_reset_password(
+    request: Request,
+    token: str = Form(""),
+    new_password: str = Form(""),
+):
+    """Complete an email-based password reset using a single-use token."""
+    token_clean = (token or "").strip()
+    if not token_clean:
+        return JSONResponse({"error": "Invalid or expired reset link"}, status_code=400)
+    try:
+        pwh.validate_password(new_password)
+    except pwh.PasswordPolicyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    token_hash = hashlib.sha256(token_clean.encode("utf-8")).hexdigest()
+    row = consume_password_reset(AUTH_DB_TARGET, token_hash)
+    if not row:
+        return JSONResponse({"error": "Invalid or expired reset link"}, status_code=400)
+    update_user_password(AUTH_DB_TARGET, int(row["user_id"]), pwh.hash_password(new_password))
+    logger.info(
+        "auth.password_reset.success",
+        extra={"event": "auth.password_reset.success", "user_id": int(row["user_id"])},
+    )
+    return {"status": "ok", "message": "Password updated. Please sign in."}
+
+
 @app.get("/auth/me")
 def auth_me(request: Request):
     payload, auth_err = _require_user(request, {"hr", "candidate"})
@@ -6525,10 +6679,13 @@ def hr_schedule_interview(
     show_spoken_text: str = Form("false"),
     enable_transcript_input: str = Form(""),
     model: str = Form("gpt-4o-mini"),
+    candidate_id: int = Form(0),      # optional Karnex CRM candidate id (Phase 5)
+    opportunity_id: int = Form(0),    # optional Karnex CRM opportunity id (Phase 5)
 ):
     payload, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR")  # HR Setup / scheduling: Admin/TA/HR
     skill_list = [s.strip().lower() for s in str(final_skills or "").split(",") if s.strip()]
     transcript_toggle_raw = enable_transcript_input if str(enable_transcript_input).strip() else show_spoken_text
     job_row = get_job_template(AUTH_DB_TARGET, str(jobId or "").strip()) if str(jobId or "").strip() else None
@@ -6571,6 +6728,17 @@ def hr_schedule_interview(
         )
     except ValueError as err:
         return {"error": str(err)}
+    # Optional Karnex CRM linkage (Phase 5): scope this session's results to a
+    # CRM candidate + opportunity. Best-effort; never blocks scheduling.
+    if candidate_id and opportunity_id:
+        try:
+            from services.ai_interview_bridge import link_schedule_to_crm
+            link_schedule_to_crm(
+                str(schedule.get("invite_token", "")), str(schedule.get("id", "")),
+                int(candidate_id), int(opportunity_id),
+            )
+        except Exception as _crm_link_exc:  # pragma: no cover
+            logger.warning("CRM schedule linkage skipped: %s", _crm_link_exc)
     base = _invite_base_url(request)
     invite_url = f"{base}/?invite={schedule.get('invite_token', '')}"
     access_key = schedule.get("access_key", "")
@@ -6730,7 +6898,7 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
 
     if not stored_key:
         pass
-    elif submitted_key != stored_key:
+    elif not hmac.compare_digest(submitted_key, stored_key):  # constant-time secret compare
         return JSONResponse({"error": "Invalid access key. Please check the key shared by HR."}, status_code=403)
 
     session_status = str(record.get("session_status") or "pending").strip().lower()
@@ -7202,6 +7370,7 @@ def interview_integrity_logs(request: Request):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
+    _enforce_crm_roles(request, "TA", "HR")  # Integrity: Admin/TA/HR (RMG excluded)
     payload = _decode_token_from_header(request)
     hr_user = str((payload or {}).get("sub", "hr")).strip().lower() or "hr"
     _recover_interviews_once(limit=50)
@@ -7286,6 +7455,28 @@ from routers import admin as admin_router
 
 admin_router.configure(AUTH_DB_TARGET, _require_user)
 app.include_router(admin_router.router)
+
+# Question Bank API (admin dashboard) + template-wizard bank preview.
+try:
+    from routers import question_bank as question_bank_router
+
+    app.include_router(question_bank_router.router)
+    logger.info("Question Bank routes registered.")
+except Exception as _qb_exc:  # pragma: no cover — never block boot
+    logger.warning("Question Bank routes not registered: %s", _qb_exc)
+
+# ---------------------------------------------------------------------------
+# Karnex CRM API (Phase 3) — all /api/* CRM routers; see routers/crm/__init__.py
+# CRM endpoints require PostgreSQL (CRM_DATABASE_URL / AUTH_DB_URL) and return
+# 503 when unconfigured; the interview platform keeps working regardless.
+# ---------------------------------------------------------------------------
+try:
+    from routers.crm import register_crm_routers
+
+    register_crm_routers(app)
+    logger.info("Karnex CRM routers registered.")
+except Exception as _crm_exc:  # pragma: no cover — never block interview platform boot
+    logger.error("Karnex CRM routers failed to register: %s", _crm_exc)
 
 # Optional slowapi-based rate limiting. No-op unless RATE_LIMIT_ENABLED=true.
 _rl.setup_rate_limit(app)

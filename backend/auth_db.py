@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
+
+import password_hashing as pwh
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -650,6 +653,21 @@ def init_auth_db(db_target: DbTarget) -> None:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        token_hash TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        used_at TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash ON password_reset_tokens (token_hash)"
+                )
             _ensure_job_templates_columns_postgres(conn)
             _ensure_schedule_security_columns_postgres(conn)
             _ensure_interview_progress_table_postgres(conn)
@@ -764,6 +782,22 @@ def init_auth_db(db_target: DbTarget) -> None:
                 updated_at_ist TEXT NOT NULL
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES registration_data(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash ON password_reset_tokens (token_hash)"
         )
         _ensure_job_templates_columns_sqlite(conn)
         _ensure_schedule_security_columns_sqlite(conn)
@@ -2830,16 +2864,38 @@ def update_interview_hr_status(db_target: DbTarget, interview_id: str, status: s
 
 
 def _hash_password(password: str, salt_bytes: bytes) -> str:
+    # Legacy KDF, retained only to verify old rows during migration.
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, 120000)
     return digest.hex()
+
+
+def _update_password_hash(db_target: DbTarget, user_id: int, new_hash: str) -> None:
+    """Persist an upgraded password hash and clear the legacy salt column."""
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE registration_data SET password_hash = %s, password_salt = %s WHERE id = %s",
+                    (new_hash, "", user_id),
+                )
+            conn.commit()
+    else:
+        with _connect_sqlite(Path(db_target)) as conn:
+            conn.execute(
+                "UPDATE registration_data SET password_hash = ?, password_salt = ? WHERE id = ?",
+                (new_hash, "", user_id),
+            )
+            conn.commit()
 
 
 def register_user(db_target: DbTarget, full_name: str, email: str, username: str, password: str, role: str) -> dict:
     role = (role or "").strip().lower()
     if role not in {"hr", "candidate"}:
         raise ValueError("Role must be HR or Candidate.")
-    if len((password or "").strip()) < 6:
-        raise ValueError("Password must be at least 6 characters.")
+    try:
+        pwh.validate_password((password or "").strip())
+    except pwh.PasswordPolicyError as exc:
+        raise ValueError(str(exc)) from exc
     if not full_name.strip():
         raise ValueError("Full name is required.")
     if not username.strip():
@@ -2848,9 +2904,9 @@ def register_user(db_target: DbTarget, full_name: str, email: str, username: str
         raise ValueError("Email is required.")
 
     now = _now_ist_parts()
-    salt = os.urandom(16)
-    salt_hex = salt.hex()
-    pw_hash = _hash_password(password, salt)
+    # Modern self-describing hash (bcrypt); the legacy salt column is unused now.
+    pw_hash = pwh.hash_password(password)
+    salt_hex = ""
     try:
         values = (
             full_name.strip(),
@@ -2943,15 +2999,18 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
 
     expected_hash = row["password_hash"]
     salt_hex = row["password_salt"]
-    try:
-        actual_hash = _hash_password(password, bytes.fromhex(salt_hex))
-    except ValueError:
-        _insert_login(db_target, row["id"], uname, row["role"], 0, "Corrupted salt", now, client_ip)
-        return {"success": False, "message": "Account data error. Contact admin."}
-
-    if actual_hash != expected_hash:
+    # Constant-time verify; supports both the modern format and legacy pbkdf2 rows.
+    ok, needs_rehash = pwh.verify_password(password, expected_hash, salt_hex)
+    if not ok:
         _insert_login(db_target, row["id"], uname, row["role"], 0, "Wrong password", now, client_ip)
         return {"success": False, "message": "Invalid username or password."}
+
+    if needs_rehash:
+        # Transparent migration: upgrade the stored hash on this successful login.
+        try:
+            _update_password_hash(db_target, row["id"], pwh.hash_password(password))
+        except Exception:
+            pass  # never block a valid login on an upgrade failure
 
     _insert_login(db_target, row["id"], uname, row["role"], 1, "Login success", now, client_ip)
     return {
@@ -3012,6 +3071,112 @@ def _insert_login(
                 values,
             )
             conn.commit()
+
+
+def get_user_by_email(db_target: DbTarget, email: str) -> dict | None:
+    """Look up a registration_data row by email (role-agnostic). Returns None when missing."""
+    addr = (email or "").strip().lower()
+    if not addr:
+        return None
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, full_name, email, username, role
+                    FROM registration_data
+                    WHERE email = %s
+                    """,
+                    (addr,),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+    with _connect_sqlite(Path(db_target)) as conn:
+        row = conn.execute(
+            """
+            SELECT id, full_name, email, username, role
+            FROM registration_data
+            WHERE email = ?
+            """,
+            (addr,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_password_reset(db_target: DbTarget, user_id: int, token_hash: str, expires_at: str) -> None:
+    """Store a hashed password-reset token. ``expires_at`` is a UTC ISO-8601 string."""
+    created_at = datetime.now(timezone.utc).isoformat()
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, created_at)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (user_id, token_hash, expires_at, created_at),
+                )
+            conn.commit()
+    else:
+        with _connect_sqlite(Path(db_target)) as conn:
+            conn.execute(
+                """
+                INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, token_hash, expires_at, created_at),
+            )
+            conn.commit()
+
+
+def consume_password_reset(db_target: DbTarget, token_hash: str) -> dict | None:
+    """Atomically mark a valid (unused, unexpired) reset token as used.
+
+    Returns ``{"id", "user_id"}`` when the token was valid, else None.
+    Timestamps are same-format UTC ISO-8601 strings, so lexicographic
+    comparison in SQL is chronologically correct.
+    """
+    if not (token_hash or "").strip():
+        return None
+    now_utc = datetime.now(timezone.utc).isoformat()
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    UPDATE password_reset_tokens
+                    SET used_at = %s
+                    WHERE token_hash = %s AND used_at IS NULL AND expires_at > %s
+                    RETURNING id, user_id
+                    """,
+                    (now_utc, token_hash, now_utc),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return dict(row) if row else None
+    with _connect_sqlite(Path(db_target)) as conn:
+        row = conn.execute(
+            """
+            SELECT id, user_id FROM password_reset_tokens
+            WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
+            """,
+            (token_hash, now_utc),
+        ).fetchone()
+        if not row:
+            return None
+        cur = conn.execute(
+            "UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL",
+            (now_utc, row["id"]),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            return None  # lost the race: another request consumed it first
+        return {"id": row["id"], "user_id": row["user_id"]}
+
+
+def update_user_password(db_target: DbTarget, user_id: int, new_hash: str) -> None:
+    """Persist a new (modern, self-describing) password hash; clears the legacy salt column."""
+    _update_password_hash(db_target, user_id, new_hash)
 
 
 def upsert_interview_record_snapshot(db_target: DbTarget, record: dict) -> None:
