@@ -132,6 +132,39 @@ Tools run: **knip**, **ts-prune**, **depcheck** (frontend); **ruff F401/F841**, 
 
 ---
 
+## Phase 5 — Second verification pass (independent, 2026-07-21 PM)
+
+A second detector run (ruff/vulture/deptry + knip/ts-prune/depcheck, Windows ground truth) with
+dynamic-usage cross-checking (monkeypatch strings, React.lazy map, models/__init__ metadata,
+re-export chains, tests-count-as-used) confirmed Phases 1–4 and found a small remainder.
+
+### Additional removals (applied + re-verified)
+
+| Item | Where | Evidence |
+|---|---|---|
+| `supabase` dependency | backend/requirements.txt | Zero `import supabase`/`create_client` anywhere; auth_db.py only string-matches the `supabase.com` hostname — psycopg2 makes the connection. (Upgrades Phase-1's "uncertain" verdict.) |
+| `export { sectionVisible }` + its import | opportunity/FormRenderer.tsx | Consumers import it from opportunitySchema; only SectionFields/OptionsMap come from FormRenderer |
+| `CUSTOMER_TYPE_OPTIONS` | opportunity/opportunitySchema.ts | Definition was the sole occurrence; form uses `customerTypeOptionsForPo()` |
+| `SUPERADMIN_ROLES` | src/lib/rbac.ts | Sole occurrence; `isAdmin()` hardcodes the roles |
+| `listChildMotion` | src/lib/motionPresets.ts | Sole occurrence incl. tests/docs |
+
+Post-removal gates: `compileall` ✅ · `tsc --noEmit` ✅ · `ruff F401/F841` → only the two
+protected `0002_*` migration imports remain (policy keep; `models.Base` is a metadata side-effect).
+
+### Additional optimization flags (report-only, not applied)
+
+1. **N+1s (Read-verified):** `services/finance.py:563-567` — per-invoice `db.get(Project)`+`db.get(Opportunity)`+`db.get(Timesheet)` inside the loop → replace with one joined select; `services/project_employees.py:832-841` — same pattern per assignment. Probable (verify before fixing): `branch_policy.py:203`, `timesheets.py:849/891`, `ai_interview_bridge.py:288`.
+2. **Missing `index=True` on hot FKs:** `leave_applications.project_id`, `employees.reporting_manager_id`/`reporting_hr_id`, `interview_bookings.candidate_id`/`slot_id`, candidate-activity `requirement_id`, `contacts.branch_id`, `candidate_skills.skill_id`. Already indexed (no action): `invoices.po_id`, `timesheets.employee_id/project_id`, `timesheet_entries.timesheet_id`, `leave_applications.employee_id`.
+3. **Leftover no-op expressions from the Phase-2 autofix:** `ai.py` `(q or "").lower()`, `ats.py` `(jd_text or "").lower()`, 3× bare `coach_hints_text()` calls in main.py (file I/O, result discarded) — trivial manual deletes.
+4. **Dep hygiene:** add `slowapi` + explicit `starlette` to requirements.txt; run `npm install` to resync package-lock (still lists removed `@testing-library/user-event`); add `@vitest/coverage-v8` to devDependencies.
+
+### Files touched in Phase 5 (glance for truncation before building)
+
+`backend/requirements.txt`, `src/crm/pages/opportunity/FormRenderer.tsx`,
+`src/crm/pages/opportunity/opportunitySchema.ts`, `src/lib/rbac.ts`, `src/lib/motionPresets.ts`.
+
+---
+
 ## Items for manual review
 
 1. **Add `slowapi` to `requirements.txt`** — imported by `rate_limit.py`, deptry flags missing

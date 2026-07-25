@@ -1,12 +1,18 @@
 """Current-user endpoint for the CRM UI (role-based navigation)."""
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, get_crm_db, get_current_user
+from models import EmployeeLeaveBalance, LeavePolicyType
 from schemas.common import envelope
 from services import users_admin as svc
+from services.employees import serialize_leave_balance
+from services.timesheets import employee_for_user
 
 router = APIRouter(prefix="/api/me", tags=["CRM: Me"])
 
@@ -69,9 +75,33 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
 def my_project_leave(user: CurrentUser = Depends(get_current_user),
                      db: Session = Depends(get_crm_db)):
     """Consolidated 'My Leave' across every project the current user is mapped to."""
-    from services.timesheets import employee_for_user
     from services.project_employees import employee_project_leave
     emp = employee_for_user(db, user.id)
     if emp is None:
         return envelope(data={"employee_id": None, "total_leave_balance": 0, "projects": []})
     return envelope(data=employee_project_leave(db, emp.id))
+
+
+@router.get("/leave-balances")
+def my_leave_balances(
+    year: int | None = None,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_crm_db),
+):
+    """Per-leave-type balances for the signed-in user's own employee record.
+    Self-scoped equivalent of GET /api/employees/{id}/leave-balances so the
+    timesheet Leave Balance column works for employees without employee-read
+    permission."""
+    emp = employee_for_user(db, user.id)
+    if emp is None:
+        return envelope(data=[], meta={"year": year or datetime.now().year})
+    target_year = year or datetime.now().year
+    rows = db.execute(
+        select(EmployeeLeaveBalance, LeavePolicyType.name)
+        .join(LeavePolicyType, LeavePolicyType.id == EmployeeLeaveBalance.leave_type_id)
+        .where(EmployeeLeaveBalance.employee_id == emp.id,
+               EmployeeLeaveBalance.year == target_year)
+        .order_by(EmployeeLeaveBalance.leave_type_id)
+    ).all()
+    data = [serialize_leave_balance(row[0], leave_type_name=row[1]) for row in rows]
+    return envelope(data=data, meta={"year": target_year})

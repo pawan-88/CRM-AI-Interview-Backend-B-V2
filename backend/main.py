@@ -2407,8 +2407,24 @@ async def _handle_value_error(request: Request, exc: ValueError):
 
 @app.exception_handler(RequestValidationError)
 async def _handle_validation_error(request: Request, exc: RequestValidationError):
+    from fastapi.encoders import jsonable_encoder
+
     errs = exc.errors() if hasattr(exc, "errors") else []
-    return JSONResponse({"error": "Validation failed", "details": errs}, status_code=422)
+    # ctx may hold raw Exception instances — must be JSON-safe or Starlette 500s.
+    safe = jsonable_encoder(errs)
+    parts = []
+    for row in safe if isinstance(safe, list) else []:
+        if not isinstance(row, dict):
+            continue
+        loc = row.get("loc") or []
+        loc_s = ".".join(str(p) for p in loc if p != "body")
+        msg = row.get("msg") or "Invalid value"
+        parts.append(f"{loc_s}: {msg}" if loc_s else str(msg))
+    detail = "; ".join(parts) if parts else "Validation failed"
+    return JSONResponse(
+        {"error": "Validation failed", "detail": detail, "details": safe, "message": detail},
+        status_code=422,
+    )
 
 
 @app.exception_handler(OpenAIError)

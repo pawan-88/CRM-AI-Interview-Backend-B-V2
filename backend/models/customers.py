@@ -68,6 +68,8 @@ class CustomerBranch(Base):
     hours_required_full_day_comp_off = sa.Column(sa.Numeric(4, 2), nullable=True)
 
     # --- Billing properties ---
+    # Per_Hour / Per_Day / Per_Month / Per_Year; NULL = inherit customer default (migration 0036)
+    billing_type = sa.Column(sa.String(16), nullable=True)
     billing_frequency = sa.Column(sa.String(40), nullable=True)  # Weekly / Monthly / ...
     billing_cycle_start_day = sa.Column(sa.Integer, nullable=True)  # day of month 1..31
     billing_cycle_end_day = sa.Column(sa.Integer, nullable=True)
@@ -126,6 +128,8 @@ class CustomerBillingPolicy(Base):
     holidays_billable = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     min_hours_full_day = sa.Column(sa.Numeric(4, 2), nullable=False, server_default="8.00")
     min_hours_half_day = sa.Column(sa.Numeric(4, 2), nullable=False, server_default="4.00")
+    # Per_Hour / Per_Day / Per_Month / Per_Year; NULL = not set (migration 0036)
+    billing_type = sa.Column(sa.String(16), nullable=True)
 
     # Comp-off section
     comp_off_billable = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
@@ -164,6 +168,8 @@ class ContactPerson(Base):
     email = sa.Column(sa.String(255), nullable=True)
     phone = sa.Column(sa.String(32), nullable=True)
     designation = sa.Column(sa.String(120), nullable=True)
+    # Finance | Operational | Procurement | HR (string; nullable)
+    role = sa.Column(sa.String(40), nullable=True)
     is_hiring_manager = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     is_active = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
     customer = relationship("Customer", back_populates="contacts")

@@ -15,7 +15,7 @@ from crm_deps import (
     page_params, require_access,
 )
 from models import (
-    Employee, EntryLocation, Invoice, InvoiceLine, PaymentStatus, Project,
+    AttendanceStatus, Employee, EntryLocation, Invoice, InvoiceLine, PaymentStatus, Project,
     ProjectEmployee, PurchaseOrder, Timesheet, TimesheetActivityLog, TimesheetAttachment,
     TimesheetEntry, TimesheetStatus,
 )
@@ -30,11 +30,13 @@ from services.finance import (
 from services.notify import notify_role, notify_user
 from services.timesheets import (
     accrue_comp_off, approvals_report_rows, attachment_out, build_generated_entry,
-    compute_billables, day_name, due_report_rows, effective_billing_policy,
+    compute_billables, consume_timesheet_leaves, day_name, due_report_rows, effective_billing_policy,
     employee_for_user, entry_out, for_submission_report_rows,
-    get_timesheet_or_404, holidays_for_project_period, linked_invoice_for, list_attachments,
-    month_days, period_label, resolve_entry_fields, timesheet_detail_out,
-    timesheet_invoice_preview, timesheet_out, timesheet_summary, _due_rows,
+    get_timesheet_or_404, holidays_for_project_period, leave_billable_by_type_map,
+    linked_invoice_for, list_attachments, month_days, period_label, persist_recomputed_entries,
+    release_timesheet_leaves, resolve_entry_fields, validate_timesheet_leave_balances,
+    timesheet_detail_out, timesheet_invoice_preview, timesheet_out, timesheet_summary,
+    _due_rows, _project_branch,
 )
 
 router = APIRouter(prefix="/api/timesheets", tags=["CRM: Timesheets"])
@@ -135,10 +137,11 @@ def create_timesheet(
     if body.generate_days:
         holiday_dates = holidays_for_project_period(db, project, body.year, body.month)
         policy = effective_billing_policy(db, project)
+        branch = _project_branch(db, project)
         for d in month_days(body.year, body.month):
             db.add(build_generated_entry(
                 timesheet_id=ts.id, d=d, holiday_dates=holiday_dates,
-                project=project, policy=policy,
+                project=project, policy=policy, branch=branch,
             ))
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "TS_CREATED",
                  f"Timesheet created for {period_label(body.year, body.month)}")
@@ -211,6 +214,8 @@ def upsert_entries(
         raise HTTPException(status_code=400, detail="At least one entry is required")
     project = db.get(Project, ts.project_id)
     policy = effective_billing_policy(db, project)
+    # Project-scoped leave-type → billable map (same for every employee on this project).
+    leave_by_type = leave_billable_by_type_map(db, project) if project else {}
     holiday_dates = holidays_for_project_period(db, project, ts.year, ts.month)
     existing = {
         e.entry_date: e
@@ -232,7 +237,7 @@ def upsert_entries(
                                 detail=f"Duplicate entry date in payload: {d.isoformat()}")
         seen.add(d)
         day_type, is_working, hours_worked, attendance_status, leave_type, leave_period = (
-            resolve_entry_fields(d=d, item=item, holiday_dates=holiday_dates)
+            resolve_entry_fields(d=d, item=item, holiday_dates=holiday_dates, policy=policy)
         )
         if item.entry_project_id is not None:
             split_proj = db.get(Project, item.entry_project_id)
@@ -245,6 +250,8 @@ def upsert_entries(
             leave_period=leave_period,
             project=project,
             policy=policy,
+            leave_type=leave_type,
+            leave_billable_by_type=leave_by_type,
         )
         row = existing.get(d)
         if row is None:
@@ -258,11 +265,22 @@ def upsert_entries(
         row.attendance_status = attendance_status
         row.leave_type = leave_type
         row.leave_period = leave_period
+        # Optional note from Apply-leave dialog; cleared when row is not Leave.
+        if attendance_status == AttendanceStatus.LEAVE:
+            reason = (getattr(item, "leave_reason", None) or "").strip() or None
+            row.leave_reason = reason[:255] if reason else None
+        else:
+            row.leave_reason = None
         row.location = item.location or EntryLocation.ONSITE
         row.view_flag = bool(item.view_flag)
         row.entry_project_id = item.entry_project_id
         row.billable_hours = billable_hours
         row.billable_days = billable_days
+    # Soft unknown-type check; over-balance leave converts to Loss of Pay (no reject).
+    all_entries = list(existing.values())
+    validate_timesheet_leave_balances(db, ts, all_entries)
+    # Persist LOP-aware billables (paid portion only).
+    persist_recomputed_entries(db, ts, all_entries)
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "ENTRIES_UPDATED",
                  f"{len(entries)} entries upserted")
     db.commit()
@@ -293,6 +311,16 @@ def submit_timesheet(
     ).first()
     if not has_entries:
         raise HTTPException(status_code=400, detail="Cannot submit a timesheet with no entries")
+    # Recompute + persist billables from CURRENT project policy before locking the sheet.
+    # Over-balance leave converts to Loss of Pay (no hard reject).
+    entries = db.execute(
+        select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
+        .order_by(TimesheetEntry.entry_date)
+    ).scalars().all()
+    validate_timesheet_leave_balances(db, ts, entries)
+    persist_recomputed_entries(db, ts, entries)
+    # Consume paid leave + LOP excess now (idempotent with approve).
+    consume_timesheet_leaves(db, ts, entries)
     # NEVER block timesheet submit for PO reasons (D8). Invoice generate still gates.
     ts.status = TimesheetStatus.SUBMITTED
     ts.submitted_at = datetime.now(timezone.utc)
@@ -316,13 +344,16 @@ def approve_timesheet(
     ts.status = TimesheetStatus.APPROVED
     ts.approved_by = user.id
     ts.approved_at = datetime.now(timezone.utc)
-    # Comp-off earning: weekend/holiday days actually worked credit the
-    # employee's Comp-Off leave balance (idempotent — delta vs prior grants).
+    # Comp-off earning: weekend/holiday days actually worked credit leave
+    # only when Comp Off Billable is OFF (idempotent — delta vs prior grants).
+    # When Comp Off Billable is ON those hours are billed instead (no credit).
     entries = db.execute(
         select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
         .order_by(TimesheetEntry.entry_date)
     ).scalars().all()
     earned = accrue_comp_off(db, ts, entries)
+    # Idempotent with submit-time consumption (paid + LOP excess).
+    consume_timesheet_leaves(db, ts, entries)
     comp_off_note = ""
     if earned and float(earned) > 0:
         comp_off_note = (f" — {float(earned):g} comp-off day(s) credited to the "
@@ -351,6 +382,8 @@ def reject_timesheet(
         raise HTTPException(status_code=400, detail=str(exc))
     ts.status = TimesheetStatus.REJECTED
     ts.rejection_reason = reason
+    # Reverse leave consumption applied on submit (paid + LOP).
+    release_timesheet_leaves(db, ts)
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "TS_REJECTED",
                  f"Timesheet rejected: {reason}")
     db.commit()
@@ -443,6 +476,40 @@ def delete_timesheet_attachment(
                  f"Attachment #{attachment_id} deleted")
     db.commit()
     return envelope(data={"id": attachment_id}, message="Attachment deleted")
+
+
+@router.delete("/{timesheet_id}")
+def delete_timesheet(
+    timesheet_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(get_current_user),
+    _acc: CurrentUser = Depends(TS_EDIT),
+):
+    """Hard-delete a timesheet. Blocks Approved or invoice-linked sheets."""
+    from services.crm_common import commit_or_conflict
+
+    ts = get_timesheet_or_404(db, timesheet_id)
+    _require_owner_or(db, user, ts, "HR", "Finance", "RMG", "Sales", "Sales_Head")
+    status = ts.status.value if hasattr(ts.status, "value") else str(ts.status)
+    if status == TimesheetStatus.APPROVED.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete: timesheet is Approved. Reject it first or leave it for audit.",
+        )
+    linked = linked_invoice_for(db, ts)
+    if linked is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete: timesheet is linked to invoice {linked.invoice_number}.",
+        )
+    # Activity log has no cascade — remove manually.
+    for log in db.execute(
+        select(TimesheetActivityLog).where(TimesheetActivityLog.timesheet_id == ts.id)
+    ).scalars().all():
+        db.delete(log)
+    db.delete(ts)
+    commit_or_conflict(db, "Cannot delete: timesheet is still referenced by other records.")
+    return envelope(data={"id": timesheet_id}, message="Timesheet deleted")
 
 
 @router.get("/{timesheet_id}/summary")

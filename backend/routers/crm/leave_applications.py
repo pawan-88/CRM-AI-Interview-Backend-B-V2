@@ -466,3 +466,25 @@ def cancel_leave_application(
     db.commit()
     db.refresh(app)
     return envelope(data=_app_out(db, app), message="Leave application cancelled")
+
+
+@router.delete("/{application_id}")
+def delete_leave_application(
+    application_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Hard-delete a leave application. Blocks Approved (balance already mutated)."""
+    from services.crm_common import commit_or_conflict
+
+    app = _get_or_404(db, application_id)
+    if not (_is_hr(user) or _is_owner(db, user, app)):
+        raise HTTPException(status_code=403, detail="Not allowed to delete this leave application")
+    if app.status == "Approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete: leave application is Approved (balances already updated). Cancel is not available — contact HR.",
+        )
+    db.delete(app)
+    commit_or_conflict(db, "Cannot delete: leave application is still referenced by other records.")
+    return envelope(data={"id": application_id}, message="Leave application deleted")

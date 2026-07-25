@@ -4,6 +4,14 @@ Callable from CLI (`scripts/run_pe_leave_credit.py`) or a scheduler. Credits are
 applied to `project_employee_leave_details` only for **active, non-exited**
 Project Employees. Policy edits after seed do not rewrite opening balances.
 
+Accrual lower bound: ``accrual_start(policy, pe)`` =
+``max(policy.effective_date, pe.onboarding_date)`` over non-null sides. Months
+wholly before that date credit 0; mid-period joins prorate when enabled.
+
+Deferred upfront (One_Time / Yearly Start_Of_Period): when accrual_start is
+still in the future at seed time, the period grant is stashed on
+``leave_accrual`` and granted by this job in the first eligible month.
+
 Idempotency: one `leave_accrual_events` row per PE/leave_type/period via
 `source = pe_credit:{pe_id}:{leave_type_id}:{YYYY-MM}`.
 """
@@ -22,6 +30,24 @@ from models import (
 from services.project_employee_billing import carry_forward, prorate_credit
 
 ZERO = Decimal("0")
+
+
+def accrual_start(
+    policy: CustomerLeavePolicy | None,
+    pe: ProjectEmployee | None,
+) -> date | None:
+    """Earliest date this leave type may accrue for the PE.
+
+    ``max(policy.effective_date, pe.onboarding_date)`` over whichever side is
+    set. Missing values impose no lower bound on that side. ``None`` means no
+    lower bound at all.
+    """
+    dates: list[date] = []
+    if policy is not None and getattr(policy, "effective_date", None) is not None:
+        dates.append(policy.effective_date)
+    if pe is not None and getattr(pe, "onboarding_date", None) is not None:
+        dates.append(pe.onboarding_date)
+    return max(dates) if dates else None
 
 
 def _days_in_month(year: int, month: int) -> int:
@@ -64,19 +90,83 @@ def _policy_period_amount(policy: CustomerLeavePolicy) -> Decimal:
     return bal  # Monthly
 
 
-def _days_present_in_month(pe: ProjectEmployee, as_of: date) -> tuple[int, int]:
+def _is_upfront_credit(policy: CustomerLeavePolicy | None, credit_type: str) -> bool:
+    timing = (policy.leave_credit_timing if policy else "Start_Of_Period") or "Start_Of_Period"
+    return credit_type == "One_Time" or (credit_type == "Yearly" and timing != "End_Of_Period")
+
+
+def _days_present_in_month(
+    pe: ProjectEmployee,
+    as_of: date,
+    *,
+    not_before: date | None = None,
+) -> tuple[int, int]:
+    """Days the PE is present in the month of ``as_of``, clamped by exit and lower bound.
+
+    ``not_before`` is typically ``accrual_start(policy, pe)``. When omitted, falls
+    back to ``pe.onboarding_date`` only (legacy behaviour).
+    """
     dim = _days_in_month(as_of.year, as_of.month)
     start = date(as_of.year, as_of.month, 1)
     end = date(as_of.year, as_of.month, dim)
-    if pe.onboarding_date and pe.onboarding_date > end:
+    lower = not_before if not_before is not None else pe.onboarding_date
+    if lower and lower > end:
         return 0, dim
     if pe.exit_date and pe.exit_date < start:
         return 0, dim
-    present_start = max(start, pe.onboarding_date or start)
+    present_start = max(start, lower or start)
     present_end = min(end, pe.exit_date or end)
     if present_end < present_start:
         return 0, dim
     return (present_end - present_start).days + 1, dim
+
+
+def _credit_deferred_upfront(
+    db: Session,
+    pe: ProjectEmployee,
+    row: ProjectEmployeeLeaveDetail,
+    policy: CustomerLeavePolicy,
+    as_of: date,
+    period: str,
+    start: date | None,
+) -> Decimal:
+    """Grant One_Time / Yearly-start amount stashed on leave_accrual after accrual_start."""
+    pending = Decimal(row.leave_accrual or 0)
+    if pending <= 0:
+        return ZERO
+    dim = _days_in_month(as_of.year, as_of.month)
+    month_end = date(as_of.year, as_of.month, dim)
+    if start is not None and start > month_end:
+        return ZERO
+
+    amount = pending
+    if policy.prorate_balance_credit and start is not None:
+        factor = Decimal(13 - start.month) / Decimal(12)
+        factor = min(max(factor, Decimal("0")), Decimal("1"))
+        amount = (amount * factor).quantize(Decimal("0.01"))
+
+    if policy.is_max_limit and policy.max_limit is not None:
+        room = Decimal(policy.max_limit) - Decimal(row.leave_balance or 0)
+        if room <= 0:
+            return ZERO
+        amount = min(amount, room)
+
+    if amount <= 0:
+        row.leave_accrual = ZERO
+        return ZERO
+
+    row.leave_balance = Decimal(row.leave_balance or 0) + amount
+    row.leave_accrual = ZERO
+    db.add(LeaveAccrualEvent(
+        employee_id=pe.employee_id,
+        leave_type_id=row.leave_type_id,
+        event_type="Accrual",
+        amount=amount,
+        balance_after=row.leave_balance,
+        source=_credit_source(pe.id, row.leave_type_id, period),
+        note=f"PE deferred upfront credit {period}",
+    ))
+    return amount
 
 
 def credit_one_pe_leave_row(
@@ -98,6 +188,13 @@ def credit_one_pe_leave_row(
         db.get(CustomerLeavePolicy, row.customer_leave_policy_id)
         if row.customer_leave_policy_id else None
     )
+    start = accrual_start(policy, pe)
+    credit_type = (policy.leave_credit_type if policy else "Monthly") or "Monthly"
+
+    # Deferred One_Time / Yearly-start: leave_accrual holds the pending grant.
+    if policy is not None and _is_upfront_credit(policy, credit_type):
+        return _credit_deferred_upfront(db, pe, row, policy, as_of, period, start)
+
     # Seed-by-copy governs the OPENING balance; the recurring per-period accrual
     # rate follows the live customer policy so a mid-engagement rate change takes
     # effect from the next credit cycle (never retroactively rewriting balances).
@@ -105,13 +202,10 @@ def credit_one_pe_leave_row(
     if accrual <= 0:
         return ZERO
 
-    credit_type = (policy.leave_credit_type if policy else "Monthly") or "Monthly"
-    if credit_type == "One_Time":
-        return ZERO
     if credit_type == "Yearly" and (policy is None or (policy.leave_credit_timing or "") != "End_Of_Period"):
         return ZERO
 
-    days_present, dim = _days_present_in_month(pe, as_of)
+    days_present, dim = _days_present_in_month(pe, as_of, not_before=start)
     do_prorate = bool(policy and policy.prorate_balance_credit)
     amount = prorate_credit(accrual, days_present, dim) if do_prorate else accrual
     if days_present <= 0:

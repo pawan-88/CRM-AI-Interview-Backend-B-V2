@@ -120,6 +120,7 @@ def serialize_branch(branch: CustomerBranch) -> dict:
         "hours_required_half_day_comp_off": _bnum(g("hours_required_half_day_comp_off")),
         "hours_required_full_day_comp_off": _bnum(g("hours_required_full_day_comp_off")),
         # billing properties
+        "billing_type": g("billing_type"),
         "billing_frequency": g("billing_frequency"),
         "billing_cycle_start_day": g("billing_cycle_start_day"),
         "billing_cycle_end_day": g("billing_cycle_end_day"),
@@ -141,7 +142,7 @@ BRANCH_BILLING_POLICY_FIELDS: tuple[str, ...] = (
     "holidays_billable", "weekoff_billable", "leave_billable", "comp_off_billable",
     "hours_required_half_day", "hours_required_full_day", "working_hours_per_day",
     "hours_required_half_day_comp_off", "hours_required_full_day_comp_off",
-    "billing_frequency", "billing_cycle_start_day", "billing_cycle_end_day",
+    "billing_type", "billing_frequency", "billing_cycle_start_day", "billing_cycle_end_day",
     "is_max_billable_hours_per_day", "max_billable_hours_per_day",
     "is_max_billable_hours_per_month", "max_billable_hours_per_month",
     "is_max_billable_days_per_month", "max_billable_days_per_month",
@@ -171,6 +172,7 @@ def serialize_policy(policy: CustomerBillingPolicy | None) -> dict | None:
         "holidays_billable": policy.holidays_billable,
         "min_hours_full_day": float(policy.min_hours_full_day),
         "min_hours_half_day": float(policy.min_hours_half_day),
+        "billing_type": getattr(policy, "billing_type", None),
         "comp_off_billable": bool(getattr(policy, "comp_off_billable", False)),
         "comp_off_balance": _bnum(getattr(policy, "comp_off_balance", None)),
         "comp_off_balance_initial": _bnum(getattr(policy, "comp_off_balance_initial", None)),
@@ -191,6 +193,7 @@ def serialize_contact(contact: ContactPerson) -> dict:
         "email": contact.email,
         "phone": contact.phone,
         "designation": contact.designation,
+        "role": getattr(contact, "role", None),
         "is_hiring_manager": contact.is_hiring_manager,
         "is_active": contact.is_active,
     }

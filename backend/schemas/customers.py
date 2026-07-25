@@ -1,9 +1,14 @@
 """Pydantic schemas for the Customer module (branches, billing policy, documents, contacts)."""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from models import CustomerStatus
+
+# Billing Type dropdown values (nullable everywhere = "Not set" / inherit).
+BillingType = Literal["Per_Hour", "Per_Day", "Per_Month", "Per_Year"]
 
 
 class _CustomerAddress(BaseModel):
@@ -43,6 +48,7 @@ class _BranchBillingFields(BaseModel):
     working_hours_per_day: float | None = None
     hours_required_half_day_comp_off: float | None = None
     hours_required_full_day_comp_off: float | None = None
+    billing_type: BillingType | None = None
     billing_frequency: str | None = Field(default=None, max_length=40)
     billing_cycle_start_day: int | None = Field(default=None, ge=1, le=31)
     billing_cycle_end_day: int | None = Field(default=None, ge=1, le=31)
@@ -98,6 +104,7 @@ class BranchBillingPolicyIn(BaseModel):
     working_hours_per_day: float | None = Field(default=None, ge=0, le=24)
     hours_required_half_day_comp_off: float | None = Field(default=None, ge=0, le=24)
     hours_required_full_day_comp_off: float | None = Field(default=None, ge=0, le=24)
+    billing_type: BillingType | None = None
     billing_frequency: str | None = Field(default=None, max_length=40)
     billing_cycle_start_day: int | None = Field(default=None, ge=1, le=31)
     billing_cycle_end_day: int | None = Field(default=None, ge=1, le=31)
@@ -120,6 +127,7 @@ class BillingPolicyIn(BaseModel):
     holidays_billable: bool = False
     min_hours_full_day: float = Field(default=8.0, ge=0, le=24)
     min_hours_half_day: float = Field(default=4.0, ge=0, le=24)
+    billing_type: BillingType | None = None
     # comp-off section
     comp_off_billable: bool = False
     comp_off_balance: float | None = None
@@ -138,6 +146,7 @@ class ContactCreate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=32)
     designation: str | None = Field(default=None, max_length=120)
+    role: str | None = Field(default=None, max_length=40)  # Finance|Operational|Procurement|HR
     is_hiring_manager: bool = False
     is_active: bool = True
 
@@ -148,5 +157,6 @@ class ContactUpdate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=32)
     designation: str | None = Field(default=None, max_length=120)
+    role: str | None = Field(default=None, max_length=40)
     is_hiring_manager: bool | None = None
     is_active: bool | None = None

@@ -5,8 +5,8 @@ Alembic's env.py relies on that for migrations.
 """
 from models.base import Base, USERS_TABLE, USERS_FK, WorkMode  # noqa: F401
 from models.masters import (  # noqa: F401
-    AppSetting, CalendarYear, Currency, Department, Designation, DocumentType, FinancialYear,
-    LeavePolicyType, Location, Skill, TaxRate,
+    AppSetting, CalendarYear, ContactRole, Currency, Department, Designation, DocumentType,
+    FinancialYear, LeavePolicyType, Location, Skill, TaxRate,
 )
 from models.customers import (  # noqa: F401
     BranchHolidayYear, ContactPerson, Customer, CustomerBillingPolicy, CustomerBranch, CustomerDocument, CustomerStatus,
@@ -29,7 +29,8 @@ from models.profiles import (  # noqa: F401
 )
 from models.projects import (  # noqa: F401
     BillingFrequency, BillingUnit, CommEntryType, Project, ProjectCommunicationMatrix,
-    ProjectEmployee, ProjectEmployeeLeaveDetail, ProjectEmployeeRate, ProjectStatus,
+    ProjectEmployee, ProjectEmployeeLeaveDetail, ProjectEmployeeRate, ProjectLeavePolicy,
+    ProjectStatus,
 )
 from models.timesheets import (  # noqa: F401
     AttendanceStatus, DayType, EntryLocation, LeavePeriod, Timesheet, TimesheetActivityLog,

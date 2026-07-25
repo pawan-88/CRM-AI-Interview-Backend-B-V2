@@ -23,7 +23,8 @@ from services.crm_common import paginate, to_dict
 
 router = APIRouter(prefix="/api/customer-leave-policies", tags=["CRM: Customer Leave Policies"])
 
-hr_finance = role_required("HR", "Finance")
+# Sales creates these from the New Customer wizard; HR/Finance also manage them.
+write_customer_leave = role_required("HR", "Finance", "Sales", "Sales_Head")
 
 
 def _get_or_404(db: Session, policy_id: int) -> CustomerLeavePolicy:
@@ -105,7 +106,7 @@ def list_customer_leave_policies(
 def create_customer_leave_policy(
     body: CustomerLeavePolicyCreate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(hr_finance),
+    user: CurrentUser = Depends(write_customer_leave),
 ):
     _validate_refs(db, body.customer_id, body.branch_id, body.leave_type_id)
     if _duplicate_exists(db, body.customer_id, body.branch_id, body.leave_type_id):
@@ -138,7 +139,7 @@ def update_customer_leave_policy(
     policy_id: int,
     body: CustomerLeavePolicyUpdate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(hr_finance),
+    user: CurrentUser = Depends(write_customer_leave),
 ):
     policy = _get_or_404(db, policy_id)
     data = body.model_dump(exclude_unset=True)
@@ -162,7 +163,7 @@ def update_customer_leave_policy(
 def deactivate_customer_leave_policy(
     policy_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(hr_finance),
+    user: CurrentUser = Depends(write_customer_leave),
 ):
     policy = _get_or_404(db, policy_id)
     policy.is_active = False  # soft delete
@@ -184,7 +185,7 @@ def add_leave_credit_concept(
     policy_id: int,
     body: LeaveCreditConceptIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(hr_finance),
+    user: CurrentUser = Depends(write_customer_leave),
 ):
     policy = _get_or_404(db, policy_id)
     concept = LeaveCreditConcept(policy_id=policy.id, **body.model_dump())
@@ -200,7 +201,7 @@ def update_leave_credit_concept(
     concept_id: int,
     body: LeaveCreditConceptIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(hr_finance),
+    user: CurrentUser = Depends(write_customer_leave),
 ):
     _get_or_404(db, policy_id)
     concept = _concept_or_404(db, policy_id, concept_id)
@@ -216,7 +217,7 @@ def deactivate_leave_credit_concept(
     policy_id: int,
     concept_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(hr_finance),
+    user: CurrentUser = Depends(write_customer_leave),
 ):
     _get_or_404(db, policy_id)
     concept = _concept_or_404(db, policy_id, concept_id)

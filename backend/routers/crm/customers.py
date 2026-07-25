@@ -32,7 +32,7 @@ from schemas.customers import (
     CustomerCreate,
     CustomerUpdate,
 )
-from schemas.leave import BranchHolidayCreate, BranchHolidayUpdate
+from schemas.leave import BranchHolidayCreate, BranchHolidayUpdate, BranchLeavePolicyCreate, CustomerLeavePolicyUpdate
 from services.crm_common import paginate, save_upload
 from services.customers import (
     clear_other_primaries,
@@ -202,16 +202,45 @@ def delete_customer(
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(write_customers),
 ):
+    from models import Opportunity, Project, PurchaseOrder, Requirement
+    from services.crm_common import commit_or_conflict
+    from services.crm_delete import cascade_customer_owned_policies
+
     customer = get_customer_or_404(db, customer_id)
-    db.delete(customer)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
+    parts = []
+    opp_n = db.execute(
+        select(func.count()).select_from(Opportunity).where(Opportunity.customer_id == customer_id)
+    ).scalar() or 0
+    proj_n = db.execute(
+        select(func.count()).select_from(Project).where(Project.customer_id == customer_id)
+    ).scalar() or 0
+    req_n = db.execute(
+        select(func.count()).select_from(Requirement).where(Requirement.customer_id == customer_id)
+    ).scalar() or 0
+    po_n = db.execute(
+        select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.customer_id == customer_id)
+    ).scalar() or 0
+    if opp_n:
+        parts.append(f"{opp_n} opportunity(ies)")
+    if proj_n:
+        parts.append(f"{proj_n} project(s)")
+    if req_n:
+        parts.append(f"{req_n} requirement(s)")
+    if po_n:
+        parts.append(f"{po_n} purchase order(s)")
+    if parts:
         raise HTTPException(
-            status_code=400,
-            detail="Customer is referenced by other records (opportunities/projects) and cannot be deleted",
+            status_code=409,
+            detail=f"Cannot delete: {', '.join(parts)} exist. Remove them first.",
         )
+    # Cascade leave policies + holidays that otherwise produce opaque FK 409s.
+    # Branches/contacts/docs/billing_policy already cascade via ORM relationships.
+    cascade_customer_owned_policies(db, customer_id)
+    db.delete(customer)
+    commit_or_conflict(
+        db,
+        "Cannot delete: customer is still referenced by other records. Remove dependencies first.",
+    )
     return envelope(data={"id": customer_id}, message="Customer deleted")
 
 
@@ -384,6 +413,7 @@ def upsert_billing_policy(
     policy.holidays_billable = payload.holidays_billable
     policy.min_hours_full_day = payload.min_hours_full_day
     policy.min_hours_half_day = payload.min_hours_half_day
+    policy.billing_type = payload.billing_type
     policy.comp_off_billable = payload.comp_off_billable
     policy.comp_off_balance = payload.comp_off_balance
     policy.comp_off_balance_initial = payload.comp_off_balance_initial
@@ -419,6 +449,7 @@ def upload_document(
     document_type_id: int = Form(...),
     start_date: date | None = Form(None),
     end_date: date | None = Form(None),
+    status: str | None = Form(None),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(write_customers),
 ):
@@ -426,9 +457,15 @@ def upload_document(
     validate_document_type(db, document_type_id)
     if start_date and end_date and end_date < start_date:
         raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
+    resolved_status = status or "Active"
+    if end_date and end_date <= date.today():
+        resolved_status = "Expired"
     file_url = save_upload(file, "customer_docs")
-    doc = CustomerDocument(customer_id=customer_id, document_type_id=document_type_id,
-                           file_url=file_url, start_date=start_date, end_date=end_date)
+    doc = CustomerDocument(
+        customer_id=customer_id, document_type_id=document_type_id,
+        file_url=file_url, start_date=start_date, end_date=end_date,
+        status=resolved_status,
+    )
     db.add(doc)
     db.commit()
     db.refresh(doc)
@@ -554,29 +591,88 @@ def _branch_leave_policy_out(db: Session, p) -> dict:
     return {
         "id": p.id, "leave_type_id": p.leave_type_id, "leave_name": lt.name if lt else None,
         "leave_credit_type": p.leave_credit_type, "leave_expire": p.leave_expire,
-        "is_max_limit": bool(p.is_max_limit), "prorate_balance_credit": bool(p.prorate_balance_credit),
+        "is_max_limit": bool(p.is_max_limit), "max_limit": _n(p.max_limit),
+        "prorate_balance_credit": bool(p.prorate_balance_credit),
         "leave_credit_balance": _n(p.leave_credit_balance), "initial_credit_balance": _n(p.initial_credit_balance),
         "maximum_carry_forward": _n(p.maximum_carry_forward), "leave_credit_timing": p.leave_credit_timing,
         "effective_date": p.effective_date.isoformat() if p.effective_date else None,
+        "is_billable": getattr(p, "is_billable", None),
+        "is_active": bool(getattr(p, "is_active", True)),
     }
 
 
 @router.get("/branches/{branch_id}/policy")
 def get_branch_policy_detail(branch_id: int, db: Session = Depends(get_crm_db),
                              user: CurrentUser = Depends(read_branch_policy)):
-    from models import CustomerLeavePolicy, Opportunity, Project
+    from models import Customer, CustomerLeavePolicy, Opportunity, Project
     from services.branch_policy import branch_holiday_years
     branch = _branch_or_404(db, branch_id)
     data = serialize_branch(branch)
+    customer = db.get(Customer, branch.customer_id)
+    data["customer_name"] = customer.name if customer else None
     data["holiday_years"] = branch_holiday_years(db, branch_id)
     pols = db.execute(select(CustomerLeavePolicy).where(CustomerLeavePolicy.branch_id == branch_id)
                       .order_by(CustomerLeavePolicy.id)).scalars().all()
     data["leave_policies"] = [_branch_leave_policy_out(db, p) for p in pols]
-    projs = db.execute(select(Project).join(Opportunity, Opportunity.id == Project.opportunity_id)
-                       .where(Opportunity.branch_id == branch_id).order_by(Project.name)).scalars().all()
+    projs = db.execute(
+        select(Project)
+        .join(Opportunity, Opportunity.id == Project.opportunity_id)
+        .where(or_(Project.branch_id == branch_id, Opportunity.branch_id == branch_id))
+        .order_by(Project.name)
+    ).scalars().unique().all()
     data["linked_projects"] = [{"id": p.id, "name": p.name,
                                 "status": getattr(p.status, "value", p.status)} for p in projs]
     return envelope(data=data, message="Branch policy")
+
+
+@router.put("/branches/{branch_id}/policy")
+def put_branch_policy_detail(
+    branch_id: int,
+    payload: BranchUpdate,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_branch_policy),
+):
+    """Save Section 1/3/4 branch identity + billing fields (branch-policy write gate).
+
+    Reuses existing ``CustomerBranch`` columns — no duplicate tables.
+    """
+    branch = _branch_or_404(db, branch_id)
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        if field == "is_primary":
+            continue
+        setattr(branch, field, value)
+    if changes.get("is_primary") is True:
+        branch.is_primary = True
+        clear_other_primaries(db, branch.customer_id, keep_branch_id=branch.id)
+    elif changes.get("is_primary") is False:
+        branch.is_primary = False
+    db.commit()
+    db.refresh(branch)
+    return envelope(data=serialize_branch(branch), message="Branch policy updated")
+
+
+@router.get("/branches/{branch_id}/effective-policy")
+def get_branch_effective_policy(
+    branch_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_customers),
+):
+    """RESOLVED (branch → customer default → built-in) billing policy for a branch.
+
+    Used by the New Opportunity form to inherit the branch's billing policy
+    (incl. billing_type). Also carries the Leave & Holiday aggregates:
+    ``holidays_count`` (active holidays in the branch's calendar for the
+    current year; null when none), ``leave_total`` / ``credit_leave_monthly``
+    (summed leave_credit_balance over active customer leave policies, branch
+    row winning per leave type; Monthly-only for the latter; null when none)
+    and ``leave_policy_name`` (set only when exactly one active leave type
+    applies). ``sources`` says where each value came from.
+    """
+    from services.branch_policy import effective_customer_branch_policy
+    branch = _branch_or_404(db, branch_id)
+    return envelope(data=effective_customer_branch_policy(db, branch),
+                    message="Effective branch billing policy")
 
 
 @router.get("/branches/{branch_id}/holiday-years")
@@ -693,3 +789,104 @@ def delete_branch_year_holiday(
         raise HTTPException(status_code=404, detail="Holiday not found")
     obj = deactivate_branch_holiday(db, branch, calendar_year, holiday)
     return envelope(data=holiday_out(obj), message="Branch holiday removed")
+
+
+# ---------------------------------------------------------------------------
+# Branch-scoped leave policies — REUSES customer_leave_policies (branch_id set).
+# Do NOT create a separate customer_branch_leave_policies table.
+# ---------------------------------------------------------------------------
+
+@router.get("/branches/{branch_id}/leave-policies")
+def list_branch_leave_policies(
+    branch_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_branch_policy),
+):
+    from models import CustomerLeavePolicy
+    _branch_or_404(db, branch_id)
+    pols = db.execute(
+        select(CustomerLeavePolicy)
+        .where(CustomerLeavePolicy.branch_id == branch_id,
+               CustomerLeavePolicy.is_active.is_(True))
+        .order_by(CustomerLeavePolicy.id)
+    ).scalars().all()
+    return envelope(data=[_branch_leave_policy_out(db, p) for p in pols],
+                    message="Branch leave policies")
+
+
+@router.post("/branches/{branch_id}/leave-policies")
+def create_branch_leave_policy(
+    branch_id: int,
+    body: BranchLeavePolicyCreate,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_branch_policy),
+):
+    from models import CustomerLeavePolicy, LeavePolicyType
+
+    branch = _branch_or_404(db, branch_id)
+    if db.get(LeavePolicyType, body.leave_type_id) is None:
+        raise HTTPException(status_code=400, detail="Leave policy type not found")
+    dup = db.execute(
+        select(CustomerLeavePolicy).where(
+            CustomerLeavePolicy.customer_id == branch.customer_id,
+            CustomerLeavePolicy.branch_id == branch_id,
+            CustomerLeavePolicy.leave_type_id == body.leave_type_id,
+        ).limit(1)
+    ).scalars().first()
+    if dup is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A leave policy for this branch/leave type already exists",
+        )
+    policy = CustomerLeavePolicy(
+        customer_id=branch.customer_id,
+        branch_id=branch_id,
+        **body.model_dump(),
+    )
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+    return envelope(data=_branch_leave_policy_out(db, policy), message="Leave policy created")
+
+
+@router.put("/branches/{branch_id}/leave-policies/{policy_id}")
+def update_branch_leave_policy(
+    branch_id: int,
+    policy_id: int,
+    body: CustomerLeavePolicyUpdate,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_branch_policy),
+):
+    from models import CustomerLeavePolicy, LeavePolicyType
+
+    _branch_or_404(db, branch_id)
+    policy = db.get(CustomerLeavePolicy, policy_id)
+    if policy is None or policy.branch_id != branch_id:
+        raise HTTPException(status_code=404, detail="Leave policy not found for this branch")
+    changes = body.model_dump(exclude_unset=True)
+    changes.pop("branch_id", None)
+    if "leave_type_id" in changes and changes["leave_type_id"] is not None:
+        if db.get(LeavePolicyType, changes["leave_type_id"]) is None:
+            raise HTTPException(status_code=400, detail="Leave policy type not found")
+    for field, value in changes.items():
+        setattr(policy, field, value)
+    db.commit()
+    db.refresh(policy)
+    return envelope(data=_branch_leave_policy_out(db, policy), message="Leave policy updated")
+
+
+@router.delete("/branches/{branch_id}/leave-policies/{policy_id}")
+def delete_branch_leave_policy(
+    branch_id: int,
+    policy_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_branch_policy),
+):
+    from models import CustomerLeavePolicy
+    _branch_or_404(db, branch_id)
+    policy = db.get(CustomerLeavePolicy, policy_id)
+    if policy is None or policy.branch_id != branch_id:
+        raise HTTPException(status_code=404, detail="Leave policy not found for this branch")
+    policy.is_active = False
+    db.commit()
+    return envelope(data=_branch_leave_policy_out(db, policy), message="Leave policy deactivated")

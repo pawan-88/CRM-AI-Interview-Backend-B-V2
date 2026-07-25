@@ -149,6 +149,26 @@ class DocumentTypeOut(BaseModel):
     is_active: bool
 
 
+# ---------------------------------------------------------------- contact roles
+class ContactRoleCreate(BaseModel):
+    name: str
+    is_active: bool = True
+
+    _name = field_validator("name")(_required_str)
+
+
+class ContactRoleUpdate(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+
+
+class ContactRoleOut(BaseModel):
+    model_config = {"from_attributes": True}
+    id: int
+    name: str
+    is_active: bool
+
+
 # ---------------------------------------------------------------- leave policy types
 class LeavePolicyTypeCreate(BaseModel):
     name: str

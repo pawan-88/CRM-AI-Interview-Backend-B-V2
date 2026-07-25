@@ -18,12 +18,21 @@ The resolver maps them explicitly so callers see one canonical shape.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
-from models import BranchHolidayYear, CustomerBranch, Holiday, Project
+from models import (
+    BranchHolidayYear,
+    CustomerBillingPolicy,
+    CustomerBranch,
+    CustomerLeavePolicy,
+    Holiday,
+    LeavePolicyType,
+    Project,
+)
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
@@ -178,6 +187,141 @@ def resolve_branch_project_policy(project: Project | None,
 
 def _freq(v):
     return getattr(v, "value", v) if v is not None else None
+
+
+# ---------------------------------------------------------------- effective (branch → customer)
+# (out_key, branch_attr, customer_policy_attr, built_in_default)
+# NOTE the deliberate name bridges: branch "weekoff_billable" vs customer
+# "week_off_billable"; branch "hours_required_*" vs customer "min_hours_*";
+# branch "working_hours_per_day" vs customer "normal_hours_per_day".
+_EFFECTIVE_FIELDS: tuple[tuple[str, str, str | None, object], ...] = (
+    ("holidays_billable", "holidays_billable", "holidays_billable", False),
+    ("weekoff_billable", "weekoff_billable", "week_off_billable", False),
+    ("leave_billable", "leave_billable", "leave_billable", False),
+    ("comp_off_billable", "comp_off_billable", "comp_off_billable", False),
+    ("min_hours_full_day", "hours_required_full_day", "min_hours_full_day", 8.0),
+    ("min_hours_half_day", "hours_required_half_day", "min_hours_half_day", 4.0),
+    ("working_hours_per_day", "working_hours_per_day", "normal_hours_per_day", None),
+    ("billing_type", "billing_type", "billing_type", None),
+    # billing_frequency has no customer-level counterpart — branch value or null.
+    ("billing_frequency", "billing_frequency", None, None),
+)
+
+_BOOL_KEYS = frozenset(
+    {"holidays_billable", "weekoff_billable", "leave_billable", "comp_off_billable"}
+)
+
+
+def effective_customer_branch_policy(db: Session, branch: CustomerBranch) -> dict:
+    """Resolve the branch → customer-default → built-in policy for one branch.
+
+    Used by the New Opportunity form to inherit the branch's billing policy.
+    Each field: branch value when set (not NULL), else the customer's default
+    billing policy row, else the built-in default (None when there is none).
+    ``sources`` records where each value came from: "branch" | "customer" |
+    "default" | None (no value anywhere).
+    """
+    cust_policy = db.execute(
+        select(CustomerBillingPolicy)
+        .where(CustomerBillingPolicy.customer_id == branch.customer_id)
+    ).scalars().first()
+
+    data: dict = {"branch_id": branch.id, "customer_id": branch.customer_id}
+    sources: dict[str, str | None] = {}
+    for key, battr, cattr, default in _EFFECTIVE_FIELDS:
+        val = getattr(branch, battr, None)
+        src: str | None = "branch"
+        if val is None:
+            val = getattr(cust_policy, cattr, None) if (cust_policy is not None and cattr) else None
+            src = "customer"
+        if val is None:
+            val = default
+            src = "default" if default is not None else None
+        if isinstance(val, Decimal):
+            val = float(val)
+        elif key in _BOOL_KEYS and val is not None:
+            val = bool(val)
+        data[key] = val
+        sources[key] = src
+
+    # --- Leave & Holiday form extras (read-only aggregation, no migration) ---
+
+    # Holidays: count of ACTIVE holidays in this branch's holiday calendar for
+    # the current calendar year (no branch-level "holiday year" column exists —
+    # BranchHolidayYear rows are per-year headers, so "today's year" is used).
+    # Calendar membership mirrors services.project_employees: branch-specific
+    # rows OR customer-wide rows (branch NULL) OR global rows (customer NULL).
+    # One COUNT query. Blank (null) when zero — same convention as
+    # branch_holiday_years' derived Holiday Count.
+    holiday_year = date.today().year
+    holidays_count = int(db.execute(
+        select(func.count(Holiday.id)).where(
+            Holiday.is_active.is_(True),
+            Holiday.year == holiday_year,
+            or_(
+                Holiday.branch_id == branch.id,
+                and_(Holiday.customer_id == branch.customer_id,
+                     Holiday.branch_id.is_(None)),
+                and_(Holiday.customer_id.is_(None), Holiday.branch_id.is_(None)),
+            ),
+        )
+    ).scalar() or 0)
+    data["holidays_count"] = holidays_count if holidays_count > 0 else None
+    sources["holidays_count"] = "branch" if holidays_count > 0 else None
+
+    # NOTE: no weekoff-count column exists on CustomerBranch (verified) — the
+    # form keeps its own default; no key is emitted for it.
+
+    # Leave: ACTIVE customer leave policies for this customer, branch-specific
+    # OR customer-wide, in ONE select (leave-type name joined in — no N+1).
+    # Dedupe per leave_type_id: the branch-specific row wins.
+    policy_rows = db.execute(
+        select(CustomerLeavePolicy, LeavePolicyType.name)
+        .join(LeavePolicyType, LeavePolicyType.id == CustomerLeavePolicy.leave_type_id)
+        .where(
+            CustomerLeavePolicy.customer_id == branch.customer_id,
+            CustomerLeavePolicy.is_active.is_(True),
+            or_(CustomerLeavePolicy.branch_id == branch.id,
+                CustomerLeavePolicy.branch_id.is_(None)),
+        )
+    ).all()
+    chosen: dict[int, tuple[CustomerLeavePolicy, str]] = {}
+    for pol, type_name in policy_rows:
+        prev = chosen.get(pol.leave_type_id)
+        if prev is None or (pol.branch_id is not None and prev[0].branch_id is None):
+            chosen[pol.leave_type_id] = (pol, type_name)
+
+    def _agg_source(pols) -> str | None:
+        if not pols:
+            return None
+        return "branch" if any(p.branch_id is not None for p in pols) else "customer"
+
+    picked = [p for p, _ in chosen.values()]
+    data["leave_total"] = (
+        float(sum(Decimal(str(p.leave_credit_balance or 0)) for p in picked))
+        if picked else None
+    )
+    sources["leave_total"] = _agg_source(picked)
+
+    monthly = [p for p in picked if p.leave_credit_type == "Monthly"]
+    data["credit_leave_monthly"] = (
+        float(sum(Decimal(str(p.leave_credit_balance or 0)) for p in monthly))
+        if monthly else None
+    )
+    sources["credit_leave_monthly"] = _agg_source(monthly)
+
+    # Leave Policy name: only when EXACTLY ONE active leave type applies to the
+    # branch (per the same dedupe rule) — otherwise no single value maps.
+    if len(chosen) == 1:
+        only_pol, only_name = next(iter(chosen.values()))
+        data["leave_policy_name"] = only_name
+        sources["leave_policy_name"] = "branch" if only_pol.branch_id is not None else "customer"
+    else:
+        data["leave_policy_name"] = None
+        sources["leave_policy_name"] = None
+
+    data["sources"] = sources
+    return data
 
 
 # ---------------------------------------------------------------- holiday count

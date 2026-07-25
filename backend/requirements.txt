@@ -9,7 +9,6 @@ tzdata
 PyJWT
 bcrypt>=4.0.1
 psycopg2-binary
-supabase
 cryptography>=42.0.0
 pytest>=8.0.0
 # --- Karnex CRM (Phase 2+) ---

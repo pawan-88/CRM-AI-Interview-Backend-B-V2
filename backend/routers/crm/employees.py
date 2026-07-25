@@ -9,7 +9,7 @@ from decimal import Decimal
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params
@@ -168,6 +168,9 @@ def update_employee(employee_id: int, body: EmployeeUpdate, db: Session = Depend
 @router.delete("/{employee_id}")
 def delete_employee(employee_id: int, db: Session = Depends(get_crm_db),
                     user: CurrentUser = Depends(EMP_WRITE)):
+    from models import LeaveAccrualEvent, LeaveApplication
+    from services.crm_common import commit_or_conflict
+
     emp = get_employee_or_404(db, employee_id)
     linked_project = db.execute(
         select(ProjectEmployee.id).where(ProjectEmployee.employee_id == emp.id).limit(1)
@@ -175,13 +178,48 @@ def delete_employee(employee_id: int, db: Session = Depends(get_crm_db),
     linked_timesheet = db.execute(
         select(Timesheet.id).where(Timesheet.employee_id == emp.id).limit(1)
     ).first()
-    if linked_project or linked_timesheet:
-        raise HTTPException(
-            status_code=400,
-            detail="Employee has project/timesheet records; deactivate (is_active=false) instead",
+    leave_apps = db.execute(
+        select(func.count()).select_from(LeaveApplication).where(
+            LeaveApplication.employee_id == emp.id
         )
+    ).scalar() or 0
+    leave_events = db.execute(
+        select(func.count()).select_from(LeaveAccrualEvent).where(
+            LeaveAccrualEvent.employee_id == emp.id
+        )
+    ).scalar() or 0
+    if linked_project or linked_timesheet or leave_apps or leave_events:
+        parts = []
+        if linked_project:
+            parts.append("project assignment(s)")
+        if linked_timesheet:
+            parts.append("timesheet(s)")
+        if leave_apps:
+            parts.append(f"{leave_apps} leave application(s)")
+        if leave_events:
+            parts.append(f"{leave_events} leave ledger event(s)")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete: employee has {', '.join(parts)}. "
+                "Deactivate (is_active=false) instead, or remove those records first."
+            ),
+        )
+    # Clear self-FK manager pointers so peers don't block the delete.
+    for other in db.execute(
+        select(Employee).where(
+            or_(
+                Employee.reporting_manager_id == emp.id,
+                Employee.reporting_hr_id == emp.id,
+            )
+        )
+    ).scalars().all():
+        if other.reporting_manager_id == emp.id:
+            other.reporting_manager_id = None
+        if other.reporting_hr_id == emp.id:
+            other.reporting_hr_id = None
     db.delete(emp)
-    db.commit()
+    commit_or_conflict(db, "Cannot delete: employee is still referenced by other records.")
     return envelope(message="Employee deleted")
 
 

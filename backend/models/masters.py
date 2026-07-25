@@ -62,6 +62,15 @@ class LeavePolicyType(Base):
     carry_forward_rule = sa.Column(sa.String(255), nullable=True)
 
 
+class ContactRole(Base):
+    """Branch / customer contact person role master (Finance, HR, …)."""
+
+    __tablename__ = "contact_roles"
+    id = sa.Column(sa.Integer, primary_key=True)
+    name = sa.Column(sa.String(120), nullable=False, unique=True)
+    is_active = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
+
+
 class FinancialYear(Base):
     """Indian financial year master, e.g. "FY 2026-27" (Apr 1 → Mar 31)."""
 

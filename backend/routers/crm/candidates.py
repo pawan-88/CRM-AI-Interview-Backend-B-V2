@@ -108,15 +108,23 @@ def update_candidate(candidate_id: int, payload: CandidateUpdate,
 def delete_candidate(candidate_id: int,
                      db: Session = Depends(get_crm_db),
                      user: CurrentUser = Depends(write_roles)):
+    from models import CandidateOutreach, Resume
+    from services.crm_common import commit_or_conflict
+    from services.crm_delete import cascade_candidate_children
+
     candidate = get_candidate_or_404(db, candidate_id)
-    has_profiles = db.execute(
-        select(CandidateProfile.id).where(CandidateProfile.candidate_id == candidate.id).limit(1)
-    ).first() is not None
-    if has_profiles:
-        raise HTTPException(status_code=409,
-                            detail="Candidate has linked candidate-profiles and cannot be deleted")
+    # Cascade profiles, AI interview links, and slot bookings owned by this candidate.
+    cascade_candidate_children(db, candidate.id)
+    for row in db.execute(
+        select(CandidateOutreach).where(CandidateOutreach.candidate_id == candidate.id)
+    ).scalars().all():
+        db.delete(row)
+    for resume in db.execute(
+        select(Resume).where(Resume.candidate_id == candidate.id)
+    ).scalars().all():
+        resume.candidate_id = None
     db.delete(candidate)
-    db.commit()
+    commit_or_conflict(db, "Cannot delete: candidate is still referenced by other records.")
     return envelope(message="Candidate deleted")
 
 

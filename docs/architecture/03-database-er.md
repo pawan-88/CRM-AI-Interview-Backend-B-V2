@@ -19,7 +19,7 @@ graph TB
         notif["notifications"]
     end
     subgraph masters["Masters"]
-        m["departments · designations · skills · locations<br/>currencies · document_types · leave_policy_types · app_settings"]
+        m["departments · designations · skills · locations<br/>currencies · document_types · contact_roles · leave_policy_types · app_settings"]
     end
     subgraph sales["Sales domain"]
         cust["customers · branches · contacts<br/>billing_policies · documents"]
@@ -154,7 +154,13 @@ erDiagram
         int id PK
         int customer_id FK
         int branch_id FK
+        string role "from contact_roles master"
         boolean is_hiring_manager
+    }
+    contact_roles {
+        int id PK
+        string name UK
+        boolean is_active
     }
     opportunities {
         int id PK
@@ -260,12 +266,15 @@ erDiagram
 erDiagram
     opportunities ||--o{ projects : "delivered as"
     customers ||--o{ projects : "for"
+    customer_branches ||--o{ projects : "delivery branch"
     projects ||--o{ project_employees : "staffs"
     employees ||--o{ project_employees : "assigned"
     project_employees ||--o{ project_employee_leave_details : "leave"
     project_employees ||--o{ project_employee_rates : "rates"
     leave_policy_types ||--o{ project_employee_leave_details : "of type"
     customer_leave_policies ||--o{ project_employee_leave_details : "seeds"
+    projects ||--o{ project_leave_policies : "leave policy"
+    leave_policy_types ||--o{ project_leave_policies : "of type"
     projects ||--o{ project_communication_matrix : "has"
     employees ||--o| registration_data : "user_id (1:1)"
     departments ||--o{ employees : "in"
@@ -288,8 +297,41 @@ erDiagram
         int id PK
         int opportunity_id FK
         int customer_id FK
-        enum billing_frequency "Monthly|Bi_Weekly|Weekly"
+        int branch_id FK "nullable; explicit delivery branch"
+        enum billing_frequency "Monthly|Bi_Weekly|Weekly|Quarterly|Yearly"
+        bool recurring_billing
+        bool holidays_billable
+        bool weekoff_billable
+        decimal hours_required_half_day
+        decimal hours_required_full_day
+        decimal hours_required_half_day_comp_off
+        decimal hours_required_full_day_comp_off
+        bool is_max_billable_hours_per_day
+        decimal max_billable_hours_day
+        bool is_max_billable_hours_per_month
+        decimal max_billable_hours_month
+        bool is_max_billable_days_per_month
+        int max_billable_days_month
+        bool is_initial_no_billing_period
+        int initial_no_billing_qty "numeric count (UI Period)"
+        string initial_no_billing_period "unit Hours|Days|… (UI QTY)"
         enum status "Active|Completed|On_Hold"
+    }
+    project_leave_policies {
+        int id PK
+        int project_id FK
+        int leave_type_id FK
+        string name
+        string leave_credit_type "VARCHAR(64); Monthly|…|Credit Balance Every Month"
+        decimal leave_credit_balance
+        decimal initial_credit_balance
+        string leave_expire "Monthly|Quarterly|Annually|Carry Forward"
+        bool is_max_limit
+        int maximum_carry_forward
+        date effective_date "accrual lower bound with PE.onboarding_date"
+        bool is_active
+        datetime created_at
+        datetime updated_at
     }
     project_employees {
         int id PK
@@ -361,6 +403,9 @@ erDiagram
         date entry_date
         enum day_type "Working|Week_Off|Holiday"
         enum attendance_status "Present|Absent|Half_Day|Leave|Holiday|Week_Off"
+        string leave_type "nullable"
+        enum leave_period "Full|Half_AM|Half_PM nullable"
+        string leave_reason "nullable optional Apply-leave note ≤255"
         decimal hours_worked
         decimal billable_hours
         decimal billable_days

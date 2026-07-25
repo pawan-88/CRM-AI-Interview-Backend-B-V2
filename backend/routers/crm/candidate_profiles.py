@@ -9,7 +9,7 @@ from datetime import date
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, role_required
@@ -143,9 +143,21 @@ def update_profile(profile_id: int, payload: ProfileUpdate,
 def delete_profile(profile_id: int,
                    db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(create_roles)):
+    from models import AiInterviewLink, Employee
+    from services.crm_common import commit_or_conflict
+
     profile = get_profile_or_404(db, profile_id)
+    # Cascade AI interview links owned by this profile.
+    for link in db.execute(
+        select(AiInterviewLink).where(AiInterviewLink.profile_id == profile.id)
+    ).scalars().all():
+        db.delete(link)
+    for emp in db.execute(
+        select(Employee).where(Employee.candidate_profile_id == profile.id)
+    ).scalars().all():
+        emp.candidate_profile_id = None
     db.delete(profile)
-    db.commit()
+    commit_or_conflict(db, "Cannot delete: candidate profile is still referenced by other records.")
     return envelope(message="Candidate profile deleted")
 
 

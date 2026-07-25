@@ -117,6 +117,7 @@ class TimesheetEntry(Base):
                                   server_default=AttendanceStatus.PRESENT.value)
     leave_type = sa.Column(sa.String(64), nullable=True)  # casual / sick / earned / comp-off / ...
     leave_period = sa.Column(pg_enum(LeavePeriod, "leave_period"), nullable=True)
+    leave_reason = sa.Column(sa.String(255), nullable=True)  # optional note from Apply-leave dialog
     billable_hours = sa.Column(sa.Numeric(4, 2), nullable=False, server_default="0")
     billable_days = sa.Column(sa.Numeric(3, 2), nullable=False, server_default="0")
     location = sa.Column(pg_enum(EntryLocation, "entry_location"), nullable=True)

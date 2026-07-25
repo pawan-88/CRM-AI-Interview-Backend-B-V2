@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, or_, select
@@ -11,25 +12,27 @@ from crm_deps import (
     CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params,
 )
 from models import (
-    Customer, CustomerLeavePolicy, Employee, Project, ProjectCommunicationMatrix,
-    ProjectEmployee, ProjectEmployeeLeaveDetail, ProjectEmployeeRate, ProjectStatus,
-    Timesheet, TimesheetStatus,
+    BillingFrequency, Customer, CustomerLeavePolicy, Employee, LeavePolicyType, Project,
+    ProjectCommunicationMatrix, ProjectEmployee, ProjectEmployeeLeaveDetail,
+    ProjectEmployeeRate, ProjectLeavePolicy, ProjectStatus, Timesheet, TimesheetStatus,
 )
 from schemas.common import envelope
 from schemas.projects import (
     CommMatrixIn, ProjectCreate, ProjectEmployeeIn, ProjectEmployeeLeaveDetailUpdate,
-    ProjectEmployeeRateIn, ProjectEmployeeRateUpdate, ProjectEmployeeUpdate, ProjectUpdate,
+    ProjectEmployeeRateIn, ProjectEmployeeRateUpdate, ProjectEmployeeUpdate,
+    ProjectLeavePolicyCreate, ProjectLeavePolicyUpdate, ProjectUpdate,
 )
 from services.crm_common import paginate
 from services.project_employees import (
     clear_other_current_rates, enrich_pe_list_row, ensure_initial_rate, exit_project_employee,
     get_pe_or_404, group_pe_rows_by_employee, leave_detail_out, project_employee_detail_out,
     rate_out, seed_leave_details_from_customer_policy, sync_pe_billing_from_current_rate,
+    sync_pe_leave_from_customer_policy,
 )
 from services.projects import (
     add_history_entry, comm_entry_out, get_project_or_404, open_history_row,
-    project_detail_out, project_employee_out, project_history, project_out,
-    validate_project_refs,
+    project_detail_out, project_employee_out, project_history, project_leave_policy_out,
+    project_out, validate_project_refs,
 )
 from services.timesheets import timesheet_out
 
@@ -39,6 +42,65 @@ read_projects = gated_read("projects")
 write_projects = gated_write("projects", "Sales_Head", "Finance")
 read_pe = gated_read("project-employees")
 write_pe = gated_write("project-employees", "Sales_Head", "HR", "Finance")
+
+
+def _get_leave_policy_or_404(db: Session, policy_id: int) -> ProjectLeavePolicy:
+    policy = db.get(ProjectLeavePolicy, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Leave policy not found")
+    return policy
+
+
+def _apply_leave_policy_update(
+    db: Session, policy: ProjectLeavePolicy, body: ProjectLeavePolicyUpdate,
+) -> ProjectLeavePolicy:
+    changes = body.model_dump(exclude_unset=True)
+    if "leave_type_id" in changes and changes["leave_type_id"] is not None:
+        if db.get(LeavePolicyType, changes["leave_type_id"]) is None:
+            raise HTTPException(status_code=400, detail="Leave policy type not found")
+        other = db.execute(
+            select(ProjectLeavePolicy).where(
+                ProjectLeavePolicy.project_id == policy.project_id,
+                ProjectLeavePolicy.leave_type_id == changes["leave_type_id"],
+                ProjectLeavePolicy.id != policy.id,
+            ).limit(1)
+        ).scalars().first()
+        if other is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="A leave policy for this project/leave type already exists",
+            )
+    for field, value in changes.items():
+        setattr(policy, field, value)
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+# Flat leave-policy routes MUST be registered before /{project_id} so FastAPI
+# does not try to coerce "leave-policies" into an int project_id.
+@router.put("/leave-policies/{policy_id}")
+def update_project_leave_policy_by_id(
+    policy_id: int,
+    body: ProjectLeavePolicyUpdate,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_projects),
+):
+    policy = _get_leave_policy_or_404(db, policy_id)
+    policy = _apply_leave_policy_update(db, policy, body)
+    return envelope(data=project_leave_policy_out(db, policy), message="Leave policy updated")
+
+
+@router.delete("/leave-policies/{policy_id}")
+def delete_project_leave_policy_by_id(
+    policy_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_projects),
+):
+    policy = _get_leave_policy_or_404(db, policy_id)
+    policy.is_active = False
+    db.commit()
+    return envelope(data=project_leave_policy_out(db, policy), message="Leave policy deactivated")
 
 
 # ---------------------------------------------------------------- CRUD
@@ -72,20 +134,94 @@ def create_project(
     user: CurrentUser = Depends(write_projects),
 ):
     validate_project_refs(db, body.opportunity_id, body.customer_id)
+    # Resolve explicit branch: client branch_id (wizard) → opportunity.branch_id.
+    from models import CustomerBranch, Opportunity
+    resolved_branch_id = body.branch_id
+    if resolved_branch_id is not None:
+        branch_row = db.get(CustomerBranch, resolved_branch_id)
+        if branch_row is None or branch_row.customer_id != body.customer_id:
+            raise HTTPException(status_code=400, detail="Branch not found for this customer")
+    else:
+        opp = db.get(Opportunity, body.opportunity_id)
+        if opp is not None and opp.branch_id is not None:
+            resolved_branch_id = opp.branch_id
+    # Apply only fields the client sent so unset policy columns can seed from branch.
+    provided = body.model_fields_set
     project = Project(
         opportunity_id=body.opportunity_id,
         customer_id=body.customer_id,
+        branch_id=resolved_branch_id,
         name=body.name,
         billing_cycle_start_day=body.billing_cycle_start_day,
         billing_cycle_end_day=body.billing_cycle_end_day,
         billing_frequency=body.billing_frequency,
+        recurring_billing=body.recurring_billing,
         max_billable_hours_day=body.max_billable_hours_day,
         max_billable_hours_month=body.max_billable_hours_month,
         max_billable_days_month=body.max_billable_days_month,
         no_billing_period_days=body.no_billing_period_days,
         status=body.status,
     )
+    for attr in (
+        "holidays_billable", "weekoff_billable", "leave_billable", "comp_off_billable",
+        "hours_required_half_day", "hours_required_full_day",
+        "hours_required_half_day_comp_off", "hours_required_full_day_comp_off",
+        "working_hours_per_day",
+        "is_max_billable_hours_per_day", "is_max_billable_hours_per_month",
+        "is_max_billable_days_per_month", "is_initial_no_billing_period",
+        "initial_no_billing_qty", "initial_no_billing_period",
+    ):
+        if attr in provided:
+            setattr(project, attr, getattr(body, attr))
     db.add(project)
+    # Seed unset billing props from the branch this project bills against
+    # (project.branch_id → opportunity.branch_id). Only fills fields the client left unset;
+    # never overwrites a provided value. Fields the branch doesn't set are left as-is.
+    from services.timesheets import _project_branch
+    branch = _project_branch(db, project)
+    if branch is not None:
+        provided = body.model_fields_set
+        # (Project column, CustomerBranch column) — only pairs where both exist.
+        for proj_attr, branch_attr in (
+            ("billing_cycle_start_day", "billing_cycle_start_day"),
+            ("billing_cycle_end_day", "billing_cycle_end_day"),
+            ("max_billable_hours_day", "max_billable_hours_per_day"),
+            ("max_billable_hours_month", "max_billable_hours_per_month"),
+            ("max_billable_days_month", "max_billable_days_per_month"),
+            ("no_billing_period_days", "initial_no_billing_qty"),
+            ("holidays_billable", "holidays_billable"),
+            ("weekoff_billable", "weekoff_billable"),
+            ("leave_billable", "leave_billable"),
+            ("comp_off_billable", "comp_off_billable"),
+            ("is_max_billable_hours_per_day", "is_max_billable_hours_per_day"),
+            ("is_max_billable_hours_per_month", "is_max_billable_hours_per_month"),
+            ("is_max_billable_days_per_month", "is_max_billable_days_per_month"),
+            ("hours_required_half_day", "hours_required_half_day"),
+            ("hours_required_full_day", "hours_required_full_day"),
+            ("hours_required_half_day_comp_off", "hours_required_half_day_comp_off"),
+            ("hours_required_full_day_comp_off", "hours_required_full_day_comp_off"),
+            ("working_hours_per_day", "working_hours_per_day"),
+            ("is_initial_no_billing_period", "is_initial_no_billing_period"),
+            ("initial_no_billing_qty", "initial_no_billing_qty"),
+            ("initial_no_billing_period", "initial_no_billing_period"),
+        ):
+            if proj_attr in provided:
+                continue
+            val = getattr(branch, branch_attr, None)
+            if val is not None:
+                setattr(project, proj_attr, val)
+        # billing_frequency is free-text on the branch; map to the project enum.
+        # Accept both Bi_Weekly (canonical) and Bi-Weekly (UI label) from branch.
+        if "billing_frequency" not in provided and branch.billing_frequency:
+            raw = str(branch.billing_frequency).strip().replace("-", "_")
+            try:
+                project.billing_frequency = BillingFrequency(raw)
+            except ValueError:
+                # try title-case Monthly/Weekly variants already matching enum values
+                try:
+                    project.billing_frequency = BillingFrequency(branch.billing_frequency)
+                except ValueError:
+                    pass
     db.commit()
     db.refresh(project)
     return envelope(data=project_out(project), message="Project created")
@@ -145,6 +281,13 @@ def list_all_project_employees(
     flat: list[dict] = []
     for pe, emp, proj, customer_name in rows:
         d = project_employee_out(pe, emp)
+        # Spec: role_title from PE.role_title, else employee designation name,
+        # else employee.role_title (already folded into project_employee_out).
+        if not d.get("role_title") and emp is not None and emp.designation_id:
+            from models.masters import Designation
+            desig = db.get(Designation, emp.designation_id)
+            if desig and desig.name:
+                d["role_title"] = desig.name
         d["project_name"] = proj.name
         d["customer_id"] = proj.customer_id
         d["customer_name"] = customer_name
@@ -169,6 +312,38 @@ def get_project_employee_detail(
 ):
     pe = get_pe_or_404(db, pe_id)
     return envelope(data=project_employee_detail_out(db, pe))
+
+
+@router.post("/employees/{pe_id}/leave/sync")
+def sync_project_employee_leave_policies(
+    pe_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(gated_write("project-employees", "Admin", "HR")),
+):
+    """Back-fill missing PE leave types from customer/branch policy (idempotent).
+
+    Existing balances/consumed are never modified — only new leave types are added.
+    """
+    pe = get_pe_or_404(db, pe_id)
+    result = sync_pe_leave_from_customer_policy(db, pe)
+    db.commit()
+    detail = project_employee_detail_out(db, pe)
+    added_names = [a.get("leave_type_name") or f"#{a.get('leave_type_id')}" for a in result["added"]]
+    msg = (
+        f"Added {result['added_count']} leave type(s): {', '.join(added_names)}"
+        if result["added_count"]
+        else "Leave policies already in sync — nothing to add"
+    )
+    return envelope(
+        data={
+            **result,
+            "leave_details": detail.get("leave_details"),
+            "leave_summary": detail.get("leave_summary"),
+            "leave_eligibility": detail.get("leave_eligibility"),
+            "leave_balance_total": detail.get("leave_balance_total"),
+        },
+        message=msg,
+    )
 
 
 @router.put("/employees/{pe_id}")
@@ -232,6 +407,76 @@ def exit_project_employee_endpoint(
     data = project_employee_detail_out(db, pe)
     data["exit_summary"] = summary
     return envelope(data=data, message="Project employee exited")
+
+
+@router.delete("/employees/{pe_id}")
+def delete_project_employee(
+    pe_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_pe),
+):
+    """Hard-delete a PE mapping.
+
+    Cascades draft/non-approved timesheets and deletable invoices (+ unpaid TDS)
+    linked to this assignment. Blocks when approved timesheets remain after
+    invoice cascade fails, or when invoices have payments / credit notes
+    (message lists invoice numbers).
+    """
+    from models import LeaveApplication
+    from services.crm_common import commit_or_conflict
+    from services.crm_delete import (
+        cascade_delete_invoices,
+        cascade_pe_draft_timesheets,
+        invoices_for_timesheet_ids,
+        pe_timesheet_query,
+        purge_timesheet,
+    )
+
+    pe = get_pe_or_404(db, pe_id)
+    ts_rows = list(db.execute(pe_timesheet_query(pe_id, pe.project_id, pe.employee_id)).scalars().all())
+    ts_ids = [t.id for t in ts_rows]
+    linked_invoices = invoices_for_timesheet_ids(db, ts_ids)
+    if linked_invoices:
+        # Cascade unpaid invoices; payments / credit notes raise 409 with numbers.
+        cascade_delete_invoices(db, linked_invoices)
+        db.flush()
+        # Refresh timesheet list after invoice removal.
+        ts_rows = list(db.execute(pe_timesheet_query(pe_id, pe.project_id, pe.employee_id)).scalars().all())
+
+    # Cascade draft / rejected sheets; then purge remaining approved (invoices gone).
+    cascade_pe_draft_timesheets(db, pe_id, pe.project_id, pe.employee_id)
+    remaining = list(db.execute(pe_timesheet_query(pe_id, pe.project_id, pe.employee_id)).scalars().all())
+    approved_left = [t for t in remaining if (
+        t.status.value if hasattr(t.status, "value") else str(t.status)
+    ) == TimesheetStatus.APPROVED.value]
+    # After invoices cascaded, approved sheets are safe to purge for cleanup.
+    for ts in approved_left:
+        purge_timesheet(db, ts)
+
+    approved_leave = db.execute(
+        select(func.count()).select_from(LeaveApplication).where(
+            LeaveApplication.project_employee_id == pe_id,
+            LeaveApplication.status == "Approved",
+        )
+    ).scalar() or 0
+    if approved_leave:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete: {approved_leave} approved leave application(s) exist. "
+                "Cancel or remove them first."
+            ),
+        )
+    for app in db.execute(
+        select(LeaveApplication).where(LeaveApplication.project_employee_id == pe_id)
+    ).scalars().all():
+        app.project_employee_id = None
+    db.delete(pe)
+    commit_or_conflict(
+        db,
+        "Cannot delete: project employee is still referenced by other records.",
+    )
+    return envelope(data={"id": pe_id}, message="Project employee deleted")
 
 
 @router.put("/employees/{pe_id}/leave/{leave_id}")
@@ -387,11 +632,214 @@ def update_project(
     project = get_project_or_404(db, project_id)
     changes = body.model_dump(exclude_unset=True)
     validate_project_refs(db, changes.get("opportunity_id"), changes.get("customer_id"))
+    if "branch_id" in changes and changes["branch_id"] is not None:
+        from models import CustomerBranch
+        cust_id = changes.get("customer_id", project.customer_id)
+        branch_row = db.get(CustomerBranch, changes["branch_id"])
+        if branch_row is None or branch_row.customer_id != cust_id:
+            raise HTTPException(status_code=400, detail="Branch not found for this customer")
+    # Guard hour threshold ordering when both (or one + existing) are present.
+    half = changes.get("hours_required_half_day", project.hours_required_half_day)
+    full = changes.get("hours_required_full_day", project.hours_required_full_day)
+    if half is not None and full is not None and Decimal(str(half)) > Decimal(str(full)):
+        raise HTTPException(
+            status_code=400,
+            detail="hours_required_half_day cannot exceed hours_required_full_day",
+        )
     for field, value in changes.items():
         setattr(project, field, value)
+    # If opportunity changed and branch_id was not explicitly set, refresh from opp.
+    if "opportunity_id" in changes and "branch_id" not in changes:
+        from models import Opportunity
+        opp = db.get(Opportunity, project.opportunity_id)
+        if opp is not None and opp.branch_id is not None:
+            project.branch_id = opp.branch_id
     db.commit()
     db.refresh(project)
     return envelope(data=project_out(project), message="Project updated")
+
+
+@router.delete("/{project_id}")
+def delete_project(
+    project_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_projects),
+):
+    """Hard-delete a project.
+
+    Cascades team assignments, timesheets, and deletable invoices (+ unpaid TDS).
+    Approved leave apps still block. Invoices with payments / credit notes 409
+    with invoice numbers.
+    """
+    from models import (
+        EmployeeProjectHistory, LeaveApplication, POProjectAllocation, TimesheetEntry,
+    )
+    from services.crm_common import commit_or_conflict
+    from services.crm_delete import (
+        cascade_delete_invoices,
+        cascade_project_timesheets,
+        invoices_for_project,
+        purge_timesheet,
+    )
+
+    project = get_project_or_404(db, project_id)
+    approved_leave = db.execute(
+        select(func.count()).select_from(LeaveApplication).where(
+            LeaveApplication.project_id == project_id,
+            LeaveApplication.status == "Approved",
+        )
+    ).scalar() or 0
+    if approved_leave:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete: {approved_leave} approved leave application(s) exist. "
+                "Remove them first."
+            ),
+        )
+
+    # Cascade deletable invoices first (payments / CNs block with numbers).
+    invs = invoices_for_project(db, project_id)
+    if invs:
+        cascade_delete_invoices(db, invs)
+        db.flush()
+
+    # Draft sheets, then any remaining (approved) after invoices are gone.
+    cascade_project_timesheets(db, project_id, include_approved=False)
+    for ts in db.execute(
+        select(Timesheet).where(Timesheet.project_id == project_id)
+    ).scalars().all():
+        purge_timesheet(db, ts)
+
+    # HR project history has no cascade — drop with the project.
+    for hist in db.execute(
+        select(EmployeeProjectHistory).where(EmployeeProjectHistory.project_id == project_id)
+    ).scalars().all():
+        db.delete(hist)
+    # Soft-clear leave apps that still point at this project (non-Approved only).
+    for app in db.execute(
+        select(LeaveApplication).where(LeaveApplication.project_id == project_id)
+    ).scalars().all():
+        app.project_id = None
+        app.project_employee_id = None
+    # Split-billing entries on *other* timesheets may still reference this project.
+    for entry in db.execute(
+        select(TimesheetEntry).where(TimesheetEntry.entry_project_id == project_id)
+    ).scalars().all():
+        entry.entry_project_id = None
+    # Purge all PE rows (active + inactive) after finance/timesheet cascade.
+    for pe in db.execute(
+        select(ProjectEmployee).where(ProjectEmployee.project_id == project_id)
+    ).scalars().all():
+        for app in db.execute(
+            select(LeaveApplication).where(LeaveApplication.project_employee_id == pe.id)
+        ).scalars().all():
+            app.project_employee_id = None
+        db.delete(pe)
+    # Drop PO allocations that only reference this project (non-financial orphan).
+    allocs = db.execute(
+        select(POProjectAllocation).where(POProjectAllocation.project_id == project_id)
+    ).scalars().all()
+    for a in allocs:
+        db.delete(a)
+    db.delete(project)
+    commit_or_conflict(
+        db,
+        "Cannot delete: project is still referenced by other records. Remove dependencies first.",
+    )
+    return envelope(data={"id": project_id}, message="Project deleted")
+
+
+# ---------------------------------------------------------------- leave policies (project-scoped)
+
+@router.get("/{project_id}/leave-policies")
+def list_project_leave_policies(
+    project_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_projects),
+):
+    get_project_or_404(db, project_id)
+    pols = db.execute(
+        select(ProjectLeavePolicy)
+        .where(ProjectLeavePolicy.project_id == project_id,
+               ProjectLeavePolicy.is_active.is_(True))
+        .order_by(ProjectLeavePolicy.id)
+    ).scalars().all()
+    return envelope(
+        data=[project_leave_policy_out(db, p) for p in pols],
+        message="Project leave policies",
+    )
+
+
+@router.post("/{project_id}/leave-policies")
+def create_project_leave_policy(
+    project_id: int,
+    body: ProjectLeavePolicyCreate,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_projects),
+):
+    get_project_or_404(db, project_id)
+    if db.get(LeavePolicyType, body.leave_type_id) is None:
+        raise HTTPException(status_code=400, detail="Leave policy type not found")
+    dup = db.execute(
+        select(ProjectLeavePolicy).where(
+            ProjectLeavePolicy.project_id == project_id,
+            ProjectLeavePolicy.leave_type_id == body.leave_type_id,
+        ).limit(1)
+    ).scalars().first()
+    if dup is not None:
+        if not dup.is_active:
+            # Reactivate soft-deleted row with new values
+            for field, value in body.model_dump().items():
+                setattr(dup, field, value)
+            dup.is_active = True
+            db.commit()
+            db.refresh(dup)
+            return envelope(data=project_leave_policy_out(db, dup),
+                            message="Leave policy reactivated")
+        raise HTTPException(
+            status_code=409,
+            detail="A leave policy for this project/leave type already exists",
+        )
+    policy = ProjectLeavePolicy(project_id=project_id, **body.model_dump())
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+    return envelope(data=project_leave_policy_out(db, policy), message="Leave policy created")
+
+
+@router.put("/{project_id}/leave-policies/{policy_id}")
+def update_project_leave_policy(
+    project_id: int,
+    policy_id: int,
+    body: ProjectLeavePolicyUpdate,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_projects),
+):
+    """Nested alias — prefer PUT /api/projects/leave-policies/{id}."""
+    get_project_or_404(db, project_id)
+    policy = db.get(ProjectLeavePolicy, policy_id)
+    if policy is None or policy.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Leave policy not found for this project")
+    policy = _apply_leave_policy_update(db, policy, body)
+    return envelope(data=project_leave_policy_out(db, policy), message="Leave policy updated")
+
+
+@router.delete("/{project_id}/leave-policies/{policy_id}")
+def delete_project_leave_policy(
+    project_id: int,
+    policy_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_projects),
+):
+    """Nested alias — prefer DELETE /api/projects/leave-policies/{id}."""
+    get_project_or_404(db, project_id)
+    policy = db.get(ProjectLeavePolicy, policy_id)
+    if policy is None or policy.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Leave policy not found for this project")
+    policy.is_active = False
+    db.commit()
+    return envelope(data=project_leave_policy_out(db, policy), message="Leave policy deactivated")
 
 
 # ---------------------------------------------------------------- team

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -337,16 +337,30 @@ def delete_opportunity(
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("opportunities", "Sales_Head")),
 ):
+    from models import Project
+    from services.crm_common import commit_or_conflict
+    from services.crm_delete import cascade_opportunity_children
+
     opp = get_opportunity_or_404(db, opportunity_id)
-    db.delete(opp)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
+    # Projects carry finance/timesheet history — keep as hard blocker with counts.
+    proj_n = db.execute(
+        select(func.count()).select_from(Project).where(Project.opportunity_id == opportunity_id)
+    ).scalar() or 0
+    if proj_n:
         raise HTTPException(
-            status_code=400,
-            detail="Opportunity is referenced by other records (requirements) and cannot be deleted",
+            status_code=409,
+            detail=(
+                f"Cannot delete: {proj_n} project(s) exist. "
+                "Delete or reassign those projects first."
+            ),
         )
+    # Cascade recruiting children (requirements, profiles, AI links, slots, TRs).
+    cascade_opportunity_children(db, opportunity_id)
+    db.delete(opp)
+    commit_or_conflict(
+        db,
+        "Cannot delete: opportunity is still referenced by other records. Remove dependencies first.",
+    )
     return envelope(data={"id": opportunity_id}, message="Opportunity deleted")
 
 

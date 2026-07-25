@@ -13,6 +13,8 @@ class BillingFrequency(str, enum.Enum):
     MONTHLY = "Monthly"
     BI_WEEKLY = "Bi_Weekly"
     WEEKLY = "Weekly"
+    QUARTERLY = "Quarterly"
+    YEARLY = "Yearly"
 
 
 class ProjectStatus(str, enum.Enum):
@@ -37,11 +39,15 @@ class Project(Base):
     id = sa.Column(sa.Integer, primary_key=True)
     opportunity_id = sa.Column(sa.Integer, sa.ForeignKey("opportunities.id"), nullable=False, index=True)
     customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id"), nullable=False, index=True)
+    # Explicit delivery branch (nullable for legacy rows until backfilled).
+    # Prefer this over opportunity.branch_id for branch-policy / linked-projects scoping.
+    branch_id = sa.Column(sa.Integer, sa.ForeignKey("customer_branches.id"), nullable=True, index=True)
     name = sa.Column(sa.String(255), nullable=False)
     billing_cycle_start_day = sa.Column(sa.Integer, nullable=False, server_default="1")
     billing_cycle_end_day = sa.Column(sa.Integer, nullable=False, server_default="31")
     billing_frequency = sa.Column(pg_enum(BillingFrequency, "billing_frequency"), nullable=False,
                                   server_default=BillingFrequency.MONTHLY.value)
+    recurring_billing = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
     max_billable_hours_day = sa.Column(sa.Numeric(4, 2), nullable=True)
     max_billable_hours_month = sa.Column(sa.Numeric(6, 2), nullable=True)
     max_billable_days_month = sa.Column(sa.Integer, nullable=True)
@@ -60,6 +66,10 @@ class Project(Base):
     is_max_billable_hours_per_month = sa.Column(sa.Boolean, nullable=True)
     is_max_billable_days_per_month = sa.Column(sa.Boolean, nullable=True)
     is_initial_no_billing_period = sa.Column(sa.Boolean, nullable=True)
+    # Column semantics (SOURCE UI labels are swapped vs these names):
+    #   initial_no_billing_qty     = numeric count (UI "Initial No Billing Period")
+    #   initial_no_billing_period  = unit string Hours|Days|Week|Month|Year
+    #                                (UI "Initial No Billing QTY")
     initial_no_billing_qty = sa.Column(sa.Integer, nullable=True)
     initial_no_billing_period = sa.Column(sa.String(40), nullable=True)
     status = sa.Column(pg_enum(ProjectStatus, "project_status"), nullable=False,
@@ -69,6 +79,39 @@ class Project(Base):
     employees = relationship("ProjectEmployee", back_populates="project", cascade="all, delete-orphan")
     communication_matrix = relationship("ProjectCommunicationMatrix", back_populates="project",
                                         cascade="all, delete-orphan")
+    leave_policies = relationship("ProjectLeavePolicy", back_populates="project",
+                                  cascade="all, delete-orphan")
+
+
+class ProjectLeavePolicy(Base):
+    """Per-project leave crediting rules for one leave type (Edit Project §2).
+
+    Distinct from customer_leave_policies (customer/branch scope) and from
+    project_employee_leave_details (per-assignment balances).
+    """
+
+    __tablename__ = "project_leave_policies"
+    id = sa.Column(sa.Integer, primary_key=True)
+    project_id = sa.Column(sa.Integer, sa.ForeignKey("projects.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    leave_type_id = sa.Column(sa.Integer, sa.ForeignKey("leave_policy_types.id"), nullable=False)
+    name = sa.Column(sa.String(255), nullable=True)
+    leave_credit_type = sa.Column(sa.String(40), nullable=False, server_default="Monthly")
+    leave_credit_balance = sa.Column(sa.Numeric(5, 2), nullable=False, server_default="0")
+    initial_credit_balance = sa.Column(sa.Numeric(5, 2), nullable=False, server_default="0")
+    leave_expire = sa.Column(sa.String(40), nullable=False, server_default="Annually")
+    is_max_limit = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    maximum_carry_forward = sa.Column(sa.Integer, nullable=False, server_default="0")
+    effective_date = sa.Column(sa.Date, nullable=True)
+    is_active = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    updated_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(),
+                           onupdate=sa.func.now(), nullable=False)
+    __table_args__ = (sa.UniqueConstraint("project_id", "leave_type_id",
+                                          name="uq_project_leave_policy"),)
+
+    project = relationship("Project", back_populates="leave_policies")
+    leave_type = relationship("LeavePolicyType")
 
 
 class ProjectEmployee(Base):

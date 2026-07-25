@@ -71,8 +71,9 @@ journey
 journey
     title Sales / Sales_Head — pipeline to delivery
     section Sales
-      Create customer + branches/contacts: 4: Sales
-      Create opportunity: 4: Sales
+      Create customer + branches/contacts (5-step wizard): 4: Sales
+      Edit branch (4-step: Info → Holiday Billing → Leave & Holiday Billing + Billable Leave → Billing Props): 4: Sales
+      Create opportunity (11-step wizard, Prev+Next bottom-right): 4: Sales
       Add type-aware Candidate CTC slabs with auto revenue and budget: 4: Sales
       Advance pipeline stage: 3: Sales
       Create requirement (Draft): 4: Sales
@@ -80,7 +81,7 @@ journey
     section Sales_Head
       Approve/reject requirement: 4: Sales_Head
       Close/cancel requirement: 3: Sales_Head
-      Create project on win: 4: Sales_Head
+      Create project on win (Details → Leave & Holiday Billing Policy ← branch prefill → Billing Properties): 4: Sales_Head
       View executive dashboard: 5: Sales_Head
 ```
 
@@ -100,6 +101,8 @@ journey
       View RMG dashboard: 5: RMG
     section Timesheets
       Review Timesheet Due report: 5: RMG
+      Edit daily grid (Week Off hours editable; Apply leave + Comp-Off): 4: RMG
+      Weekend work: Comp Off Billable → bill or credit: 4: RMG
       Submit/resubmit drafts: 4: RMG
       Approve/reject submitted sheets: 4: RMG
       Generate invoice from approved sheet: 3: RMG
@@ -166,7 +169,7 @@ journey
 ```mermaid
 flowchart TB
     subgraph SalesLane["Sales / Sales_Head"]
-        c1["Create Customer"] --> o1["Create Opportunity"] --> r1["Create + submit Requirement"]
+        c1["Create Customer<br/>(5-step wizard)"] --> o1["Create Opportunity<br/>(wizard: one section per step)"] --> r1["Create + submit Requirement"]
         r1 --> a1["Sales_Head approves"]
     end
     subgraph RMGLane["RMG"]
@@ -188,3 +191,52 @@ flowchart TB
         ts1 --> ap1["Approve timesheets"] --> inv1["PO → Invoice → Payment/TDS"]
     end
 ```
+
+## 5.10 Customer → Branch → Project → Team drill-down
+
+Sales / Sales_Head (and any role with Customers/Projects access) navigate delivery
+context via row clicks and a shared `CrmBreadcrumb` trail. Existing detail routes
+are reused — no new pages.
+
+```mermaid
+flowchart LR
+    list["Customers list"] --> cust["customers/:id<br/>CustomerDetailPage"]
+    cust -->|"Branches tab · row click"| branch["branch-policy/:id<br/>BranchPolicyPage<br/>Projects section"]
+    branch -->|"project row → crmNavigate"| proj["projects/:id<br/>ProjectDetailPage<br/>Overview · Team · Timesheet · PO & Invoices"]
+    proj -->|"Team tab · row click<br/>pe_id"| pe["project-employees/:id<br/>ProjectEmployeeDetailPage"]
+    crumbs["CrmBreadcrumb<br/>Customers / Customer / Branch / Project / Employee"]
+    cust -.-> crumbs
+    branch -.-> crumbs
+    proj -.-> crumbs
+    pe -.-> crumbs
+```
+
+Breadcrumb crumbs (last = current, not a link):
+
+| Page | Trail |
+|------|-------|
+| Customer detail | `Customers / {customer}` |
+| Branch policy | `Customers / {customer} / {branch}` |
+| Project detail | `Customers / {customer} / {branch} / {project}` |
+| Project employee | `Customers / {customer} / {branch} / {project} / {employee}` |
+
+Row-click actions (Edit/Delete) use `stopPropagation` so they do not navigate.
+After a dependency **409**, ConfirmModal disables Delete (Close to dismiss); Employees
+offer **Deactivate** (`PUT is_active=false`) when hard-delete is blocked.
+Serializer additions for crumbs: project detail `customer_id`/`customer_name`/`branch_id`/`branch_name`
+(via `project.branch_id` then opportunity); PE detail top-level `branch_id`/`branch_name`;
+branch policy `customer_name` + `linked_projects`; team rows `pe_id`.
+`projects.branch_id` (0045) is the explicit Branch→Project link; legacy rows fall back to
+`opportunity.branch_id`.
+
+### PE Holidays + leave sync
+- Holidays tab / timesheet holiday dates resolve branch via
+  `pe_effective_branch` / `effective_customer_branch_for_project`
+  (`project.branch_id` → same-customer opportunity branch → calendar/leave fallbacks).
+  Wrong cross-customer opportunity branches are ignored.
+- `POST /api/projects/employees/{pe_id}/leave/sync` (Admin/HR) back-fills missing leave types from
+  customer/branch policy without mutating existing balances (idempotent).
+- Leave accrual start: `accrual_start = max(CustomerLeavePolicy.effective_date, PE.onboarding_date)`
+  (missing side = no bound). Monthly credit job credits 0 for periods ending before that date;
+  One_Time / Yearly-start with a future start opens at 0 and is granted by the credit job on/after
+  the start month. Editing `effective_date` later does not rewrite already-seeded balances.

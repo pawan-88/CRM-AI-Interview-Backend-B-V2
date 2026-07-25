@@ -1,5 +1,5 @@
 """CRM master-data endpoints (departments, designations, skills, locations,
-currencies, document-types, leave-policy-types).
+currencies, document-types, contact-roles, leave-policy-types).
 
 Read: any CRM role. Create/Update: Admin only. All endpoints are generated
 from a single registration loop over services.masters.MasterResource configs.
@@ -17,12 +17,13 @@ from crm_deps import (
     CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, role_required,
 )
 from models import (
-    CalendarYear, Currency, Department, Designation, DocumentType, FinancialYear,
+    CalendarYear, ContactRole, Currency, Department, Designation, DocumentType, FinancialYear,
     LeavePolicyType, Location, Skill, TaxRate,
 )
 from schemas.common import envelope
 from schemas.masters import (
     CalendarYearCreate, CalendarYearOut, CalendarYearUpdate,
+    ContactRoleCreate, ContactRoleOut, ContactRoleUpdate,
     CurrencyCreate, CurrencyOut, CurrencyUpdate,
     DepartmentCreate, DepartmentOut, DepartmentUpdate,
     DesignationCreate, DesignationOut, DesignationUpdate,
@@ -121,6 +122,11 @@ _register(
     "document-types",
     MasterResource(DocumentType, "Document type", (DocumentType.name,), has_is_active=True),
     DocumentTypeCreate, DocumentTypeUpdate, DocumentTypeOut,
+)
+_register(
+    "contact-roles",
+    MasterResource(ContactRole, "Contact role", (ContactRole.name,), has_is_active=True),
+    ContactRoleCreate, ContactRoleUpdate, ContactRoleOut,
 )
 _register(
     "leave-policy-types",

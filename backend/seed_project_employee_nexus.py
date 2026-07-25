@@ -56,6 +56,11 @@ def _ensure_seed_user(session) -> int:
 
 def _ensure_leave_type(session) -> LeavePolicyType:
     lt = session.execute(
+        select(LeavePolicyType).where(LeavePolicyType.name == "Earned Leave")
+    ).scalar_one_or_none()
+    if lt:
+        return lt
+    lt = session.execute(
         select(LeavePolicyType).where(LeavePolicyType.name == "Earned")
     ).scalar_one_or_none()
     if lt:
@@ -65,7 +70,7 @@ def _ensure_leave_type(session) -> LeavePolicyType:
         return lt
     lt, _ = _get_or_create(
         session, LeavePolicyType,
-        name="Earned",
+        name="Earned Leave",
         defaults={"accrual_rule": "1.25 per month", "carry_forward_rule": "Carry forward up to 30 days"},
     )
     return lt

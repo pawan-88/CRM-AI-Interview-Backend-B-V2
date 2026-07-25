@@ -26,6 +26,7 @@ class TimesheetEntryIn(BaseModel):
     attendance_status: AttendanceStatus = AttendanceStatus.PRESENT
     leave_type: str | None = Field(default=None, max_length=64)
     leave_period: LeavePeriod | None = None
+    leave_reason: str | None = Field(default=None, max_length=255)
     location: EntryLocation | None = EntryLocation.ONSITE
     view_flag: bool = False
     entry_project_id: int | None = None

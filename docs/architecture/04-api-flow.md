@@ -25,19 +25,20 @@ graph LR
     end
 
     subgraph crm["CRM API (/api/*)"]
-        me["/api/me"]
-        customers["/api/customers · /all-branches · /api/opportunities"]
+        me["/api/me · /project-leave · /leave-balances"]
+        customers["/api/customers · DELETE (cascade policies/holidays) · /all-branches · /api/opportunities · DELETE (cascade req/profile/AI)"]
         req["/api/requirements · attachments · /api/resumes"]
-        candp["/api/candidates · /api/candidate-profiles"]
+        candp["/api/candidates · DELETE (cascade profiles) · /api/candidate-profiles"]
         aiint["/api/candidate-profiles/{id}/ai-interviews"]
-        proj["/api/projects · /all-employees · /employees/{pe_id} · rates · /api/timesheets"]
-        leave["/api/leave-applications · /api/holidays · /api/holiday-names · /api/customer-leave-policies"]
-        finance["/api/purchase-orders · /api/invoices · /api/tds"]
-        emp["/api/employees"]
-        mast["/api/{masters} · /api/settings"]
+        proj["/api/projects · DELETE /{id} (cascade PE/TS/unpaid INV)<br/>/all-employees · /employees/{pe_id} · DELETE employees/{pe_id}<br/>rates · leave-policies · /api/timesheets · DELETE /{id}"]
+        leave["/api/leave-applications · DELETE /{id}<br/>/api/holidays · /api/holiday-names · /api/customer-leave-policies"]
+        finance["/api/purchase-orders · DELETE (cascade unpaid INV+TDS)<br/>/api/invoices · DELETE (cascade unpaid TDS) · /api/tds · DELETE /tds/{id}"]
+        emp["/api/employees · DELETE (prefer deactivate)"]
+        mast["/api/{masters} · /api/contact-roles · /api/settings"]
         usersadm["/api/users (Admin)"]
         dash["/api/dashboard/* · /api/reports/*"]
         notif["/api/notifications · /api/crm-files/*"]
+        tplreq["/api/template-requests · DELETE /{id}"]
     end
 
     subgraph observ["Admin/Observability (routers/admin.py)"]
@@ -180,29 +181,55 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    map["POST /api/projects/{id}/employees"] --> seed["Seed leave_details from<br/>CustomerLeavePolicy copy<br/>+ pe_seed LeaveAccrualEvent<br/>+ ensure current rate row"]
+    map["POST /api/projects/{id}/employees"] --> seed["Seed leave_details from<br/>CustomerLeavePolicy copy<br/>accrual_start=max(effective,onboard)<br/>defer upfront if start future<br/>+ pe_seed LeaveAccrualEvent<br/>+ ensure current rate row"]
     list["GET /api/projects/all-employees<br/>?project_id&customer_id&status&group_by=employee"] --> enrich["Flat rows OR nested mappings[] · leave_balance_total · po_status"]
-    detail["GET /api/projects/employees/{pe_id}"] --> nested["leave_details · leave_eligibility · leave_summary<br/>credit_history · leave_applications<br/>rates · timesheet_rollups · holidays · holiday_calendar · po"]
+    detail["GET /api/projects/employees/{pe_id}"] --> nested["leave_details · leave_eligibility · leave_summary<br/>credit_history · leave_applications<br/>rates · timesheet_rollups · holidays · holiday_calendar · po<br/>+ customer_id/name · branch_id/name · project_name"]
+    syncLeave["POST .../employees/{pe_id}/leave/sync"] --> seedGap["Idempotent seed missing leave types<br/>(Admin/HR; no balance reset)"]
     rates["POST/PUT .../rates"] --> sync["Sync pe.billing_rate<br/>when is_current_rate"]
     leaveApp["POST /api/leave-applications<br/>project required when active PE"] --> peBal["Debit PE leave_balance on approve"]
-    credit["scripts/run_pe_leave_credit.py"] --> peBal2["Credit PE leave_details<br/>skip is_exit"]
+    credit["scripts/run_pe_leave_credit.py"] --> peBal2["Credit PE leave_details<br/>accrual_start=max(effective_date,onboarding)<br/>skip is_exit · months before start → 0"]
     exitEp["POST .../employees/{pe_id}/exit"] --> stop["Stop accrual · flag open TS<br/>settlement_pending + leave balances"]
-    tsLock["POST /api/timesheets/{id}/entries"] --> holLock["Client calendar holidays locked<br/>day_type · view_flag · entry_project_id<br/>billable_day display = hours÷8"]
-    tsCreate["POST /api/timesheets generate_days=true"] --> autoDay["Auto-classify Working/Week_Off/Holiday<br/>default 8.50h working · 0 off-days"]
+    tsLock["POST /api/timesheets/{id}/entries"] --> holLock["Client calendar holidays locked<br/>day_type · view_flag · entry_project_id<br/>billable_day display = hours÷8<br/>leave_billable_by_type from project CustomerLeavePolicy"]
+    tsCreate["POST /api/timesheets generate_days=true"] --> autoDay["Auto-classify Working/Week_Off/Holiday<br/>default hours = resolved max_billable_hours_day · else 8.50"]
+    tsDetail["GET /api/timesheets/{id}"] --> leaveMap["billing_policy incl. comp_off_billable<br/>+ leave_billable_by_type + leave_balances_by_type<br/>+ max_billable_hours_day (project→branch)"]
+    tsApprove["POST /api/timesheets/{id}/approve"] --> compOff["comp_off_earned when Comp Off Billable OFF<br/>else billed (no credit); PE-scoped when mapped"]
     tsSubmit["POST /api/timesheets/{id}/submit"] --> noPo["Never blocks on PO"]
     tsRpt["GET /api/timesheets/reports/{due|for-submission|approvals}"] --> rmg["RMG/HR/Finance gated_write"]
     tsAtt["POST/GET /api/timesheets/{id}/attachments<br/>DELETE /api/timesheets/attachments/{id}"] --> multi["Multi-file + legacy file_attachment_url"]
-    inv["POST .../generate-invoice"] --> rateEng["timesheet_invoice_preview<br/>RateRow + split_period_by_rate"]
+    inv["POST .../generate-invoice"] --> rateEng["timesheet_invoice_preview<br/>RateRow + split_period_by_rate<br/>+ comp_off_billable_qty line"]
     inv --> poGate["assert_po_allows_new_drawdown<br/>expiry / balance 100%"]
 ```
 
+## 4.7b Project policy (Create + Edit Project wizard)
+
+```mermaid
+flowchart LR
+    create["POST /api/projects<br/>write_projects · optional branch_id<br/>else opportunity.branch_id<br/>unset policy → seed from branch"] --> cols["projects.* overrides<br/>+ branch_id FK<br/>+ recurring_billing<br/>billing_frequency Weekly/Monthly/Quarterly/Yearly"]
+    put["PUT /api/projects/{id}<br/>write_projects · optional branch_id"] --> cols
+    list["GET /api/projects/{id}/leave-policies"] --> plp["project_leave_policies"]
+    post["POST /api/projects/{id}/leave-policies<br/>leave_credit_type + leave_expire required"] --> plp
+    putDel["PUT/DELETE /api/projects/leave-policies/{id}<br/>+ nested …/{project_id}/leave-policies/{id}"] --> plp
+    plp --> lpt["leave_policy_types FK"]
+    ui["CreateProjectWizard / EditProjectWizard<br/>LeaveBillingPolicyModal + ProjectPolicySections<br/>create sends seededBranchId as branch_id"] --> create
+    ui --> put
+    ui --> post
+    ui --> putDel
+    ts["timesheets.effective_billing_policy<br/>_project_branch: project.branch_id → opp.branch_id"] --> resolve["project → branch → customer → defaults<br/>hours_required_* · week/leave/holiday/comp_off_billable"]
+    ts --> caps["max_billable_hours_day via resolve_branch_project_policy<br/>Project.max_billable_hours_day ← branch max_billable_hours_per_day"]
+    caps --> genHrs["generate_days + UI Present default Hours Worked<br/>fallback DEFAULT_WORKING_HOURS 8.50"]
+    ts --> leaveTypes["leave_billable_by_type_map<br/>resolve_customer_leave_policies(project)<br/>is_billable · leave_credit_balance"]
+    leaveTypes --> compute["compute_billables LEAVE branch<br/>per-type flag else policy.leave_billable"]
+    ts --> weekend["Weekend/holiday worked hours<br/>gated by comp_off_billable<br/>(bill XOR leave credit)"]
+```
+
+Create wizard steps: Project Details (name/opportunity/customer) → Leave & Holiday Billing Policy (combined holiday thresholds + leave-billing rows; create mode prefills from opportunity branch policy and persists `branch_id`) → Billing Properties. Edit keeps the same 2 policy sections (loads project’s own policy).
 ## 4.7 Customer Holiday Calendar (branch-year + names master)
 
 ```mermaid
 flowchart LR
     names["GET/POST /api/holiday-names<br/>HR write"] --> master["holiday_names table"]
     global["GET/POST/PUT/DELETE /api/holidays<br/>HR write · global/customer scope"]
-    branch["GET/POST/PUT/DELETE<br/>/api/customers/branches/{id}/holiday-years/{year}/holidays<br/>read_branch_policy · write_branch_policy"]
+    branch["GET/PUT /api/customers/branches/{id}/policy<br/>linked_projects: Project.branch_id OR Opportunity.branch_id<br/>GET/POST/PUT/DELETE …/leave-policies<br/>GET/POST/PUT/DELETE …/holiday-years/…/holidays<br/>read_branch_policy · write_branch_policy"]
     freeze["PATCH .../holiday-years/{year_id}<br/>is_freeze blocks branch date edits"]
     master --> hol["holidays · holiday_name_id · observance Mandatory|Optional<br/>optional holiday_calendar_id → branch_holiday_years"]
     branch --> hol

@@ -134,3 +134,18 @@ def rows_to_csv(rows: list[dict], filename: str = "report.csv"):
 def get_app_setting(db: Session, key: str, default: str | None = None) -> str | None:
     row = db.execute(sa.text("SELECT value FROM app_settings WHERE key = :k"), {"k": key}).first()
     return row[0] if row else default
+
+
+def commit_or_conflict(
+    db: Session,
+    detail: str = "Cannot delete: record is still referenced by other data. Remove dependencies first.",
+) -> None:
+    """Commit; on FK violation roll back and raise HTTP 409 (never bubble as 500)."""
+    from fastapi import HTTPException
+    from sqlalchemy.exc import IntegrityError
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=detail)

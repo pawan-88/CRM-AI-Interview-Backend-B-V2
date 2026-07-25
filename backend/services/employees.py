@@ -200,6 +200,7 @@ def serialize_employee(emp: Employee, db: Session | None = None, detail: bool = 
         "portal_access": emp.portal_access,
         "date_of_joining": _iso(emp.date_of_joining),
         "is_active": emp.is_active,
+        "role_title": emp.role_title,
     }
     if detail and db is not None:
         data["pan"] = emp.pan
@@ -307,7 +308,8 @@ def serialize_experience(row: EmployeeExperienceDetail) -> dict:
 # Leave matrix (Tab 13 "Leaves" section)
 # ---------------------------------------------------------------------------
 
-# (code, label, seeded LeavePolicyType.name lower-cased) — display order fixed.
+# (code, label, normalized key) — display order fixed.
+# Keys match `_normalize_leave_type_key` output (short stem, e.g. "casual").
 LEAVE_MATRIX_ROWS = [
     ("CL", "Casual Leave", "casual"),
     ("SL", "Sick Leave", "sick"),
@@ -318,6 +320,54 @@ LEAVE_MATRIX_ROWS = [
 ]
 
 LOSS_OF_PAY_NAME = "loss of pay"
+LOSS_OF_PAY_DISPLAY = "Loss of Pay"
+
+
+def _normalize_leave_type_key(name: str) -> str:
+    """Map LeavePolicyType.name variants to a stable stem for matrix lookup.
+
+    "Casual" / "Casual Leave" → "casual"; "Loss Off Pay" → "loss of pay".
+    """
+    n = str(name or "").strip().lower().replace("_", " ")
+    n = " ".join(n.split())
+    if n in ("loss of pay", "loss off pay", "lop"):
+        return LOSS_OF_PAY_NAME
+    if n in ("comp-off", "comp off", "compoff"):
+        return "comp-off"
+    if n.endswith(" leave"):
+        n = n[: -len(" leave")].strip()
+    return n
+
+
+def is_loss_of_pay_name(name: str | None) -> bool:
+    return _normalize_leave_type_key(name or "") == LOSS_OF_PAY_NAME
+
+
+def is_comp_off_name(name: str | None) -> bool:
+    return _normalize_leave_type_key(name or "") == "comp-off"
+
+
+def ensure_loss_of_pay_type(db: Session) -> LeavePolicyType:
+    """Lookup-or-create the canonical seeded Loss of Pay leave type."""
+    row = db.execute(
+        select(LeavePolicyType).where(
+            sa.func.lower(LeavePolicyType.name).in_(
+                ("loss of pay", "loss off pay", "lop")
+            )
+        )
+    ).scalars().first()
+    if row is not None:
+        if (row.name or "").strip() != LOSS_OF_PAY_DISPLAY:
+            row.name = LOSS_OF_PAY_DISPLAY
+        return row
+    row = LeavePolicyType(
+        name=LOSS_OF_PAY_DISPLAY,
+        accrual_rule="Unpaid — deducted from salary",
+        carry_forward_rule="Not applicable",
+    )
+    db.add(row)
+    db.flush()
+    return row
 
 
 def leave_matrix(db: Session, employee_id: int, year: int) -> dict:
@@ -336,7 +386,7 @@ def leave_matrix(db: Session, employee_id: int, year: int) -> dict:
         .where(EmployeeLeaveBalance.employee_id == employee_id,
                EmployeeLeaveBalance.year == year)
     ).all()
-    by_name = {str(name).strip().lower(): bal for bal, name in rows}
+    by_name = {_normalize_leave_type_key(name): bal for bal, name in rows}
 
     matrix_rows = []
     for code, label, key in LEAVE_MATRIX_ROWS:

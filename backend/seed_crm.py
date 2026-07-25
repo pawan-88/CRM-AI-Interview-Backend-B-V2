@@ -13,8 +13,8 @@ from sqlalchemy import select
 
 from crm_db import get_session_factory
 from models import (
-    AppSetting, CalendarYear, Currency, Department, Designation, DocumentType, FinancialYear,
-    LeavePolicyType, Location, Skill, TaxRate,
+    AppSetting, CalendarYear, ContactRole, Currency, Department, Designation, DocumentType,
+    FinancialYear, LeavePolicyType, Location, Skill, TaxRate,
 )
 
 DEPARTMENTS = ["Engineering", "Sales", "Talent Acquisition", "RMG", "HR", "Finance", "Delivery"]
@@ -50,14 +50,19 @@ CURRENCIES = [("INR", "Indian Rupee", "₹"), ("USD", "US Dollar", "$"), ("EUR",
 
 DOCUMENT_TYPES = ["MSA", "NDA", "SOW", "Rate Card", "GST Certificate", "PAN Card", "Agreement"]
 
+CONTACT_ROLES = ["Finance", "Operational", "Procurement", "HR"]
+
+# Canonical names (must match migration 0038 / 0041). Short aliases like
+# "Casual" / "Sick" were retired — they duplicated "Casual Leave" / "Sick Leave".
 LEAVE_TYPES = [
-    ("Casual", "1 per month", "No carry forward"),
-    ("Sick", "0.5 per month", "No carry forward"),
-    ("Earned", "1.25 per month", "Carry forward up to 30 days"),
+    ("Casual Leave", "1 per month", "No carry forward"),
+    ("Sick Leave", "0.5 per month", "No carry forward"),
+    ("Earned Leave", "1.25 per month", "Carry forward up to 30 days"),
     ("Comp-Off", "Earned on approved weekend/holiday work", "Expires in 90 days"),
-    ("Maternity", "26 weeks as per Maternity Benefit Act", "Not applicable"),
-    ("Paternity", "5 days per child", "Not applicable"),
+    ("Maternity Leave", "26 weeks as per Maternity Benefit Act", "Not applicable"),
+    ("Paternity Leave", "5 days per child", "Not applicable"),
     ("Loss of Pay", "Unpaid — deducted from salary", "Not applicable"),
+    ("Paid Leave", "As per client / company policy", "As per policy"),
 ]
 
 FINANCIAL_YEARS = [
@@ -115,6 +120,10 @@ def seed() -> None:
 
         for name in DOCUMENT_TYPES:
             _, new = _get_or_create(session, DocumentType, name=name)
+            created += new
+
+        for name in CONTACT_ROLES:
+            _, new = _get_or_create(session, ContactRole, name=name)
             created += new
 
         for name, accrual, carry in LEAVE_TYPES:

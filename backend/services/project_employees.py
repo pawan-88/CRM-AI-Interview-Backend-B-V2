@@ -14,14 +14,15 @@ from sqlalchemy import select, or_, and_, func
 from sqlalchemy.orm import Session
 
 from models import (
-    AttendanceStatus, Customer, CustomerLeavePolicy, Employee, Holiday, LeaveAccrualEvent,
-    LeaveApplication, LeavePolicyType, POProjectAllocation, POStatus, Project,
-    ProjectEmployee, ProjectEmployeeLeaveDetail, ProjectEmployeeRate, PurchaseOrder,
-    Timesheet, TimesheetEntry, TimesheetStatus,
+    AttendanceStatus, BranchHolidayYear, Customer, CustomerBranch, CustomerLeavePolicy,
+    Employee, Holiday, LeaveAccrualEvent, LeaveApplication, LeavePolicyType, POProjectAllocation,
+    POStatus, Project, ProjectEmployee, ProjectEmployeeLeaveDetail, ProjectEmployeeRate,
+    PurchaseOrder, Timesheet, TimesheetEntry, TimesheetStatus,
 )
 from services.project_employee_billing import (
     RateRow, compute_billable_days, monthly_accrual, po_status_label, po_utilization,
 )
+from services.project_employee_leave_credit import accrual_start
 from services.projects import project_employee_out
 from services.timesheets import _project_branch
 
@@ -32,6 +33,103 @@ def _weekdays_in_month(year: int, month: int) -> int:
         1 for day in range(1, calendar.monthrange(year, month)[1] + 1)
         if date(year, month, day).weekday() < 5
     )
+
+
+def effective_customer_branch_for_project(
+    db: Session,
+    project: Project,
+    *,
+    pe: ProjectEmployee | None = None,
+    year: int | None = None,
+) -> CustomerBranch | None:
+    """Resolve the customer branch for holidays / leave policies for a project (and optional PE).
+
+    Precedence:
+      1. project.branch_id, else opportunity.branch_id (same-customer) via ``_project_branch``
+      2. PE leave-detail → CustomerLeavePolicy.branch_id (majority vote among non-null)
+      3. Unique BranchHolidayYear for this customer + year
+      4. Unique active branch-scoped CustomerLeavePolicy for this customer
+      5. Unique CustomerBranch for this customer
+    """
+    branch = _project_branch(db, project)
+    if branch is not None:
+        return branch
+
+    # (2) PE-seeded policy branch hints
+    if pe is not None:
+        policy_ids = [
+            r.customer_leave_policy_id
+            for r in db.execute(
+                select(ProjectEmployeeLeaveDetail).where(
+                    ProjectEmployeeLeaveDetail.project_employee_id == pe.id,
+                    ProjectEmployeeLeaveDetail.customer_leave_policy_id.is_not(None),
+                )
+            ).scalars().all()
+            if r.customer_leave_policy_id
+        ]
+        if policy_ids:
+            counts: dict[int, int] = {}
+            for pol in db.execute(
+                select(CustomerLeavePolicy).where(CustomerLeavePolicy.id.in_(policy_ids))
+            ).scalars().all():
+                if pol.branch_id is not None:
+                    counts[pol.branch_id] = counts.get(pol.branch_id, 0) + 1
+            if counts:
+                best_id = max(counts, key=counts.get)
+                b = db.get(CustomerBranch, best_id)
+                if b is not None and b.customer_id == project.customer_id:
+                    return b
+
+    year = year or date.today().year
+
+    # (3) Unique holiday calendar for this customer/year
+    cal_branches = db.execute(
+        select(BranchHolidayYear.branch_id)
+        .join(CustomerBranch, CustomerBranch.id == BranchHolidayYear.branch_id)
+        .where(
+            CustomerBranch.customer_id == project.customer_id,
+            BranchHolidayYear.calendar_year == year,
+        )
+        .distinct()
+    ).scalars().all()
+    if len(cal_branches) == 1:
+        b = db.get(CustomerBranch, cal_branches[0])
+        if b is not None:
+            return b
+
+    # (4) Unique branch that has active leave policies for this customer
+    pol_branches = db.execute(
+        select(CustomerLeavePolicy.branch_id).where(
+            CustomerLeavePolicy.customer_id == project.customer_id,
+            CustomerLeavePolicy.is_active.is_(True),
+            CustomerLeavePolicy.branch_id.is_not(None),
+        ).distinct()
+    ).scalars().all()
+    if len(pol_branches) == 1:
+        b = db.get(CustomerBranch, pol_branches[0])
+        if b is not None:
+            return b
+
+    # (5) Unique customer branch
+    cust_branches = db.execute(
+        select(CustomerBranch).where(CustomerBranch.customer_id == project.customer_id)
+    ).scalars().all()
+    if len(cust_branches) == 1:
+        return cust_branches[0]
+    return None
+
+
+def pe_effective_branch(
+    db: Session,
+    pe: ProjectEmployee,
+    *,
+    year: int | None = None,
+) -> CustomerBranch | None:
+    """Branch this PE belongs to for holiday calendars and leave-policy resolution."""
+    project = db.get(Project, pe.project_id)
+    if project is None:
+        return None
+    return effective_customer_branch_for_project(db, project, pe=pe, year=year)
 
 
 def get_pe_or_404(db: Session, pe_id: int) -> ProjectEmployee:
@@ -139,26 +237,36 @@ def eligibility_from_policy(policy: CustomerLeavePolicy | None) -> dict:
 def leave_detail_out(row: ProjectEmployeeLeaveDetail, leave_type: LeavePolicyType | None = None,
                      *, settlement: bool = False,
                      policy: CustomerLeavePolicy | None = None) -> dict:
+    from services.employees import is_comp_off_name, is_loss_of_pay_name
+
     leave_type = leave_type or row.leave_type
     eligibility = eligibility_from_policy(policy)
+    name = leave_type.name if leave_type else None
+    raw_balance = Decimal(row.leave_balance or 0)
+    # Display hygiene: clamp paid (and LOP) balances at >= 0; Comp-Off may stay negative.
+    if name and is_comp_off_name(name):
+        display_balance = raw_balance
+    else:
+        display_balance = max(raw_balance, Decimal("0"))
     data = {
         "id": row.id,
         "project_employee_id": row.project_employee_id,
         "leave_type_id": row.leave_type_id,
-        "leave_type_name": leave_type.name if leave_type else None,
+        "leave_type_name": name,
         "customer_leave_policy_id": row.customer_leave_policy_id,
         "initial_balance": _num(row.initial_balance),
         "opening_balance": _num(row.opening_balance),
         "leave_accrual": _num(row.leave_accrual),
         "leave_consumed": _num(row.leave_consumed),
-        "leave_balance": _num(row.leave_balance),
+        "leave_balance": float(display_balance),
         "eligibility": eligibility,
         "eligibility_label": eligibility.get("label"),
         "yearly_entitlement": eligibility.get("yearly_days"),
         "monthly_entitlement": eligibility.get("monthly_days"),
+        "is_loss_of_pay": bool(name and is_loss_of_pay_name(name)),
     }
     if settlement:
-        data["settlement_leave_balance"] = _num(row.leave_balance)
+        data["settlement_leave_balance"] = float(display_balance)
         data["needs_settlement"] = True
     return data
 
@@ -256,9 +364,19 @@ def _seed_balance_from_policy(policy: CustomerLeavePolicy) -> tuple[Decimal, Dec
     return initial + period, period
 
 
-def resolve_customer_leave_policies(db: Session, project: Project) -> list[CustomerLeavePolicy]:
+def resolve_customer_leave_policies(
+    db: Session,
+    project: Project,
+    *,
+    pe: ProjectEmployee | None = None,
+    branch: CustomerBranch | None = None,
+) -> list[CustomerLeavePolicy]:
     """Active customer leave policies for the project (branch-specific preferred, else customer-wide)."""
-    branch = _project_branch(db, project)
+    if branch is None:
+        branch = (
+            pe_effective_branch(db, pe) if pe is not None
+            else effective_customer_branch_for_project(db, project)
+        )
     all_pols = db.execute(
         select(CustomerLeavePolicy).where(
             CustomerLeavePolicy.customer_id == project.customer_id,
@@ -274,12 +392,31 @@ def resolve_customer_leave_policies(db: Session, project: Project) -> list[Custo
     return [p for p in all_pols if p.branch_id is None] or all_pols
 
 
-def seed_leave_details_from_customer_policy(db: Session, pe: ProjectEmployee,
-                                            project: Project | None = None) -> list[ProjectEmployeeLeaveDetail]:
-    """Seed PE leave rows from Customer Leave Policy. Skip types that already exist."""
+def seed_leave_details_from_customer_policy(
+    db: Session,
+    pe: ProjectEmployee,
+    project: Project | None = None,
+    *,
+    seed_as_of: date | None = None,
+) -> list[ProjectEmployeeLeaveDetail]:
+    """Seed PE leave rows from Customer Leave Policy. Skip types that already exist.
+
+    ``policy.effective_date`` (via ``accrual_start``) only pushes the accrual start
+    later — never earlier than onboarding. When accrual_start is still in the future
+    relative to ``seed_as_of`` (default today):
+
+    * One_Time / Yearly Start_Of_Period — open at ``initial_credit_balance`` only;
+      stash ``leave_credit_balance`` on ``leave_accrual`` for the monthly credit job.
+    * Monthly / Quarterly Start_Of_Period — open like End_Of_Period (initial only;
+      recurring accrual on ``leave_accrual``).
+
+    Editing ``effective_date`` later never rewrites already-seeded rows; only new
+    seeds and future credit-job runs observe the new date.
+    """
     project = project or db.get(Project, pe.project_id)
     if project is None:
         return []
+    seed_as_of = seed_as_of or date.today()
     existing_types = {
         r.leave_type_id
         for r in db.execute(
@@ -288,7 +425,7 @@ def seed_leave_details_from_customer_policy(db: Session, pe: ProjectEmployee,
         ).scalars().all()
     }
     created: list[ProjectEmployeeLeaveDetail] = []
-    for policy in resolve_customer_leave_policies(db, project):
+    for policy in resolve_customer_leave_policies(db, project, pe=pe):
         if policy.leave_type_id in existing_types:
             continue
         initial, accrual = _seed_balance_from_policy(policy)
@@ -299,10 +436,32 @@ def seed_leave_details_from_customer_policy(db: Session, pe: ProjectEmployee,
         _ct = (policy.leave_credit_type or "Monthly")
         _timing = (policy.leave_credit_timing or "Start_Of_Period")
         _is_upfront = _ct == "One_Time" or (_ct == "Yearly" and _timing != "End_Of_Period")
-        if _is_upfront and policy.prorate_balance_credit and pe.onboarding_date and initial > 0:
-            factor = Decimal(13 - pe.onboarding_date.month) / Decimal(12)
-            factor = min(max(factor, Decimal("0")), Decimal("1"))
-            initial = (initial * factor).quantize(Decimal("0.01"))
+        start = accrual_start(policy, pe)
+        deferred = start is not None and start > seed_as_of
+        if deferred:
+            base_initial = Decimal(policy.initial_credit_balance or 0)
+            period_amt = Decimal(policy.leave_credit_balance or 0)
+            if _is_upfront:
+                # Defer the period grant; credit job releases it on/after accrual_start.
+                initial = base_initial
+                accrual = period_amt
+            elif _timing != "End_Of_Period":
+                # Monthly/Quarterly Start → behave like End_Of_Period until start.
+                initial = base_initial
+                if _ct == "Quarterly":
+                    accrual = (
+                        (period_amt / Decimal(4)).quantize(Decimal("0.01"))
+                        if period_amt else Decimal("0")
+                    )
+                else:
+                    accrual = period_amt
+        elif _is_upfront and policy.prorate_balance_credit and initial > 0:
+            # Prorate by accrual_start month (onboarding, or later effective_date).
+            proration_date = start or pe.onboarding_date
+            if proration_date is not None:
+                factor = Decimal(13 - proration_date.month) / Decimal(12)
+                factor = min(max(factor, Decimal("0")), Decimal("1"))
+                initial = (initial * factor).quantize(Decimal("0.01"))
         bal = initial
         if policy.is_max_limit and policy.max_limit is not None:
             bal = min(bal, Decimal(policy.max_limit))
@@ -334,6 +493,36 @@ def seed_leave_details_from_customer_policy(db: Session, pe: ProjectEmployee,
     return created
 
 
+def sync_pe_leave_from_customer_policy(
+    db: Session, pe: ProjectEmployee,
+) -> dict:
+    """Idempotent back-fill: add missing leave types from customer/branch policy.
+
+    Existing PE leave rows (balances / consumed) are never modified.
+    """
+    project = db.get(Project, pe.project_id)
+    created = seed_leave_details_from_customer_policy(db, pe, project)
+    type_names: dict[int, str] = {}
+    if created:
+        ids = [r.leave_type_id for r in created]
+        for lt in db.execute(
+            select(LeavePolicyType).where(LeavePolicyType.id.in_(ids))
+        ).scalars().all():
+            type_names[lt.id] = lt.name
+    return {
+        "added_count": len(created),
+        "added": [
+            {
+                "leave_type_id": r.leave_type_id,
+                "leave_type_name": type_names.get(r.leave_type_id),
+                "leave_balance": float(r.leave_balance or 0),
+                "customer_leave_policy_id": r.customer_leave_policy_id,
+            }
+            for r in created
+        ],
+    }
+
+
 def pe_leave_detail_for(db: Session, pe_id: int,
                         leave_type_id: int) -> ProjectEmployeeLeaveDetail | None:
     return db.execute(
@@ -345,12 +534,26 @@ def pe_leave_detail_for(db: Session, pe_id: int,
 
 
 def pe_leave_balance_total(db: Session, pe_id: int) -> float:
-    total = db.execute(
-        select(func.coalesce(func.sum(ProjectEmployeeLeaveDetail.leave_balance), 0)).where(
-            ProjectEmployeeLeaveDetail.project_employee_id == pe_id
-        )
-    ).scalar()
-    return float(total or 0)
+    """Net leave balance from per-type balances clamped at >= 0 (excl. LOP type).
+
+    Comp-Off negatives are also floored for the net total so one overdrawn type
+    cannot understate the remaining paid pool. Loss of Pay is excluded (shown
+    separately via consumed).
+    """
+    from services.employees import is_loss_of_pay_name
+
+    rows = db.execute(
+        select(ProjectEmployeeLeaveDetail, LeavePolicyType.name)
+        .join(LeavePolicyType, LeavePolicyType.id == ProjectEmployeeLeaveDetail.leave_type_id,
+              isouter=True)
+        .where(ProjectEmployeeLeaveDetail.project_employee_id == pe_id)
+    ).all()
+    total = Decimal("0")
+    for row, name in rows:
+        if name and is_loss_of_pay_name(name):
+            continue
+        total += max(Decimal(row.leave_balance or 0), Decimal("0"))
+    return float(total)
 
 
 def consume_pe_leave(db: Session, pe_id: int, leave_type_id: int, days: Decimal,
@@ -445,36 +648,90 @@ def project_po_summary(db: Session, project_id: int, *, on_date: date | None = N
 
 
 def holidays_for_pe(db: Session, pe: ProjectEmployee, *, year: int | None = None) -> list[dict]:
-    """Read-only customer (+ global) holiday calendar for this PE's project customer."""
+    """Read-only National + customer-wide + PE-branch holiday calendar for this PE."""
     project = db.get(Project, pe.project_id)
     if project is None:
         return []
     year = year or date.today().year
-    branch = _project_branch(db, project)
-    stmt = select(Holiday).where(
-        Holiday.is_active.is_(True),
-        Holiday.year == year,
-        or_(
-            Holiday.customer_id.is_(None),
-            and_(
-                Holiday.customer_id == project.customer_id,
-                or_(Holiday.branch_id.is_(None),
-                    Holiday.branch_id == (branch.id if branch else None)),
-            ),
-        ),
-    ).order_by(Holiday.holiday_date)
-    rows = db.execute(stmt).scalars().all()
-    return [{
-        "id": h.id,
-        "name": h.name,
-        "holiday_date": h.holiday_date.isoformat() if h.holiday_date else None,
-        "holiday_type": h.holiday_type,
-        "customer_id": h.customer_id,
-        "branch_id": h.branch_id,
-        "year": h.year,
-        "scope": ("National" if h.customer_id is None
-                  else ("Branch" if h.branch_id is not None else "Customer")),
-    } for h in rows]
+    branch = pe_effective_branch(db, pe, year=year)
+    return _holidays_for_customer_branch(db, project.customer_id, branch, year=year)
+
+
+def _holidays_for_customer_branch(
+    db: Session,
+    customer_id: int,
+    branch: CustomerBranch | None,
+    *,
+    year: int,
+) -> list[dict]:
+    """National + customer-wide + branch-scoped (and calendar-attached) holidays."""
+    calendar_ids: list[int] = []
+    if branch is not None:
+        calendar_ids = list(db.execute(
+            select(BranchHolidayYear.id).where(
+                BranchHolidayYear.branch_id == branch.id,
+                BranchHolidayYear.calendar_year == year,
+            )
+        ).scalars().all())
+
+    branch_parts = []
+    if branch is not None:
+        branch_parts.append(Holiday.branch_id == branch.id)
+    if calendar_ids:
+        branch_parts.append(Holiday.holiday_calendar_id.in_(calendar_ids))
+
+    if branch_parts:
+        customer_clause = and_(
+            Holiday.customer_id == customer_id,
+            or_(Holiday.branch_id.is_(None), *branch_parts),
+        )
+    else:
+        customer_clause = and_(
+            Holiday.customer_id == customer_id,
+            Holiday.branch_id.is_(None),
+        )
+
+    rows = db.execute(
+        select(Holiday).where(
+            Holiday.is_active.is_(True),
+            Holiday.year == year,
+            or_(Holiday.customer_id.is_(None), customer_clause),
+        )
+    ).scalars().all()
+
+    # Prefer branch/customer rows over National when the same date+name appears twice.
+    def _rank(h: Holiday) -> int:
+        if h.customer_id is not None and (h.branch_id is not None or h.holiday_calendar_id):
+            return 0
+        if h.customer_id is not None:
+            return 1
+        return 2
+
+    rows_sorted = sorted(
+        rows,
+        key=lambda h: (h.holiday_date or date.min, _rank(h), h.id or 0),
+    )
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for h in rows_sorted:
+        key = (h.holiday_date, (h.name or "").strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "id": h.id,
+            "name": h.name,
+            "holiday_date": h.holiday_date.isoformat() if h.holiday_date else None,
+            "holiday_type": h.holiday_type,
+            "customer_id": h.customer_id,
+            "branch_id": h.branch_id,
+            "holiday_calendar_id": h.holiday_calendar_id,
+            "year": h.year,
+            "scope": ("National" if h.customer_id is None
+                      else ("Branch" if h.branch_id is not None or h.holiday_calendar_id
+                            else "Customer")),
+        })
+    return out
 
 
 def pe_credit_history(db: Session, pe: ProjectEmployee, *, limit: int = 50) -> list[dict]:
@@ -656,6 +913,15 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
     data["project_name"] = project.name if project else None
     data["customer_id"] = project.customer_id if project else None
     data["customer_name"] = customer.name if customer else None
+    holiday_year = date.today().year
+    branch = pe_effective_branch(db, pe, year=holiday_year) if project else None
+    opp_branch = _project_branch(db, project) if project else None
+    data["branch_id"] = branch.id if branch else None
+    data["branch_name"] = branch.branch_name if branch else None
+    data["branch_resolved_via"] = (
+        "opportunity" if (branch is not None and opp_branch is not None and branch.id == opp_branch.id)
+        else ("fallback" if branch is not None else None)
+    )
     data["leave_balance_total"] = pe_leave_balance_total(db, pe.id)
 
     leave_rows = db.execute(
@@ -674,10 +940,15 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
     } if policy_ids else {}
     details_out = []
     consumed_total = Decimal("0")
+    lop_consumed = Decimal("0")
+    from services.employees import is_loss_of_pay_name
     for r, lt in leave_rows:
         policy = policies.get(r.customer_leave_policy_id) if r.customer_leave_policy_id else None
         details_out.append(leave_detail_out(r, lt, settlement=settlement, policy=policy))
-        consumed_total += Decimal(r.leave_consumed or 0)
+        if lt is not None and is_loss_of_pay_name(lt.name):
+            lop_consumed += Decimal(r.leave_consumed or 0)
+        else:
+            consumed_total += Decimal(r.leave_consumed or 0)
     data["leave_details"] = details_out
     data["leave_eligibility"] = [
         {
@@ -701,6 +972,7 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
         "consumed": float(consumed_total),
         "accrued_this_year": accrued_ytd,
         "year": date.today().year,
+        "loss_of_pay_consumed": float(lop_consumed),
     }
     data["credit_history"] = credit_history
     data["leave_applications"] = pe_leave_applications(db, pe)
@@ -712,20 +984,27 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
     ).scalars().all()
     data["rates"] = [rate_out(r) for r in rates]
     data["timesheet_rollups"] = timesheet_rollups_for_pe(db, pe)
-    holiday_year = date.today().year
     data["holidays"] = holidays_for_pe(db, pe, year=holiday_year)
-    branch = _project_branch(db, project) if project else None
+    branch_linked = branch is not None
     data["holiday_calendar"] = {
         "year": holiday_year,
         "customer_id": project.customer_id if project else None,
         "customer_name": customer.name if customer else None,
         "branch_id": branch.id if branch else None,
+        "branch_name": branch.branch_name if branch else None,
+        "branch_linked": branch_linked,
         "label": (
-            f"{customer.name} / {holiday_year}" if customer
-            else f"Client calendar {holiday_year}"
+            f"{customer.name} / {branch.branch_name} / {holiday_year}"
+            if customer and branch
+            else (f"{customer.name} / {holiday_year}" if customer
+                  else f"Client calendar {holiday_year}")
         ),
-        "read_only": True,
+        "note": (
+            None if branch_linked
+            else "Branch not linked — showing National and customer-wide holidays only."
+        ),
         "count": len(data["holidays"]),
+        "read_only": True,
     }
     data["po"] = project_po_summary(db, pe.project_id)
     data["po_status"] = data["po"].get("po_status")

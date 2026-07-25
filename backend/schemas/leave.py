@@ -9,8 +9,19 @@ from pydantic import BaseModel, field_validator
 
 HOLIDAY_TYPES = ("National", "Regional", "Customer")
 HOLIDAY_OBSERVANCE = ("Mandatory", "Optional")
-LEAVE_CREDIT_TYPES = ("Monthly", "Quarterly", "Yearly", "One_Time")
+LEAVE_CREDIT_TYPES = (
+    # Legacy / existing values (keep for already-saved rows)
+    "Monthly", "Quarterly", "Yearly", "One_Time", "Annually",
+    # Project Leave Billing Policy UI values (shared with customer form)
+    "Credit Week-Off/Holiday",
+    # TODO(source-system): replace these placeholders with the exact Leave Credit
+    # Type option list from the source CRM once the product owner supplies it.
+    "Credit Balance Every Month",
+    "Carry Forward Every Month",
+)
 LEAVE_CREDIT_TIMINGS = ("Start_Of_Period", "End_Of_Period", "Start_of_Month")
+# TODO(source-system): extend Leave Expire / Prorate / Is Max Limit option sets
+# when the source CRM option lists are provided.
 LEAVE_EXPIRE_UNITS = ("Days",)  # spec §5 "Leave_Expire" dropdown (extensible)
 LEAVE_PERIOD_TYPES = ("Full_Day", "Half_Day", "Multi_Day")
 COMP_OFF_TYPES = ("Earned", "Consumed")
@@ -106,7 +117,7 @@ class CustomerLeavePolicyCreate(BaseModel):
     customer_id: int
     branch_id: int | None = None
     leave_type_id: int
-    leave_credit_type: str = "Monthly"
+    leave_credit_type: str = "Credit Balance Every Month"
     leave_expire: str | None = None
     is_max_limit: bool = False
     max_limit: Decimal | None = None
@@ -116,8 +127,31 @@ class CustomerLeavePolicyCreate(BaseModel):
     maximum_carry_forward: Decimal | None = None
     leave_credit_timing: str = "Start_Of_Period"
     effective_date: date | None = None
+    is_billable: bool | None = None
     is_active: bool = True
     concepts: list[LeaveCreditConceptIn] = []
+
+    _credit_type = field_validator("leave_credit_type")(
+        _one_of(LEAVE_CREDIT_TYPES, "leave_credit_type"))
+    _timing = field_validator("leave_credit_timing")(
+        _one_of(LEAVE_CREDIT_TIMINGS, "leave_credit_timing"))
+
+
+class BranchLeavePolicyCreate(BaseModel):
+    """Nested under /branches/{id}/leave-policies — customer_id/branch_id derived from path."""
+    leave_type_id: int
+    leave_credit_type: str = "Credit Balance Every Month"
+    leave_expire: str | None = None
+    is_max_limit: bool = False
+    max_limit: Decimal | None = None
+    prorate_balance_credit: bool = False
+    leave_credit_balance: Decimal = Decimal("0")
+    initial_credit_balance: Decimal = Decimal("0")
+    maximum_carry_forward: Decimal | None = None
+    leave_credit_timing: str = "Start_Of_Period"
+    effective_date: date | None = None
+    is_billable: bool | None = True
+    is_active: bool = True
 
     _credit_type = field_validator("leave_credit_type")(
         _one_of(LEAVE_CREDIT_TYPES, "leave_credit_type"))
@@ -138,6 +172,7 @@ class CustomerLeavePolicyUpdate(BaseModel):
     maximum_carry_forward: Decimal | None = None
     leave_credit_timing: str | None = None
     effective_date: date | None = None
+    is_billable: bool | None = None
     is_active: bool | None = None
 
     _credit_type = field_validator("leave_credit_type")(

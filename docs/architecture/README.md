@@ -67,4 +67,5 @@ browser (offline/locked-down env), the Markdown diagrams still render everywhere
 - Role names match `models/rbac.py::RoleName` exactly.
 - Endpoint paths and table/column names match the code exactly so diagrams are greppable.
 
-_Last synced: 2026-07-21 — Sales/Sales_Head can create and edit timesheets; Customer Holiday Calendar + RMG reports._
+_Last synced: 2026-07-25 — Platform top bar (`PlatformTopBar`: sticky tabs + More overflow,
+⌘K command palette, account menu); CRM_NAV extracted to `crm/nav.ts`._

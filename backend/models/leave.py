@@ -59,8 +59,9 @@ class CustomerLeavePolicy(Base):
     customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id"), nullable=False, index=True)
     branch_id = sa.Column(sa.Integer, sa.ForeignKey("customer_branches.id"), nullable=True)
     leave_type_id = sa.Column(sa.Integer, sa.ForeignKey("leave_policy_types.id"), nullable=False)
-    leave_credit_type = sa.Column(sa.String(24), nullable=False,
-                                  server_default="Monthly")  # Monthly|Quarterly|Yearly|One_Time
+    # 64 chars: UI labels like "Credit Balance Every Month" exceed the old VARCHAR(24).
+    leave_credit_type = sa.Column(sa.String(64), nullable=False,
+                                  server_default="Monthly")  # Monthly|…|Credit Balance Every Month
     leave_expire = sa.Column(sa.String(24), nullable=True)  # spec §5 dropdown, e.g. "Days"; NULL = no expiry
     is_max_limit = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     max_limit = sa.Column(sa.Numeric(5, 2), nullable=True)
@@ -71,6 +72,7 @@ class CustomerLeavePolicy(Base):
     leave_credit_timing = sa.Column(sa.String(24), nullable=False,
                                     server_default="Start_Of_Period")  # Start_Of_Period|End_Of_Period
     effective_date = sa.Column(sa.Date, nullable=True)
+    is_billable = sa.Column(sa.Boolean, nullable=True)  # spec §5 "Billable Leave Policy" flag; NULL = unset
     is_active = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
     __table_args__ = (sa.UniqueConstraint("customer_id", "branch_id", "leave_type_id",
                                           name="uq_customer_leave_policy"),)

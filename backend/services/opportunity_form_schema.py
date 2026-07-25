@@ -32,7 +32,8 @@ _ALWAYS_DETAIL: frozenset[str] = frozenset({
 _TM_DETAIL: frozenset[str] = frozenset({
     # Time & Material Details
     "tm_position_title", "tm_positions_count", "tm_exp_min", "tm_exp_max",
-    "tm_notice_period", "tm_closing_date", "tm_position_type", "tm_duration_months",
+    "tm_notice_period", "tm_closing_date", "tm_position_type", "tm_replacement_engineer",
+    "tm_duration_months",
     "tm_jd_attachments", "tm_role", "tm_work_location",
     # legacy (removed from UI; still accepted so old drafts don't 422)
     "tm_wfo_remote",

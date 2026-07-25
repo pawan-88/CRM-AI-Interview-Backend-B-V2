@@ -253,12 +253,17 @@ def update_purchase_order(po_id: int, body: PurchaseOrderUpdate,
 @router.delete("/purchase-orders/{po_id}")
 def delete_purchase_order(po_id: int, db: Session = Depends(get_crm_db),
                           user: CurrentUser = Depends(PO_WRITE)):
+    from services.crm_common import commit_or_conflict
+    from services.crm_delete import cascade_delete_invoices
+
     po = get_po_or_404(db, po_id)
+    # Cascade deletable invoices (+ unpaid TDS); payments / credit notes still 409
+    # with invoice numbers.
     if po.invoices:
-        raise HTTPException(status_code=400,
-                            detail="Cannot delete a PO with invoices raised against it")
+        cascade_delete_invoices(db, list(po.invoices))
+        db.flush()
     db.delete(po)
-    db.commit()
+    commit_or_conflict(db, "Cannot delete: purchase order is still referenced by other records.")
     return envelope(message="Purchase order deleted")
 
 
@@ -554,28 +559,13 @@ def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(g
 @router.delete("/invoices/{invoice_id}")
 def delete_invoice(invoice_id: int, db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(INV_WRITE)):
+    from services.crm_common import commit_or_conflict
+    from services.crm_delete import cascade_delete_invoice
+
     invoice = get_invoice_or_404(db, invoice_id)
-    if invoice.payments:
-        raise HTTPException(status_code=400, detail="Cannot delete an invoice with recorded payments")
-    if invoice.tds_record is not None:
-        raise HTTPException(status_code=400, detail="Cannot delete an invoice with a TDS record")
-    if invoice.po_id is not None:
-        po = db.get(PurchaseOrder, invoice.po_id)
-        if po is not None:
-            tax.apply_po_consumption(po, -Decimal(str(invoice.grand_total)))
-            alloc = db.execute(
-                select(POProjectAllocation).where(
-                    POProjectAllocation.po_id == po.id,
-                    POProjectAllocation.project_id == invoice.project_id,
-                )
-            ).scalar_one_or_none()
-            if alloc is not None:
-                alloc.consumed_amount = max(
-                    Decimal(str(alloc.consumed_amount)) - Decimal(str(invoice.grand_total)),
-                    Decimal("0"),
-                )
-    db.delete(invoice)
-    db.commit()
+    # Cascades owned unpaid TDS; still blocks on payments / TDS payments / credit notes.
+    cascade_delete_invoice(db, invoice)
+    commit_or_conflict(db, "Cannot delete: invoice is still referenced by other records.")
     return envelope(message="Invoice deleted")
 
 
@@ -773,3 +763,31 @@ def list_tds(tds_status: str | None = None, pp: PageParams = Depends(page_params
         for r in items
     ]
     return envelope(data, meta=meta)
+
+
+@router.delete("/tds/{tds_id}")
+def delete_tds(
+    tds_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(gated_write("tds", "Finance")),
+):
+    """Hard-delete a TDS record (cascades its payment rows). Blocks when any payment was recorded."""
+    from services.crm_common import commit_or_conflict
+
+    record = db.get(TdsRecord, tds_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="TDS record not found")
+    paid = Decimal(str(record.tds_paid or 0))
+    pay_count = len(record.payments or [])
+    if paid > 0 or pay_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete: {pay_count or 1} TDS payment(s) exist. Reverse payments first.",
+        )
+    invoice = record.invoice
+    db.delete(record)
+    commit_or_conflict(db, "Cannot delete: TDS record is still referenced by other records.")
+    return envelope(
+        data={"id": tds_id, "invoice_id": invoice.id if invoice else None},
+        message="TDS record deleted",
+    )

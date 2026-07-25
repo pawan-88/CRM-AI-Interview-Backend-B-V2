@@ -50,16 +50,58 @@ def project_out(p: Project) -> dict:
         "id": p.id,
         "opportunity_id": p.opportunity_id,
         "customer_id": p.customer_id,
+        "branch_id": getattr(p, "branch_id", None),
         "name": p.name,
         "billing_cycle_start_day": p.billing_cycle_start_day,
         "billing_cycle_end_day": p.billing_cycle_end_day,
         "billing_frequency": getattr(p.billing_frequency, "value", p.billing_frequency),
+        "recurring_billing": bool(getattr(p, "recurring_billing", True)),
         "max_billable_hours_day": _num(p.max_billable_hours_day),
         "max_billable_hours_month": _num(p.max_billable_hours_month),
         "max_billable_days_month": p.max_billable_days_month,
         "no_billing_period_days": p.no_billing_period_days,
+        "holidays_billable": p.holidays_billable,
+        "weekoff_billable": p.weekoff_billable,
+        "leave_billable": p.leave_billable,
+        "comp_off_billable": p.comp_off_billable,
+        "hours_required_half_day": _num(p.hours_required_half_day),
+        "hours_required_full_day": _num(p.hours_required_full_day),
+        "hours_required_half_day_comp_off": _num(p.hours_required_half_day_comp_off),
+        "hours_required_full_day_comp_off": _num(p.hours_required_full_day_comp_off),
+        "working_hours_per_day": _num(p.working_hours_per_day),
+        "is_max_billable_hours_per_day": p.is_max_billable_hours_per_day,
+        "is_max_billable_hours_per_month": p.is_max_billable_hours_per_month,
+        "is_max_billable_days_per_month": p.is_max_billable_days_per_month,
+        "is_initial_no_billing_period": p.is_initial_no_billing_period,
+        # qty = numeric count (UI "Period"); period = unit string (UI "QTY")
+        "initial_no_billing_qty": p.initial_no_billing_qty,
+        "initial_no_billing_period": p.initial_no_billing_period,
         "status": getattr(p.status, "value", p.status),
         "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+def project_leave_policy_out(db: Session, p) -> dict:
+    from models import LeavePolicyType
+    lt = db.get(LeavePolicyType, p.leave_type_id)
+    created = getattr(p, "created_at", None)
+    updated = getattr(p, "updated_at", None)
+    return {
+        "id": p.id,
+        "project_id": p.project_id,
+        "leave_type_id": p.leave_type_id,
+        "leave_name": lt.name if lt else None,
+        "name": p.name,
+        "leave_credit_type": p.leave_credit_type,
+        "leave_credit_balance": _num(p.leave_credit_balance),
+        "initial_credit_balance": _num(p.initial_credit_balance),
+        "leave_expire": p.leave_expire,
+        "is_max_limit": bool(p.is_max_limit),
+        "maximum_carry_forward": int(p.maximum_carry_forward or 0),
+        "effective_date": p.effective_date.isoformat() if p.effective_date else None,
+        "is_active": bool(getattr(p, "is_active", True)),
+        "created_at": created.isoformat() if created else None,
+        "updated_at": updated.isoformat() if updated else None,
     }
 
 
@@ -67,10 +109,12 @@ def project_employee_out(pe: ProjectEmployee, emp: Employee | None = None) -> di
     emp = emp or pe.employee
     return {
         "id": pe.id,
+        "pe_id": pe.id,  # alias for UI drill-down (project-employees/:id)
         "project_id": pe.project_id,
         "employee_id": pe.employee_id,
         "employee_name": employee_full_name(emp),
         "employee_email": emp.email if emp else None,
+        "role_title": getattr(pe, "role_title", None) or (getattr(emp, "role_title", None) if emp else None),
         "onboarding_date": pe.onboarding_date.isoformat() if pe.onboarding_date else None,
         "experience_years": _num(pe.experience_years),
         "project_experience_years": _num(getattr(pe, "project_experience_years", None)),
@@ -102,8 +146,11 @@ def project_detail_out(db: Session, p: Project) -> dict:
     data = project_out(p)
     customer = db.get(Customer, p.customer_id)
     opportunity = db.get(Opportunity, p.opportunity_id)
+    branch = _project_branch(db, p)
     data["customer_name"] = customer.name if customer else None
     data["opportunity_title"] = opportunity.title if opportunity else None
+    data["branch_id"] = branch.id if branch else None
+    data["branch_name"] = branch.branch_name if branch else None
     team_rows = db.execute(
         select(ProjectEmployee, Employee)
         .join(Employee, Employee.id == ProjectEmployee.employee_id)

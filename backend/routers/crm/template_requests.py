@@ -288,3 +288,24 @@ def cancel_request(
     db.commit()
     db.refresh(tr)
     return envelope(_serialize(db, tr), message="Template request cancelled")
+
+
+@router.delete("/{tr_id}")
+def delete_request(
+    tr_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(role_required("TA", "RMG")),
+):
+    """Hard-delete a template request. Blocks Prepared (downstream L1 may reference it)."""
+    from services.crm_common import commit_or_conflict
+
+    tr = _get_or_404(db, tr_id)
+    status = _ev(tr.status)
+    if status == TemplateRequestStatus.PREPARED.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete: request is Prepared (candidate L1 already attached).",
+        )
+    db.delete(tr)
+    commit_or_conflict(db, "Cannot delete: template request is still referenced by other records.")
+    return envelope(data={"id": tr_id}, message="Template request deleted")
