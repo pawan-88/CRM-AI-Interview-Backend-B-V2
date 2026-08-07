@@ -6,7 +6,7 @@ from uuid import uuid4
 # Imported lazily-safe: utils.warmup only depends on stdlib so this module
 # stays cheap to import inside fastapi startup paths.
 from ai import align_qa_to_answered_turns
-from utils.warmup import filter_out_warmups
+from utils.warmup import extract_and_strip_intro, filter_out_warmups
 
 
 def build_hr_records_summary(records: list[dict]) -> list[dict]:
@@ -82,8 +82,20 @@ def build_report_record(session: dict, report_result: dict, evaluated_ist: dict)
     meta = session.get("meta", {})
     job_id = str(meta.get("job_id") or "").strip()
     job_title = str(meta.get("job_title") or "").strip()
+    # Realign the scored per-question rows with the warmup-filtered transcript and
+    # surface the introduction turn for display (fixes the first technical question
+    # inheriting the intro's 0% and shows what the candidate said in the warmup).
+    extract_and_strip_intro(report_result, session.get("questions"), session.get("answers"), meta)
     rec_q, rec_a = filter_out_warmups(session.get("questions"), session.get("answers"), meta)
     rec_q, rec_a, _ = align_qa_to_answered_turns(rec_q, rec_a)
+    # Persist whether this role was assessed on communication at all. The report
+    # is read long after the session is gone, so the flag has to live in the
+    # record — otherwise the UI cannot tell "communication scored 0" apart from
+    # "communication was never assessed", and would show an empty card either way.
+    if isinstance(report_result, dict):
+        report_result.setdefault(
+            "communication_required", bool(meta.get("communication_required", True))
+        )
     return {
         "id": meta.get("interview_id", str(uuid4())),
         "created_at": meta.get("created_at"),

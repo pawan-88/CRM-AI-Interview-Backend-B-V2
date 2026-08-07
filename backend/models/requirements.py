@@ -4,6 +4,7 @@ from __future__ import annotations
 import enum
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from models.base import Base, TimestampMixin, USERS_FK, WorkMode, pg_enum
@@ -45,6 +46,10 @@ class Requirement(Base, TimestampMixin):
     description = sa.Column(sa.Text, nullable=True)
     # RMG job description (typed at engineering-approve); file JD lives in RequirementAttachment.
     rmg_jd_text = sa.Column(sa.Text, nullable=True)
+    # Optional per-requirement ATS component weights, e.g. {"experience": 30,
+    # "mandatory": 40}. NULL = use the scorer's default weights. Missing keys fall
+    # back to defaults; only configured criteria enter the score denominator.
+    ats_weights = sa.Column(JSONB, nullable=True)
     no_of_positions = sa.Column(sa.Integer, nullable=False, server_default="1")
     experience_min = sa.Column(sa.Numeric(4, 1), nullable=True)
     experience_max = sa.Column(sa.Numeric(4, 1), nullable=True)

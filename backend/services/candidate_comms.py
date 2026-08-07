@@ -18,11 +18,13 @@ logger = logging.getLogger("karnex.crm.candidate_comms")
 
 # --------------------------------------------------------------------- email
 
-def send_candidate_email(to: str, subject: str, text: str, html: str | None = None) -> dict:
+def send_candidate_email(to: str, subject: str, text: str, html: str | None = None,
+                         attachments: list[tuple[str, bytes, str]] | None = None) -> dict:
     """Send one candidate email via the platform SMTP config. Never raises.
 
     Returns {"sent": bool, "error": str|None}; {"sent": False, "error":
     "smtp_disabled"} when SMTP is not enabled/configured.
+    `attachments`: optional (filename, bytes, mime) list — e.g. an .ics invite.
     """
     try:
         to = (to or "").strip()
@@ -30,13 +32,48 @@ def send_candidate_email(to: str, subject: str, text: str, html: str | None = No
             return {"sent": False, "error": "no_email"}
         if not smtp_configured():
             return {"sent": False, "error": "smtp_disabled"}
-        result = send_email(to, subject, text, html)
+        result = send_email(to, subject, text, html, attachments=attachments)
         if result.get("ok"):
             return {"sent": True, "error": None}
         return {"sent": False, "error": str(result.get("error") or "send_failed")}
     except Exception as exc:  # defensive: comms must never break the pipeline
         logger.warning("candidate email failed for %s: %s", to, exc)
         return {"sent": False, "error": str(exc)}
+
+
+# ----------------------------------------------------------------- ics invite
+
+def build_ics_invite(summary: str, starts_at, description: str = "", location: str = "",
+                     uid: str = "karnex-interview", duration_minutes: int = 60) -> str:
+    """Minimal RFC-5545 VCALENDAR for one interview event (floating local time,
+    matching how RMG typed it). Attach as ("invite.ics", bytes, "text/calendar")."""
+    from datetime import timedelta
+
+    def _fmt(dt) -> str:
+        return dt.strftime("%Y%m%dT%H%M%S")
+
+    def _esc(v: str) -> str:
+        return (v or "").replace("\\", "\\\\").replace(";", r"\;").replace(",", r"\,").replace("\n", r"\n")
+
+    ends_at = starts_at + timedelta(minutes=duration_minutes)
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Karnex//AI HR Suite//EN",
+        "METHOD:REQUEST",
+        "BEGIN:VEVENT",
+        f"UID:{uid}@karnex",
+        f"DTSTAMP:{_fmt(starts_at)}",
+        f"DTSTART:{_fmt(starts_at)}",
+        f"DTEND:{_fmt(ends_at)}",
+        f"SUMMARY:{_esc(summary)}",
+    ]
+    if description:
+        lines.append(f"DESCRIPTION:{_esc(description)}")
+    if location:
+        lines.append(f"LOCATION:{_esc(location)}")
+    lines += ["STATUS:CONFIRMED", "END:VEVENT", "END:VCALENDAR"]
+    return "\r\n".join(lines) + "\r\n"
 
 
 # ------------------------------------------------------------------ whatsapp

@@ -17,7 +17,7 @@ from models import (
     TimesheetEntry, TimesheetStatus,
 )
 from services.finance import active_po_allocation_for_project
-from services.timesheets import _project_branch, effective_billing_policy, period_bounds
+from services.timesheets import _project_branch, effective_billing_policy, opportunity_branch_foreign_to_project, period_bounds
 
 
 def get_project_or_404(db: Session, project_id: int) -> Project:
@@ -93,9 +93,11 @@ def project_leave_policy_out(db: Session, p) -> dict:
         "leave_name": lt.name if lt else None,
         "name": p.name,
         "leave_credit_type": p.leave_credit_type,
+        "leave_credit_timing": getattr(p, "leave_credit_timing", None),
         "leave_credit_balance": _num(p.leave_credit_balance),
         "initial_credit_balance": _num(p.initial_credit_balance),
         "leave_expire": p.leave_expire,
+        "leave_expire_timing": getattr(p, "leave_expire_timing", None),
         "is_max_limit": bool(p.is_max_limit),
         "maximum_carry_forward": int(p.maximum_carry_forward or 0),
         "effective_date": p.effective_date.isoformat() if p.effective_date else None,
@@ -147,10 +149,15 @@ def project_detail_out(db: Session, p: Project) -> dict:
     customer = db.get(Customer, p.customer_id)
     opportunity = db.get(Opportunity, p.opportunity_id)
     branch = _project_branch(db, p)
+    foreign = opportunity_branch_foreign_to_project(db, p)
     data["customer_name"] = customer.name if customer else None
     data["opportunity_title"] = opportunity.title if opportunity else None
     data["branch_id"] = branch.id if branch else None
     data["branch_name"] = branch.branch_name if branch else None
+    data["branch_unlinked"] = bool(branch is None and foreign)
+    data["branch_link_message"] = (
+        "Branch not linked to this customer" if data["branch_unlinked"] else None
+    )
     team_rows = db.execute(
         select(ProjectEmployee, Employee)
         .join(Employee, Employee.id == ProjectEmployee.employee_id)

@@ -43,8 +43,10 @@ from services.opportunities import (
     fetch_activity_log,
     get_opportunity_or_404,
     replace_skills,
+    requirement_fields_from_opportunity,
     serialize_opportunity,
     serialize_skills,
+    sync_requirement_from_opportunity,
     validate_refs,
     validate_stage_transition,
 )
@@ -78,12 +80,26 @@ def _spawn_requirement_from_opportunity(db: Session, opp: Opportunity, approver:
     if existing:
         return None  # a requirement already exists for this opportunity
 
+    # Carry the Sales-entered details onto the requirement so RMG (Engineering
+    # Review) and TA see Experience / Budget / Work mode / Location / Target
+    # closure without re-keying. Single source of truth in services.opportunities
+    # (also used to backfill requirements created before this carry-over existed).
+    carry = requirement_fields_from_opportunity(db, opp)
+
     req = Requirement(
         req_number=next_sequence_number(db, Requirement, Requirement.req_number, "REQ"),
         opportunity_id=opp.id,
         customer_id=opp.customer_id,
         title=opp.title,
-        no_of_positions=1,
+        description=carry["description"],
+        no_of_positions=(carry["no_of_positions"] or 1),
+        experience_min=carry["experience_min"],
+        experience_max=carry["experience_max"],
+        budget_ctc_min=carry["budget_ctc_min"],
+        budget_ctc_max=carry["budget_ctc_max"],
+        work_mode=carry["work_mode"],
+        location_id=carry["location_id"],
+        target_closure_date=carry["target_closure_date"],
         priority=Priority.MEDIUM,
         status=RequirementStatus.PENDING_ENGINEERING_REVIEW,
         created_by=opp.created_by,
@@ -323,6 +339,10 @@ def update_opportunity(
         # Opportunity-type and source-detail changes refresh the complete chain.
         _replace_ctc_slab(db, opp, _existing_ctc_rows(db, opp.id))
     opp.version = (opp.version or 1) + 1  # bump for the next optimistic-concurrency check
+
+    # Keep the linked requirement (seen by RMG/TA) in sync with the opportunity's
+    # title, customer and carried details — they're denormalized copies.
+    sync_requirement_from_opportunity(db, opp)
 
     log_activity(db, OpportunityActivityLog, "opportunity_id", opp.id, user.id,
                  "Updated", f"Fields updated: {', '.join(sorted(changes.keys()))}")

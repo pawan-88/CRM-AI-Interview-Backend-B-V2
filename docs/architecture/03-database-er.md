@@ -155,6 +155,8 @@ erDiagram
         int customer_id FK
         int branch_id FK
         string role "from contact_roles master"
+        string contact_priority "Primary|Secondary"
+        string notification "Email|SMS|Both|None"
         boolean is_hiring_manager
     }
     contact_roles {
@@ -272,7 +274,8 @@ erDiagram
     project_employees ||--o{ project_employee_leave_details : "leave"
     project_employees ||--o{ project_employee_rates : "rates"
     leave_policy_types ||--o{ project_employee_leave_details : "of type"
-    customer_leave_policies ||--o{ project_employee_leave_details : "seeds"
+    customer_leave_policies ||--o{ project_employee_leave_details : "seeds (branch/customer)"
+    project_leave_policies ||--o{ project_employee_leave_details : "seeds (project override)"
     projects ||--o{ project_leave_policies : "leave policy"
     leave_policy_types ||--o{ project_leave_policies : "of type"
     projects ||--o{ project_communication_matrix : "has"
@@ -323,9 +326,11 @@ erDiagram
         int leave_type_id FK
         string name
         string leave_credit_type "VARCHAR(64); Monthly|…|Credit Balance Every Month"
+        string leave_credit_timing "Start_Of_Period|End_Of_Period"
         decimal leave_credit_balance
         decimal initial_credit_balance
         string leave_expire "Monthly|Quarterly|Annually|Carry Forward"
+        string leave_expire_timing "Start_Of_Period|End_Of_Period; null if no expire"
         bool is_max_limit
         int maximum_carry_forward
         date effective_date "accrual lower bound with PE.onboarding_date"
@@ -352,7 +357,8 @@ erDiagram
         int id PK
         int project_employee_id FK
         int leave_type_id FK
-        int customer_leave_policy_id FK
+        int customer_leave_policy_id FK "nullable; exactly one of customer/project FK set"
+        int project_leave_policy_id FK "nullable; set when seeded from project override"
         decimal initial_balance
         decimal opening_balance
         decimal leave_accrual
@@ -433,6 +439,12 @@ erDiagram
         int id PK
         string po_number UK
         int customer_id FK
+        date start_date
+        date end_date
+        enum po_type "Standard|Blanket|Open PO|Regular PO"
+        jsonb billing_address_snapshot
+        jsonb delivery_address_snapshot
+        decimal tax_slab
         decimal total_value
         decimal consumed_value
         enum status "Active|Exhausted|Cancelled"
@@ -448,6 +460,7 @@ erDiagram
         string invoice_number UK
         int po_id FK
         int project_id FK
+        string buyer_state_code "nullable 2-digit GST override"
         decimal grand_total
         enum payment_status "Unpaid|Partially_Paid|Paid"
     }

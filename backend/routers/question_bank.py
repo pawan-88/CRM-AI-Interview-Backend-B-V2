@@ -7,24 +7,23 @@ super-admins in the UI.
 """
 from __future__ import annotations
 
-import hashlib
-import os
 
 import jwt
 from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse
 
 import question_bank as qb
+from auth_secret import auth_secret as _shared_auth_secret
 
 router = APIRouter(tags=["Question Bank"])
 
 
 def _auth_secret() -> str:
-    # Must match main.py / crm_deps exactly (incl. sha256 for short secrets).
-    raw = (os.getenv("AUTH_SECRET") or os.getenv("REPORT_CODE") or "change-me-auth-secret").strip()
-    if len(raw.encode("utf-8")) >= 32:
-        return raw
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """Delegates to auth_secret.py — no local fallback (see that module).
+
+    A default here meant tokens could be forged by anyone reading the source.
+    """
+    return _shared_auth_secret()
 
 
 def _require_hr(request: Request) -> dict:

@@ -6,7 +6,7 @@ Alembic's env.py relies on that for migrations.
 from models.base import Base, USERS_TABLE, USERS_FK, WorkMode  # noqa: F401
 from models.masters import (  # noqa: F401
     AppSetting, CalendarYear, ContactRole, Currency, Department, Designation, DocumentType,
-    FinancialYear, LeavePolicyType, Location, Skill, TaxRate,
+    FinancialYear, LeavePolicyType, Location, Skill, TaxRate, UserTablePreference
 )
 from models.customers import (  # noqa: F401
     BranchHolidayYear, ContactPerson, Customer, CustomerBillingPolicy, CustomerBranch, CustomerDocument, CustomerStatus,
@@ -49,7 +49,7 @@ from models.leave import (  # noqa: F401
 )
 from models.rbac import Notification, Role, RoleName, UserRole  # noqa: F401
 from models.ai_links import AiInterviewLink  # noqa: F401
-from models.scheduling import CandidateOutreach, InterviewSlot, SlotBooking  # noqa: F401
+from models.scheduling import CandidateOutreach, InterviewEvent, InterviewSlot, SlotBooking  # noqa: F401
 from models.template_requests import TemplateRequest, TemplateRequestStatus  # noqa: F401
 from models.access_templates import AccessTemplate  # noqa: F401
 from models.user_profiles import UserProfile  # noqa: F401

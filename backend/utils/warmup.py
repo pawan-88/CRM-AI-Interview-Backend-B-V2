@@ -121,6 +121,40 @@ def is_warmup_index(meta: dict | None, idx: int) -> bool:
     return i in _coerce_indices(meta)
 
 
+def extract_and_strip_intro(
+    report: dict | None,
+    session_questions: Sequence[str] | None,
+    session_answers: Sequence[str] | None,
+    meta: dict | None,
+) -> None:
+    """Expose the warmup/introduction turn for DISPLAY ONLY on the report.
+
+    The warmup is filtered out of questions/answers BEFORE scoring (see
+    _evaluate_and_store_report), so it never appears in ``per_question`` and the
+    scored arrays are already aligned — this function must NOT touch them. It only
+    reads the raw session transcript (which still has the warmup at index 0) and
+    surfaces the intro question + the candidate's answer so the report can show
+    what they said. It carries no score. No-op when the warmup is disabled.
+    """
+    if not isinstance(report, dict):
+        return
+    wm = _coerce_indices(meta)
+    if not wm or report.get("introduction_turn") is not None:
+        return
+    sq = [str(q) for q in (session_questions or [])]
+    sa = [str(a) for a in (session_answers or [])]
+    intro_idx = min(wm)
+    q = sq[intro_idx] if intro_idx < len(sq) else WARMUP_QUESTION_TEXT
+    a = sa[intro_idx] if intro_idx < len(sa) else ""
+    if q or a:
+        report["introduction_turn"] = {
+            "question": q or WARMUP_QUESTION_TEXT,
+            "answer": a,
+            "evaluation": {},
+            "excluded_reason": "Introduction warmup (not counted toward overall score).",
+        }
+
+
 def filter_out_warmups(
     questions: Iterable[str] | None,
     answers: Iterable[str] | None,

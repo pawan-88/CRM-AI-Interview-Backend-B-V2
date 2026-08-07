@@ -93,11 +93,21 @@ def test_validate_allows_zero_entitlement_as_lop():
 def test_validate_unknown_leave_type_still_raises():
     ts = _ts()
     entries = [_leave_entry("NoSuchType")]
-    db = _sequenced_db([("first", None)])
+    # resolve: candidate SQL miss, then full-table stem scan miss
+    db = _sequenced_db([("first", None), ("all", [])])
     with pytest.raises(HTTPException) as ei:
         validate_timesheet_leave_balances(db, ts, entries)
     assert ei.value.status_code == 400
     assert "Unknown leave type" in str(ei.value.detail)
+
+
+def test_validate_resolves_casual_stem_to_casual_leave():
+    """Entries may store stem 'casual' while policy types are 'Casual Leave'."""
+    lt = SimpleNamespace(id=1, name="Casual Leave")
+    ts = _ts()
+    entries = [_leave_entry("casual")]
+    db = _sequenced_db([("first", lt)])
+    validate_timesheet_leave_balances(db, ts, entries)
 
 
 def test_classify_earned_5_take_7_splits_paid_and_lop():
@@ -209,13 +219,14 @@ def test_consume_allow_negative_false_for_earned_paid_portion():
     assert mock_consume.call_args.kwargs.get("allow_negative") is False
 
 
-def test_consume_allow_negative_true_for_comp_off():
+def test_consume_allow_negative_false_when_comp_off_has_balance():
+    """ISSUE-3: Comp-Off paid portion consumes with allow_negative=False."""
     lt = SimpleNamespace(id=5, name="Comp-Off")
     lop = SimpleNamespace(id=99, name="Loss of Pay")
     pe_row = SimpleNamespace(
-        leave_type_id=5, leave_balance=D("0"), leave_consumed=D("0"),
+        leave_type_id=5, leave_balance=D("2"), leave_consumed=D("0"),
     )
-    pe_after = SimpleNamespace(leave_balance=D("-1"), leave_consumed=D("1"))
+    pe_after = SimpleNamespace(leave_balance=D("1"), leave_consumed=D("1"))
     ts = _ts()
     entries = [_leave_entry("Comp-Off")]
     db = MagicMock()
@@ -244,4 +255,36 @@ def test_consume_allow_negative_true_for_comp_off():
     db.flush = MagicMock()
     with patch("services.project_employees.consume_pe_leave", return_value=pe_after) as mock_consume:
         consume_timesheet_leaves(db, ts, entries)
-    assert mock_consume.call_args.kwargs.get("allow_negative") is True
+    assert mock_consume.called
+    assert mock_consume.call_args.kwargs.get("allow_negative") is False
+    assert mock_consume.call_args.args[2] == 5  # Comp-Off type id
+
+
+def test_classify_comp_off_excess_becomes_lop():
+    """ISSUE-3: Comp-Off with balance 1, apply 2 → paid 1 + LOP 1."""
+    comp = SimpleNamespace(id=5, name="Comp-Off")
+    lop = SimpleNamespace(id=99, name="Loss of Pay")
+    pe_row = SimpleNamespace(leave_type_id=5, leave_balance=D("1"))
+    ts = _ts()
+    entries = [_leave_entry("Comp-Off", day=1), _leave_entry("Comp-Off", day=2)]
+    db = MagicMock()
+    calls = {"n": 0}
+
+    def execute(_stmt):
+        result = MagicMock()
+        n = calls["n"]
+        calls["n"] += 1
+        if n == 0:
+            result.scalars.return_value.all.return_value = []
+        elif n == 1:
+            result.scalars.return_value.all.return_value = [pe_row]
+        elif n == 2:
+            result.scalars.return_value.first.return_value = comp
+        else:
+            result.scalars.return_value.first.return_value = lop
+        return result
+
+    db.execute.side_effect = execute
+    clf = classify_timesheet_leave_paid_vs_lop(db, ts, entries)
+    assert clf.paid_required_by_type_id.get(5) == D("1")
+    assert clf.lop_days_total == D("1")

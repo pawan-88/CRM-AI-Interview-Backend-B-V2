@@ -74,6 +74,7 @@ journey
       Create customer + branches/contacts (5-step wizard): 4: Sales
       Edit branch (4-step: Info → Holiday Billing → Leave & Holiday Billing + Billable Leave → Billing Props): 4: Sales
       Create opportunity (11-step wizard, Prev+Next bottom-right): 4: Sales
+      Edit opportunity from list row (same full wizard; GET+hydrate → versioned PUT): 3: Sales
       Add type-aware Candidate CTC slabs with auto revenue and budget: 4: Sales
       Advance pipeline stage: 3: Sales
       Create requirement (Draft): 4: Sales
@@ -102,6 +103,7 @@ journey
     section Timesheets
       Review Timesheet Due report: 5: RMG
       Edit daily grid (Week Off hours editable; Apply leave + Comp-Off): 4: RMG
+      Excess leave / Absent / Half_Day → LOP reporting; Summary + Invoice LOP column: 4: RMG
       Weekend work: Comp Off Billable → bill or credit: 4: RMG
       Submit/resubmit drafts: 4: RMG
       Approve/reject submitted sheets: 4: RMG
@@ -140,10 +142,18 @@ journey
       Approve/reject timesheets: 4: HR
       RMG timesheet reports (due · submission · approvals): 4: RMG
     section Finance
-      Create purchase orders: 4: Finance
-      Allocate PO to projects: 3: Finance
+      Create purchase orders (Open/Regular, start/end dates, CGST/IGST slab): 4: Finance
+      Edit purchase orders (list pencil / detail Edit → PUT): 4: Finance
+      Quick-add customer contact from PO Header (Finance write on POST/PUT contacts): 4: Finance
+      Allocate PO to project during create (customer+branch-filtered): 3: Finance
+      Allocate PO to projects (detail): 3: Finance
+      Dashboard warning when PO end_date within 45 days / expired: 4: Finance
       Generate invoices using PE effective rates: 4: Finance
       Block invoice/submit when PO expired: 4: Finance
+      Invoice detail GST + editable buyer State Code override: 5: Finance
+      New Tax Invoice generator (form/Excel/PDF): 5: Finance
+      Download Tax Invoice PDF from invoice detail: 5: Finance
+      View Tax Invoice (A4 print): 4: Finance
       Record payments + TDS: 4: Finance
       View finance dashboard: 5: Finance
 ```
@@ -221,13 +231,22 @@ Breadcrumb crumbs (last = current, not a link):
 | Project employee | `Customers / {customer} / {branch} / {project} / {employee}` |
 
 Row-click actions (Edit/Delete) use `stopPropagation` so they do not navigate.
-After a dependency **409**, ConfirmModal disables Delete (Close to dismiss); Employees
-offer **Deactivate** (`PUT is_active=false`) when hard-delete is blocked.
+List Delete opens **ConfirmModal** (“Do you want to delete this …?”); on confirm the
+row is removed from list state immediately (`afterListDelete`) then soft-refreshed —
+no need to open the entity and navigate back. After a dependency **409**, ConfirmModal
+disables Delete (Close to dismiss); Employees offer **Deactivate** (`PUT is_active=false`)
+when hard-delete is blocked.
 Serializer additions for crumbs: project detail `customer_id`/`customer_name`/`branch_id`/`branch_name`
-(via `project.branch_id` then opportunity); PE detail top-level `branch_id`/`branch_name`;
-branch policy `customer_name` + `linked_projects`; team rows `pe_id`.
+(via `project.branch_id` then **same-customer** opportunity branch; foreign opp branches suppressed
+with `branch_unlinked` / “Branch not linked to this customer”); PE detail top-level
+`branch_id`/`branch_name`; branch policy `customer_name` + `linked_projects`; team rows `pe_id`.
 `projects.branch_id` (0045) is the explicit Branch→Project link; legacy rows fall back to
-`opportunity.branch_id`.
+same-customer `opportunity.branch_id` only. `ensure_project_branch_id` never overwrites a
+non-null `project.branch_id` (PUT opportunity change also keeps an existing branch when
+the new opp branch is foreign). Timesheet detail header uses `pe_effective_branch` /
+`_project_branch` — never raw `opp.branch_id` — so a stray cross-customer opportunity branch
+(e.g. Harman under BMW) cannot appear in the timesheet Branch field. Disagreement between
+`project.branch_id` and `opportunity.branch_id` is logged.
 
 ### PE Holidays + leave sync
 - Holidays tab / timesheet holiday dates resolve branch via

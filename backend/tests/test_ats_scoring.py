@@ -6,6 +6,7 @@ import pytest
 
 from services.ats_scoring import (
     AtsConfigError,
+    detect_experience_years,
     looks_like_resume,
     score_resume_against_requirement,
 )
@@ -157,3 +158,57 @@ def test_jd_match_boosts_resume_aligned_with_jd():
     assert with_jd["breakdown"]["score_details"]["earned_points"] >= without["breakdown"]["score_details"]["earned_points"]
     nurse = score_resume_against_requirement(UNRELATED_RESUME, MANDATORY, OPTIONAL, 4, 8, jd_text=jd)
     assert with_jd["ats_score"] > nurse["ats_score"]
+
+
+# ------------------------------------------- symbol-ending skills (C++, C#, .NET)
+SYMBOL_RESUME = """
+Alex Lee
+alex.lee@example.com | +1 555 111 2222
+Skills: C++, C#, .NET, STL
+Experience: 5 years building systems in C++ and C#.
+Education: B.Tech
+"""
+
+
+def test_symbol_skills_match():
+    r = score_resume_against_requirement(SYMBOL_RESUME, ["C++"])
+    assert "C++" in r["breakdown"]["skills_matched"]
+    assert "C++" not in r["breakdown"]["skills_missing"]
+
+
+# --------------------------------------------------------- skill alias matching
+def test_skill_alias_react_matches_reactjs():
+    resume = (
+        "Sam Roy\nsam.roy@example.com | +1 555 000 1111\n"
+        "Skills: ReactJS, JavaScript, K8s\nExperience: 4 years.\nEducation: B.E"
+    )
+    r = score_resume_against_requirement(resume, ["React"])
+    assert "React" in r["breakdown"]["skills_matched"]
+
+
+# --------------------------------------------------- improved experience parsing
+def test_experience_from_date_range():
+    assert detect_experience_years("Software Engineer, Acme 2018 - 2023.") == 5.0
+
+
+def test_experience_prefers_stated_total():
+    assert detect_experience_years("Backend engineer with 7 years of experience.") == 7.0
+
+
+# ----------------------------------------------------- per-requirement weighting
+def test_custom_weights_apply_and_change_score():
+    base = score_resume_against_requirement(PARTIAL_RESUME, MANDATORY, OPTIONAL, 4, 8)
+    heavy = score_resume_against_requirement(
+        PARTIAL_RESUME, MANDATORY, OPTIONAL, 4, 8, weights={"experience": 40},
+    )
+    assert heavy["breakdown"]["score_details"]["weights"]["experience"] == 40
+    assert heavy["breakdown"]["score_details"]["weights_customized"] is True
+    assert heavy["ats_score"] != base["ats_score"]
+
+
+def test_bad_weights_are_ignored_not_fatal():
+    r = score_resume_against_requirement(
+        PARTIAL_RESUME, MANDATORY, weights={"experience": -5, "bogus": 99},
+    )
+    # negative/unknown keys ignored → experience stays at its default 15
+    assert r["breakdown"]["score_details"]["weights"]["experience"] == 15

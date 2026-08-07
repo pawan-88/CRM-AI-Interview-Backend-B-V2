@@ -48,6 +48,52 @@ class SlotBooking(Base):
     slot = relationship("InterviewSlot")
 
 
+class InterviewEvent(Base):
+    """Human interview rounds (L2 face-to-face, customer interviews) scheduled on
+    a candidate profile — feeds the RMG/Sales interview calendar and .ics invites."""
+    __tablename__ = "interview_events"
+    id = sa.Column(sa.Integer, primary_key=True)
+    profile_id = sa.Column(sa.Integer, sa.ForeignKey("candidate_profiles.id"), nullable=False, index=True)
+    candidate_id = sa.Column(sa.Integer, sa.ForeignKey("candidates.id"), nullable=True)
+    # L2_F2F / Customer_Interview / Other
+    kind = sa.Column(sa.String(32), nullable=False, server_default="L2_F2F")
+    scheduled_at = sa.Column(sa.DateTime(timezone=True), nullable=True, index=True)
+    raw_when = sa.Column(sa.String(64), nullable=True)  # original free-form input
+    meeting_link = sa.Column(sa.String(1024), nullable=True)
+    note = sa.Column(sa.Text, nullable=True)
+    # Structured outcome of the round (Zoho Interview_Round subform). Kept alongside
+    # `note` so imported history is queryable instead of buried in free text.
+    stage = sa.Column(sa.String(120), nullable=True)
+    mode = sa.Column(sa.String(60), nullable=True)
+    status = sa.Column(sa.String(60), nullable=True)
+    result = sa.Column(sa.String(60), nullable=True)
+    interviewer = sa.Column(sa.String(200), nullable=True)
+    feedback = sa.Column(sa.Text, nullable=True)
+    zoho_round_id = sa.Column(sa.String(32), nullable=True)
+    # --- RMG interview-feedback form (migration 0056) ------------------------
+    interview_category = sa.Column(sa.String(20), nullable=True)   # Internal / External
+    duration_minutes = sa.Column(sa.Integer, nullable=True)
+    user_role = sa.Column(sa.String(40), nullable=True)            # who conducted the round
+    # The panel member, when they exist in the Employees tab. `interviewer` always
+    # keeps the display text (external panellists have no employee row).
+    employee_id = sa.Column(sa.Integer, sa.ForeignKey("employees.id"), nullable=True, index=True)
+    # --- Zoho interviews.json (migration 0059) -------------------------------
+    #: Durable external id so interviews.json upserts instead of duplicating.
+    zoho_interview_id = sa.Column(sa.String(32), nullable=True)
+    interviewer_email = sa.Column(sa.String(255), nullable=True)
+    interviewer_phone = sa.Column(sa.String(32), nullable=True)
+    external_panel = sa.Column(sa.String(255), nullable=True)
+    scheduled_end = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    weightage = sa.Column(sa.String(60), nullable=True)
+    score_card_reference = sa.Column(sa.String(255), nullable=True)
+    venue = sa.Column(sa.String(255), nullable=True)
+    created_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+
+    profile = relationship("CandidateProfile")
+    candidate = relationship("Candidate")
+
+
 class CandidateOutreach(Base):
     __tablename__ = "candidate_outreach"
     id = sa.Column(sa.Integer, primary_key=True)

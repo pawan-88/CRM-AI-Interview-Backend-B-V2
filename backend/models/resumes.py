@@ -47,9 +47,9 @@ class Resume(Base):
     ats_score_breakdown = sa.Column(JSONB, nullable=True)
     ats_status = sa.Column(pg_enum(AtsStatus, "ats_status"), nullable=False,
                            server_default=AtsStatus.PENDING_SCAN.value, index=True)
-    screened_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    screened_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True, index=True)
     ai_interview_status = sa.Column(pg_enum(AiInterviewStatus, "ai_interview_status"), nullable=False,
-                                    server_default=AiInterviewStatus.NOT_SCHEDULED.value)
+                                    server_default=AiInterviewStatus.NOT_SCHEDULED.value, index=True)
     ai_interview_scheduled_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
     created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
 

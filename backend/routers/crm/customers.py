@@ -1,13 +1,14 @@
 """Customer master API: CRUD + branches, billing policy, documents, contact persons.
 
-Writes: Sales / Sales_Head (Admin implicit). Reads: any CRM role.
+Writes: Sales / Sales_Head (Admin implicit). Contact create/update also allows Finance
+(PO Header quick-add). Reads: any CRM role.
 No activity-log table exists for customers, so mutations are not logged here.
 """
 from __future__ import annotations
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -32,10 +33,11 @@ from schemas.customers import (
     CustomerCreate,
     CustomerUpdate,
 )
-from schemas.leave import BranchHolidayCreate, BranchHolidayUpdate, BranchLeavePolicyCreate, CustomerLeavePolicyUpdate
+from schemas.leave import BranchHolidayCreate, BranchHolidayUpdate, BranchLeavePolicyCreate, CustomerLeavePolicyUpdate, apply_leave_expire_timing_consistency
 from services.crm_common import paginate, save_upload
 from services.customers import (
     clear_other_primaries,
+    detach_branch_references,
     ensure_unique_name,
     get_branch_or_404,
     get_contact_or_404,
@@ -54,6 +56,8 @@ router = APIRouter(prefix="/api/customers", tags=["CRM: Customers"])
 
 read_customers = gated_read("customers")
 write_customers = gated_write("customers", "Sales", "Sales_Head")
+# Finance may add/edit contacts from the PO form (quick-add popup).
+write_customer_contacts = gated_write("customers", "Sales", "Sales_Head", "Finance")
 read_branch_policy = gated_read("branch-policy")
 write_branch_policy = gated_write("branch-policy", "Sales", "Sales_Head", "HR")
 
@@ -304,10 +308,42 @@ def update_branch(
 def delete_branch(
     customer_id: int,
     branch_id: int,
+    force: bool = Query(False, description="Admin/CEO only: detach referencing records, then delete"),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(write_customers),
 ):
+    """Delete a branch.
+
+    Normally a branch referenced by contacts / opportunities / projects /
+    invoices / holidays is protected (400). Admin and CEO may pass
+    ``?force=true``: the referencing records are DETACHED (their branch_id is
+    set to NULL — nothing is deleted, so no business history is lost) and the
+    branch is then removed.
+    """
     branch = get_branch_or_404(db, customer_id, branch_id)
+
+    if force:
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Only Admin/CEO can force-delete a branch that is still referenced.",
+            )
+        detached = detach_branch_references(db, branch_id)
+        db.delete(branch)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(
+                status_code=400,
+                detail="Branch could not be deleted: it is still referenced by records that require a branch.",
+            )
+        summary = ", ".join(f"{n} {t}" for t, n in sorted(detached.items()) if n) or "no"
+        return envelope(
+            data={"id": branch_id, "detached": detached},
+            message=f"Branch deleted ({summary} record(s) detached)",
+        )
+
     db.delete(branch)
     try:
         db.commit()
@@ -408,13 +444,26 @@ def upsert_billing_policy(
     if created:
         policy = CustomerBillingPolicy(customer_id=customer_id)
         db.add(policy)
-    policy.week_off_billable = payload.week_off_billable
-    policy.leave_billable = payload.leave_billable
-    policy.holidays_billable = payload.holidays_billable
+    # Only overwrite billability when explicitly sent (customer Default tab omits them).
+    if payload.week_off_billable is not None:
+        policy.week_off_billable = payload.week_off_billable
+    elif created:
+        policy.week_off_billable = False
+    if payload.leave_billable is not None:
+        policy.leave_billable = payload.leave_billable
+    elif created:
+        policy.leave_billable = False
+    if payload.holidays_billable is not None:
+        policy.holidays_billable = payload.holidays_billable
+    elif created:
+        policy.holidays_billable = False
     policy.min_hours_full_day = payload.min_hours_full_day
     policy.min_hours_half_day = payload.min_hours_half_day
     policy.billing_type = payload.billing_type
-    policy.comp_off_billable = payload.comp_off_billable
+    if payload.comp_off_billable is not None:
+        policy.comp_off_billable = payload.comp_off_billable
+    elif created:
+        policy.comp_off_billable = False
     policy.comp_off_balance = payload.comp_off_balance
     policy.comp_off_balance_initial = payload.comp_off_balance_initial
     policy.comp_off_max_limit = payload.comp_off_max_limit
@@ -509,7 +558,7 @@ def create_contact(
     customer_id: int,
     payload: ContactCreate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(write_customers),
+    user: CurrentUser = Depends(write_customer_contacts),
 ):
     get_customer_or_404(db, customer_id)
     if payload.branch_id is not None:
@@ -527,7 +576,7 @@ def update_contact(
     contact_id: int,
     payload: ContactUpdate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(write_customers),
+    user: CurrentUser = Depends(write_customer_contacts),
 ):
     contact = get_contact_or_404(db, customer_id, contact_id)
     changes = payload.model_dump(exclude_unset=True)
@@ -595,6 +644,7 @@ def _branch_leave_policy_out(db: Session, p) -> dict:
         "prorate_balance_credit": bool(p.prorate_balance_credit),
         "leave_credit_balance": _n(p.leave_credit_balance), "initial_credit_balance": _n(p.initial_credit_balance),
         "maximum_carry_forward": _n(p.maximum_carry_forward), "leave_credit_timing": p.leave_credit_timing,
+        "leave_expire_timing": getattr(p, "leave_expire_timing", None),
         "effective_date": p.effective_date.isoformat() if p.effective_date else None,
         "is_billable": getattr(p, "is_billable", None),
         "is_active": bool(getattr(p, "is_active", True)),
@@ -661,13 +711,15 @@ def get_branch_effective_policy(
     """RESOLVED (branch → customer default → built-in) billing policy for a branch.
 
     Used by the New Opportunity form to inherit the branch's billing policy
-    (incl. billing_type). Also carries the Leave & Holiday aggregates:
+    (incl. billing_type).     Also carries the Leave & Holiday aggregates:
     ``holidays_count`` (active holidays in the branch's calendar for the
     current year; null when none), ``leave_total`` / ``credit_leave_monthly``
     (summed leave_credit_balance over active customer leave policies, branch
     row winning per leave type; Monthly-only for the latter; null when none)
     and ``leave_policy_name`` (set only when exactly one active leave type
-    applies). ``sources`` says where each value came from.
+    applies). ``sources`` says where each value came from
+    (``sources.leave_total == "branch"`` means a leave policy is linked to
+    this branch — New Opportunity prefills Holidays/Leave only then).
     """
     from services.branch_policy import effective_customer_branch_policy
     branch = _branch_or_404(db, branch_id)
@@ -838,10 +890,11 @@ def create_branch_leave_policy(
             status_code=409,
             detail="A leave policy for this branch/leave type already exists",
         )
+    data = apply_leave_expire_timing_consistency(body.model_dump())
     policy = CustomerLeavePolicy(
         customer_id=branch.customer_id,
         branch_id=branch_id,
-        **body.model_dump(),
+        **data,
     )
     db.add(policy)
     db.commit()
@@ -868,6 +921,7 @@ def update_branch_leave_policy(
     if "leave_type_id" in changes and changes["leave_type_id"] is not None:
         if db.get(LeavePolicyType, changes["leave_type_id"]) is None:
             raise HTTPException(status_code=400, detail="Leave policy type not found")
+    apply_leave_expire_timing_consistency(changes, existing_expire=policy.leave_expire)
     for field, value in changes.items():
         setattr(policy, field, value)
     db.commit()

@@ -43,8 +43,12 @@ router = APIRouter(prefix="/api", tags=["CRM: Masters"])
 admin_only = role_required()  # Admin passes implicitly; no other role allowed
 
 
-def _register(resource: str, res: MasterResource, CreateModel, UpdateModel, OutModel):
+def _register(resource: str, res: MasterResource, CreateModel, UpdateModel, OutModel,
+              create_dep=None):
+    """Register CRUD for a master resource. `create_dep` overrides who may POST
+    (defaults to admin_only); used to let CRM roles quick-add e.g. skills inline."""
     slug = resource.replace("-", "_")
+    _create_dep = create_dep or admin_only
 
     def list_items(p: PageParams = Depends(page_params),
                    is_active: Optional[bool] = None,
@@ -65,7 +69,7 @@ def _register(resource: str, res: MasterResource, CreateModel, UpdateModel, OutM
 
     def create_item(payload: CreateModel,
                     db: Session = Depends(get_crm_db),
-                    user: CurrentUser = Depends(admin_only)):
+                    user: CurrentUser = Depends(_create_dep)):
         obj = create_master(db, res, payload.model_dump(exclude_unset=True))
         return envelope(
             data=OutModel.model_validate(obj).model_dump(),
@@ -107,6 +111,9 @@ _register(
     "skills",
     MasterResource(Skill, "Skill", (Skill.name, Skill.category), has_is_active=True),
     SkillCreate, SkillUpdate, SkillOut,
+    # Skills are quick-added inline (RMG at engineering review, Sales/TA while
+    # building requirements) — not Admin-only like other master data.
+    create_dep=role_required("RMG", "Sales", "Sales_Head", "TA"),
 )
 _register(
     "locations",
@@ -127,6 +134,9 @@ _register(
     "contact-roles",
     MasterResource(ContactRole, "Contact role", (ContactRole.name,), has_is_active=True),
     ContactRoleCreate, ContactRoleUpdate, ContactRoleOut,
+    # Sales adds contact roles inline while filling in a customer or opportunity
+    # contact — waiting on an Admin to create the master value would block the form.
+    create_dep=role_required("Sales", "Sales_Head", "RMG", "TA", "HR", "Finance"),
 )
 _register(
     "leave-policy-types",

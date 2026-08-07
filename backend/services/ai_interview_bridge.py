@@ -27,8 +27,8 @@ from sqlalchemy.orm import Session
 from crm_db import CrmNotConfiguredError, crm_database_url, get_session_factory
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Opportunity,
-    OpportunitySkill, Requirement, RequirementSkill, Resume, Skill, TemplateRequest,
-    TemplateRequestStatus,
+    OpportunitySkill, PipelineStatus, Requirement, RequirementSkill, Resume, Skill,
+    TemplateRequest, TemplateRequestStatus,
 )
 from services.crm_common import get_app_setting, log_activity
 from services.notify import notify_role
@@ -131,8 +131,17 @@ def schedule_l1_interview(
     profile: CandidateProfile,
     resume: Resume | None = None,
     scheduled_by: int | None = None,
+    scheduled_at_local: str | None = None,
+    candidate_name_override: str | None = None,
+    candidate_email_override: str | None = None,
+    extra_notes: str = "",
 ) -> dict:
     """Schedule an AI L1 interview for a CRM candidate (real session).
+
+    `scheduled_at_local` is the interview date/time as the recruiter typed it
+    ("YYYY-MM-DD HH:MM"); when omitted it defaults to now, preserving the old
+    fire-immediately behaviour. The name/email overrides let the recruiter correct
+    candidate details at scheduling time without editing the candidate master.
 
     Returns {"scheduled": bool, "session_ref": invite_token|None, "invite_url": str,
              "access_key": str, "link_id": int|None, "job_id": str, "error": str|None}.
@@ -160,17 +169,22 @@ def schedule_l1_interview(
         "model": os.getenv("CRM_AI_L1_MODEL", "gpt-4o-mini"),
     }
     title = requirement.title if requirement is not None else (opportunity.title if opportunity else "CRM Screening")
-    notes = _pack_notes(f"Karnex CRM AI L1 interview — {title}", cfg)
-    candidate_name = f"{candidate.first_name} {candidate.last_name or ''}".strip()
-    scheduled_at_local = datetime.now().strftime("%Y-%m-%d %H:%M")
+    headline = f"Karnex CRM AI L1 interview — {title}"
+    if (extra_notes or "").strip():
+        headline = f"{headline}\n{extra_notes.strip()}"
+    notes = _pack_notes(headline, cfg)
+    candidate_name = (candidate_name_override or "").strip() or \
+        f"{candidate.first_name} {candidate.last_name or ''}".strip()
+    candidate_email = ((candidate_email_override or "").strip() or (candidate.email or "")).lower()
+    when = (scheduled_at_local or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
 
     try:
         schedule = create_interview_schedule(
             _legacy_db_target(),
             hr_username="karnex-crm",
             candidate_name=candidate_name,
-            candidate_email=(candidate.email or "").lower(),
-            scheduled_at_local=scheduled_at_local,
+            candidate_email=candidate_email,
+            scheduled_at_local=when,
             provider="karnex-link",
             meeting_link="",
             notes=notes,
@@ -259,6 +273,22 @@ def sync_completed_interview(record: dict) -> bool:
             threshold = Decimal(get_app_setting(db, "ai_interview_pass_threshold", "60") or "60")
             passed = pct is not None and pct >= threshold
 
+            # Idempotency: the HR record is re-persisted many times (submit,
+            # report generation, later edits) and each persist triggers this
+            # sync. If THIS record was already synced with the SAME score and
+            # result, do nothing — otherwise every re-persist appended another
+            # "AI INTERVIEW COMPLETED" activity entry and re-notified TA.
+            record_id = str(record.get("id") or "")
+            already_synced = (
+                link.completed_at is not None
+                and record_id
+                and str(link.interview_record_id or "") == record_id
+                and link.overall_score_percent == pct
+                and link.result == ("Passed" if passed else "Failed")
+            )
+            if already_synced:
+                return True
+
             link.interview_record_id = str(record.get("id") or "") or link.interview_record_id
             link.overall_score_percent = pct
             link.result = "Passed" if passed else "Failed"
@@ -313,6 +343,31 @@ def sync_completed_interview(record: dict) -> bool:
                 f"Score {pct if pct is not None else 'n/a'}% — {'Passed' if passed else 'Failed'}",
                 f"/admin?view=crm&p=profiles/{link.profile_id}",
             )
+
+            # PASSED L1 → hand off to RMG: auto-advance the profile to RMG_Review
+            # (from Technical_Screening) and notify RMG to review the report and
+            # decide — request an L2 round or submit to the Sales team.
+            if passed and link.profile_id:
+                profile = db.get(CandidateProfile, link.profile_id)
+                cur = getattr(profile.pipeline_status, "value", profile.pipeline_status) if profile else None
+                if profile is not None and cur == PipelineStatus.TECHNICAL_SCREENING.value:
+                    profile.pipeline_status = PipelineStatus.RMG_REVIEW
+                    log_activity(
+                        db, CandidateProfileActivityLog, "profile_id", profile.id,
+                        # No scheduling user -> system user, NOT the candidate id.
+                        link.scheduled_by or None,
+                        "STATUS_CHANGE",
+                        f"Technical_Screening -> RMG_Review: AI L1 passed at {pct}% "
+                        f"(threshold {threshold}%) — auto-forwarded for RMG review",
+                    )
+                if profile is not None and getattr(profile.pipeline_status, "value", profile.pipeline_status) == PipelineStatus.RMG_REVIEW.value:
+                    notify_role(
+                        db, "RMG",
+                        f"AI L1 passed — review {cname}",
+                        f"Score {pct}%. Review the interview report and decide: "
+                        f"request an L2 round or submit to the Sales team.",
+                        f"/admin?view=crm&p=profiles/{link.profile_id}",
+                    )
             db.commit()
             return True
         finally:
@@ -320,6 +375,110 @@ def sync_completed_interview(record: dict) -> bool:
     except Exception as exc:  # pragma: no cover — must never break the interview flow
         logger.error("CRM interview sync failed: %s", exc)
         return False
+
+
+def sync_hr_decision(*, decision: str | None, decided_by: str | None = None,
+                     invite_token: str | None = None, interview_record_id: str | None = None,
+                     candidate_email: str | None = None) -> bool:
+    """Push a recruiter's Shortlist / On Hold / Reject decision into the CRM.
+
+    The report page stores this in the legacy auth DB. The CRM lives in a
+    different database and only ever knew the AI's score-threshold verdict, so a
+    candidate the recruiter had SELECTED still showed as "Failed · 57.2%" on the
+    Candidate Profile. This is the missing hop.
+
+    The AI verdict in `link.result` is deliberately left alone — the override is
+    recorded alongside it, so the profile can show "Selected (HR override)" while
+    still reporting what the AI actually scored. Overwriting `result` would erase
+    the evidence the recruiter overrode.
+
+    Identified by invite_token, else interview_record_id, else the newest
+    completed interview for that candidate's email. Never raises: a CRM outage
+    must not break the report page.
+    """
+    from models.ai_links import hr_decision_label, normalize_hr_decision
+
+    try:
+        normalized = normalize_hr_decision(decision)
+        if decision and normalized is None:
+            logger.warning("Ignoring unrecognised HR decision %r", decision)
+            return False
+
+        try:
+            session_factory = get_session_factory()
+        except CrmNotConfiguredError:
+            return False
+
+        db: Session = session_factory()
+        try:
+            link = _find_link(db, invite_token, interview_record_id, candidate_email)
+            if link is None:
+                return False
+
+            previous = link.hr_decision
+            if previous == normalized:
+                return True  # idempotent: repeated clicks must not spam the log
+
+            link.hr_decision = normalized
+            link.hr_decision_by = (decided_by or "").strip()[:255] or None
+            link.hr_decision_at = datetime.now(timezone.utc) if normalized else None
+
+            if link.profile_id:
+                label = hr_decision_label(normalized)
+                who = f" by {link.hr_decision_by}" if link.hr_decision_by else ""
+                message = (
+                    f"AI interview decision cleared{who} "
+                    f"(AI verdict stands: {link.result}"
+                    f"{f' at {link.overall_score_percent}%' if link.overall_score_percent is not None else ''})"
+                    if normalized is None else
+                    f"Interview marked {label}{who} — AI verdict was {link.result}"
+                    f"{f' at {link.overall_score_percent}%' if link.overall_score_percent is not None else ''}"
+                )
+                log_activity(
+                    db, CandidateProfileActivityLog, "profile_id", link.profile_id,
+                    link.scheduled_by or None, "AI_INTERVIEW_DECISION", message,
+                )
+            db.commit()
+            return True
+        finally:
+            db.close()
+    except Exception as exc:  # pragma: no cover — must never break the report page
+        logger.error("CRM HR-decision sync failed: %s", exc)
+        return False
+
+
+def _find_link(db: Session, invite_token: str | None, interview_record_id: str | None,
+               candidate_email: str | None) -> AiInterviewLink | None:
+    """Locate the CRM link row for an interview, most specific key first."""
+    if invite_token:
+        link = db.execute(
+            select(AiInterviewLink).where(AiInterviewLink.invite_token == str(invite_token).strip())
+        ).scalar_one_or_none()
+        if link is not None:
+            return link
+
+    if interview_record_id:
+        link = db.execute(
+            select(AiInterviewLink)
+            .where(AiInterviewLink.interview_record_id == str(interview_record_id).strip())
+        ).scalar_one_or_none()
+        if link is not None:
+            return link
+
+    # Last resort: the candidate-level decision on the report page carries only an
+    # email. Apply it to that candidate's most recent COMPLETED interview, which is
+    # the one whose report the recruiter was looking at.
+    email = (candidate_email or "").strip().lower()
+    if email:
+        return db.execute(
+            select(AiInterviewLink)
+            .join(Candidate, Candidate.id == AiInterviewLink.candidate_id)
+            .where(sa.func.lower(Candidate.email) == email,
+                   AiInterviewLink.completed_at.isnot(None))
+            .order_by(AiInterviewLink.completed_at.desc(), AiInterviewLink.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    return None
 
 
 def link_schedule_to_crm(invite_token: str, schedule_id: str, candidate_id: int,

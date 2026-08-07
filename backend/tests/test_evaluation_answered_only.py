@@ -41,7 +41,7 @@ def test_slice_qa_after_align_excludes_empty_slots():
 def test_merge_per_question_mean_uses_answered_only(monkeypatch):
     """Mean score ignores trailing empty pool slots."""
 
-    def _fake_batch(questions, answers, model="gpt-4o-mini", *, meta=None):
+    def _fake_batch(questions, answers, model="gpt-4o-mini", *, meta=None, **_kw):
         rows = []
         for i in range(len(questions)):
             rows.append(

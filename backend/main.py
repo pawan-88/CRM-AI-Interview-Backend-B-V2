@@ -22,13 +22,13 @@ import shutil
 import socket
 import subprocess
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from functools import lru_cache
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAIError
@@ -168,6 +168,11 @@ from utils.speech_validation import (
     skip_allowed_by_speech_evidence,
     skip_should_convert_to_answer,
 )
+from utils.template_settings import (
+    communication_required,
+    should_shuffle_manual_questions,
+    stamp_template_settings,
+)
 from utils.time_warnings import AUDIT_FIELD_BY_KEY, stamp_time_warning_settings
 from utils.strengths_weaknesses_analysis import attach_strengths_weaknesses_analysis
 from utils.warmup import (
@@ -182,6 +187,7 @@ from prompt_logger import (
 import response_cache
 import password_hashing as pwh
 import rate_limit as _rl
+from auth_secret import auth_secret as _shared_auth_secret
 from template_prompt import (
     build_default_template_prompt,
     build_template_prompt_context,
@@ -435,11 +441,11 @@ def _auth_db_target() -> str:
 
 
 def _auth_secret() -> str:
-    raw = (os.getenv("AUTH_SECRET") or os.getenv("REPORT_CODE") or "change-me-auth-secret").strip()
-    if len(raw.encode("utf-8")) >= 32:
-        return raw
-    # Stabilize key length to avoid runtime JWT warning in dev/prod.
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """Delegates to auth_secret.py — no local fallback (see that module).
+
+    A default here meant tokens could be forged by anyone reading the source.
+    """
+    return _shared_auth_secret()
 
 
 def _token_ttl_minutes() -> int:
@@ -792,6 +798,15 @@ def _auth_secret_is_default() -> bool:
 
 
 def _allow_public_hr_registration() -> bool:
+    """Whether an anonymous visitor may self-register with role=hr.
+
+    This must stay OFF in any deployment reachable from outside: the HR role
+    unlocks the candidate database, prompt logs and the question bank, so a
+    single POST would hand an attacker the whole system. It exists only for
+    first-run local setup, and is deliberately opt-in per environment.
+    """
+    if _is_production_env():
+        return False
     return str(os.getenv("ALLOW_PUBLIC_HR_REGISTRATION", "false")).strip().lower() in {
         "1",
         "true",
@@ -1125,6 +1140,10 @@ def _run_invite_prewarm(invite_token: str, schedule: dict, reason: str) -> None:
             question_count=int(result.get("question_count") or 0),
             session_key=str(result.get("session_key") or ""),
         )
+        # Questions exist now, and the candidate is still on the welcome/device
+        # -test screens. Synthesise the opening question in that dead time so it
+        # plays instantly when they reach the interview.
+        _prewarm_opening_audio(str(result.get("session_key") or "") or f"inv:{invite_token}")
         logger.info(
             "interview.invite.prewarm.ready",
             extra={
@@ -1252,6 +1271,10 @@ def _wait_for_invite_prewarm(invite_token: str, timeout_sec: float = 12.0) -> di
     if st != "running":
         return snap
     deadline = time.time() + max(0.5, float(timeout_sec or 0))
+    # Poll tightly. At the old 200 ms interval a session that became ready right
+    # after a tick still cost the candidate up to 200 ms of pure sleep on the
+    # login path — small, but it is the very first thing they wait for.
+    poll = 0.02
     while time.time() < deadline:
         if sessions.get(skey):
             return {"status": "ready", "session_key": skey, **_invite_prewarm_snapshot(invite_token)}
@@ -1261,14 +1284,46 @@ def _wait_for_invite_prewarm(invite_token: str, timeout_sec: float = 12.0) -> di
             if sessions.get(skey):
                 return {"status": "ready", "session_key": skey, **snap}
             return snap
-        time.sleep(0.2)
+        time.sleep(poll)
+        # Back off gradually: responsive when the answer is imminent, cheap when
+        # generation is genuinely going to take seconds.
+        poll = min(poll * 1.5, 0.25)
     return _invite_prewarm_snapshot(invite_token)
+
+
+def _prewarm_opening_audio(session_key: str | None = None) -> None:
+    """Synthesise the first thing the candidate will hear, before they need it.
+
+    The warmup line is a fixed string, so it can be made the moment the invite
+    is opened — long before the candidate clears the device test. When a session
+    already exists we warm its real first question too. Both go into the same
+    cache `/candidate/tts` reads, so the opening question plays with no OpenAI
+    call on the critical path.
+
+    Best-effort throughout: a miss just means the normal path runs.
+    """
+    try:
+        from services.tts_prewarm import prewarm_tts
+        from utils.warmup import WARMUP_QUESTION_TEXT, warmup_enabled
+
+        if warmup_enabled():
+            prewarm_tts(WARMUP_QUESTION_TEXT)
+
+        if session_key:
+            session = sessions.get(session_key) or {}
+            questions = session.get("questions") or []
+            if questions:
+                prewarm_tts(str(questions[0] or ""))
+    except Exception:
+        pass
 
 
 def _maybe_prewarm_invite_session(invite_token: str, record: dict, reason: str = "lookup") -> None:
     if not invite_token or not record:
         return
     skey = f"inv:{invite_token}"
+    # The opening line is known regardless of question generation — start it now.
+    _prewarm_opening_audio(skey if sessions.get(skey) else None)
     if sessions.get(skey):
         _set_invite_prewarm_state(invite_token, status="ready", reason=reason, reused=True, latency_ms=0)
         return
@@ -1440,14 +1495,18 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
                 )
             }
         questions = list(manual_list_inv)
-        questions = _shuffle_manual_questions_for_session(
-            questions,
-            interview_id,
-            str(invite_token or ""),
-            cemail.lower(),
-            str((job or {}).get("jobId") or ""),
-            str(schedule.get("scheduled_at_local") or ""),
-        )
+        # Shuffling used to be unconditional. RMG can now ask for the saved
+        # order instead, which matters when the questions build on each other —
+        # asking question 4 before question 1 makes the flow nonsense.
+        if should_shuffle_manual_questions(weights):
+            questions = _shuffle_manual_questions_for_session(
+                questions,
+                interview_id,
+                str(invite_token or ""),
+                cemail.lower(),
+                str((job or {}).get("jobId") or ""),
+                str(schedule.get("scheduled_at_local") or ""),
+            )
         job_timing = str((job or {}).get("timingMode") or (job or {}).get("timing_mode") or timing_mode or "count").strip().lower()
         if job_timing == "count":
             ask_n = clamp_count_mode_questions(
@@ -1626,6 +1685,7 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         }
         stamp_time_warning_settings(sessions[skey]["meta"], weights)
         stamp_auto_advance_settings(sessions[skey]["meta"], weights)
+        stamp_template_settings(sessions[skey]["meta"], weights)
         stamp_introduction_question_types(sessions[skey]["meta"], warmup_indices)
         record_generated_questions_batch(
             sessions[skey],
@@ -1656,6 +1716,41 @@ def _require_user(request: Request, allowed_roles: set[str] | None = None):
     if allowed_roles and role not in allowed_roles:
         return None, JSONResponse({"error": "Forbidden for this role."}, status_code=403)
     return payload, None
+
+
+def _actor_label(request: Request) -> str | None:
+    """Best-effort "who did this" for audit trails, from the bearer token."""
+    try:
+        payload = _decode_token_from_header(request) or {}
+    except Exception:
+        return None
+    for key in ("email", "username", "name", "sub"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value[:255]
+    return None
+
+
+def _push_decision_to_crm(*, decision, actor, interview_record_id=None,
+                          invite_token=None, candidate_email=None) -> None:
+    """Mirror a recruiter's interview decision into the CRM. Never raises.
+
+    The report page and the CRM sit in two different databases. Without this the
+    CRM only ever knows the AI's score-threshold verdict, which is why an
+    interview marked Selected could still show "Failed · 57.2%" on the profile.
+    Best-effort by design: the report page must keep working if the CRM is down.
+    """
+    try:
+        from services.ai_interview_bridge import sync_hr_decision
+        sync_hr_decision(
+            decision=decision,
+            decided_by=_actor_label(actor) if actor is not None else None,
+            invite_token=invite_token,
+            interview_record_id=interview_record_id,
+            candidate_email=candidate_email,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning("CRM decision mirror failed: %s", exc)
 
 
 def _enforce_crm_roles(request: Request, *allowed: str) -> None:
@@ -1830,17 +1925,33 @@ def _evaluate_and_store_report(session: dict) -> tuple[dict, dict, dict]:
         )
         result["evaluation_mode"] = "fallback_exception"
 
-    comm_result = evaluate_communication_skills(
-        q_eval, a_eval, model=model
-    )
-    result["communication_evaluation"] = comm_result
+    # RMG can declare that a role does not genuinely require spoken
+    # communication (template setting "Assess communication"). When it is off
+    # the report covers technical performance only — so the separate
+    # communication evaluation is skipped entirely rather than computed and
+    # hidden. Computing it anyway would leave a score in the stored record that
+    # some other view could surface later.
+    assess_communication = bool(meta.get("communication_required", True))
+    result["communication_required"] = assess_communication
+    if assess_communication:
+        result["communication_evaluation"] = evaluate_communication_skills(
+            q_eval, a_eval, model=model
+        )
+    else:
+        result["communication_evaluation"] = {}
 
+    # The warmup was already removed by filter_out_warmups above, so q_answered/
+    # a_answered contain ONLY technical turns. Passing `meta` (whose
+    # warmup_indices/question_types still point at pre-filter position 0) would
+    # make the scorer treat the FIRST technical question as the intro and drop it
+    # from scoring. Pass None so every technical answer is scored.
     result = merge_per_question_eval_into_report(
         result,
         q_answered,
         a_answered,
         model=model,
-        session_meta=meta,
+        session_meta=None,
+        assess_communication=assess_communication,
     )
     result["evaluation_scope"] = scope_meta
     result = apply_decimal_scores_to_report(result)
@@ -2685,13 +2796,15 @@ async def setup(
                 )
             }
         questions = list(manual_list_setup)
-        questions = _shuffle_manual_questions_for_session(
-            questions,
-            interview_id,
-            job_id_setup,
-            str(candidate_email or "").strip().lower(),
-            str(candidate_name or "").strip().lower(),
-        )
+        # See the invite path above — sequential order is now a template choice.
+        if should_shuffle_manual_questions(weights_for_suite):
+            questions = _shuffle_manual_questions_for_session(
+                questions,
+                interview_id,
+                job_id_setup,
+                str(candidate_email or "").strip().lower(),
+                str(candidate_name or "").strip().lower(),
+            )
         setup_timing = str((job_cfg_row or {}).get("timingMode") or (job_cfg_row or {}).get("timing_mode") or timing_mode_val or "count").strip().lower()
         if setup_timing == "count":
             ask_n = clamp_count_mode_questions(num_q or (job_cfg_row or {}).get("numQ") or (job_cfg_row or {}).get("num_q") or 5)
@@ -2882,6 +2995,7 @@ async def setup(
     }
     stamp_time_warning_settings(sessions[setup_session_key]["meta"], weights_for_suite)
     stamp_auto_advance_settings(sessions[setup_session_key]["meta"], weights_for_suite)
+    stamp_template_settings(sessions[setup_session_key]["meta"], weights_for_suite)
     stamp_introduction_question_types(sessions[setup_session_key]["meta"], warmup_indices)
     record_generated_questions_batch(
         sessions[setup_session_key],
@@ -3120,17 +3234,121 @@ async def candidate_tts(
         return {"error": "Text is required."}
     if len(payload) > 3800:
         payload = payload[:3797].rsplit(" ", 1)[0] + "…"
+    from services.tts_prewarm import get_cached, tts_voice_and_model
+
+    tts_voice, tts_model = tts_voice_and_model()
+
+    # Serve a prefetched clip instantly when this question was warmed while the
+    # candidate was answering the previous one. This is the difference between
+    # "submit, wait, hear the next question" and "submit, hear the next question".
+    cached = get_cached(payload, tts_voice, tts_model)
+    if cached is not None:
+        return Response(content=cached, media_type="audio/mpeg",
+                        headers={"X-Karnex-TTS": "cache"})
+
+    # Stream rather than buffer. `.read()` waited for the whole MP3 before a
+    # single byte reached the browser, which put a 2-3s silence in front of
+    # every question. Chunks let playback start while synthesis continues.
     try:
-        tts_model = (os.getenv("OPENAI_TTS_MODEL") or "gpt-4o-mini-tts").strip()
-        tts_voice = (os.getenv("OPENAI_TTS_VOICE") or "nova").strip()
-        audio = await run_in_threadpool(synthesize_speech_bytes, payload, tts_voice, tts_model)
-        if not audio:
-            return {"error": "Voice synthesis failed."}
-        return Response(content=audio, media_type="audio/mpeg")
+        stream = await run_in_threadpool(_open_tts_stream, payload, tts_voice, tts_model)
     except OpenAIError:
         return {"error": "Voice service unavailable."}
     except Exception:
         return {"error": "Voice synthesis failed."}
+    if stream is None:
+        return {"error": "Voice synthesis failed."}
+
+    async def _relay():
+        try:
+            for chunk in stream:
+                yield chunk
+        except Exception:
+            # The audio is already partly delivered; a mid-stream failure has to
+            # end the response rather than turn into a JSON error the <audio>
+            # element cannot understand.
+            logging.getLogger(__name__).warning("TTS stream aborted mid-flight")
+            return
+
+    return StreamingResponse(
+        _relay(),
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-store", "X-Karnex-TTS": "stream"},
+    )
+
+
+def _open_tts_stream(payload: str, voice: str, model: str):
+    """Start the OpenAI TTS stream on a worker thread and hand back the iterator."""
+    from ai import stream_speech_bytes
+
+    iterator = stream_speech_bytes(payload, voice, model)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return None
+
+    def _chain():
+        yield first
+        yield from iterator
+
+    return _chain()
+
+
+@app.post("/candidate/tts/prewarm")
+@_rl.limit("40/minute")
+async def candidate_tts_prewarm(request: Request, text: str = Form("")):
+    """Synthesise a question's audio ahead of time and hold it in memory.
+
+    The server already warms the next question automatically when it serves the
+    current one (candidate/service.py). This endpoint exists so the client can
+    warm a question the server could not predict — chiefly an adaptive follow-up,
+    whose text is only decided once the previous answer has been read.
+
+    Returns immediately; synthesis happens on a worker thread. Failures are
+    silent by design: a missed prefetch just means the normal streaming path
+    runs and the candidate waits the usual amount.
+    """
+    _, auth_err = _require_user(request, {"hr", "candidate"})
+    if auth_err:
+        return auth_err
+    from services.tts_prewarm import get_cached, normalize_tts_text, prewarm_tts, tts_voice_and_model
+
+    payload = normalize_tts_text(text)
+    if not payload:
+        return {"status": "skipped"}
+    voice, model = tts_voice_and_model()
+    if get_cached(payload, voice, model) is not None:
+        return {"status": "cached"}
+    return {"status": "warming" if prewarm_tts(payload) else "busy"}
+
+
+def _replace_question_slot(session: dict, index: int, new_question: str) -> None:
+    """Swap a pending question for an adaptive follow-up, keeping TTS honest.
+
+    The question at `index` may already have been synthesised and cached by the
+    prefetcher. Serving that cached audio afterwards would speak a question that
+    is no longer in the script — the candidate would hear one question and see
+    another. So the old audio is dropped and the replacement warmed instead.
+    """
+    try:
+        questions = session.get("questions") or []
+        if not (0 <= index < len(questions)):
+            return
+        old_question = str(questions[index] or "")
+        questions[index] = new_question
+
+        from services.tts_prewarm import invalidate, prewarm_tts
+
+        if old_question and old_question != new_question:
+            invalidate(old_question)
+        # Warm the replacement now — it is about to be asked.
+        prewarm_tts(new_question)
+    except Exception:
+        # Never let cache bookkeeping break the interview: at worst the
+        # candidate waits the normal synthesis time.
+        try:
+            session["questions"][index] = new_question
+        except Exception:
+            pass
 
 
 def _schedule_turn_evaluation(session: dict, previous_question: str, answer_text: str) -> None:
@@ -3166,6 +3384,7 @@ def _apply_turn_evaluation(session: dict, previous_question: str, answer_text: s
                 focus,
                 cur,
                 model=meta.get("model", "gpt-4o-mini"),
+                assess_communication=bool(meta.get("communication_required", True)),
             )
         except Exception:
             return
@@ -3538,7 +3757,7 @@ def answer(
                     previous_question,
                 )
             if follow_q and not question_too_similar(follow_q, prior_qs):
-                s["questions"][idx_next] = follow_q
+                _replace_question_slot(s, idx_next, follow_q)
                 meta["followups_added"] = int(meta.get("followups_added", 0)) + 1
                 meta["pending_tts_invalidate"] = True
 
@@ -3587,7 +3806,7 @@ def answer(
                 )
             if follow_q and not question_too_similar(follow_q, prior_qs):
                 if s["current"] < len(s["questions"]):
-                    s["questions"][s["current"]] = follow_q
+                    _replace_question_slot(s, s["current"], follow_q)
                 meta["followups_added"] = meta.get("followups_added", 0) + 1
                 meta["pending_tts_invalidate"] = True
 
@@ -4411,6 +4630,16 @@ def hr_patch_interview_status(request: Request, interview_id: str, payload: dict
         _sync_hr_decision_if_newest_interview(AUTH_DB_TARGET, interview_id, updated)
     except Exception as exc:
         logging.getLogger(__name__).warning("sync hr_decision from interview failed: %s", exc)
+    # Carry the decision into the CRM as well. Without this the CRM Candidate
+    # Profile keeps showing the AI's score-threshold verdict, so a candidate the
+    # recruiter just marked Selected still reads "Failed".
+    _push_decision_to_crm(
+        decision=updated.get("hr_interview_status"),
+        actor=request,
+        interview_record_id=interview_id,
+        invite_token=updated.get("invite_token"),
+        candidate_email=updated.get("candidate_email") or updated.get("email"),
+    )
     invalidate_hr_dashboard_cache()
     st = str(updated.get("hr_interview_status") or "")
     return {"status": "ok", "interview_id": str(interview_id), "interview_status": st}
@@ -4635,6 +4864,10 @@ def _interview_summary_payload(record: dict) -> dict:
     """Compact payload used for the timeline/Evaluations tab on the admin page."""
     report = record.get("report") if isinstance(record.get("report"), dict) else {}
     comm = report.get("communication_evaluation") if isinstance(report.get("communication_evaluation"), dict) else {}
+    # Templates can declare that a role is not assessed on communication. Older
+    # reports predate the flag, so absence means "was assessed" — the historic
+    # behaviour — rather than defaulting the other way and blanking their scores.
+    _assessed_communication = bool(report.get("communication_required", True))
     questions = record.get("questions") if isinstance(record.get("questions"), list) else []
     answers = record.get("answers") if isinstance(record.get("answers"), list) else []
     rid = str(record.get("id") or "")
@@ -4668,9 +4901,20 @@ def _interview_summary_payload(record: dict) -> dict:
         "has_report": bool(report),
         "recommendation": _hr_recommendation_from_report(report),
         "summary": str(report.get("overall_summary") or report.get("summary") or report.get("feedback") or "").strip(),
-        "communication_score": int(_normalize_interview_score({"overall_score": comm.get("communication_score") or comm.get("overall_score")})),
+        # Communication and confidence are both derived from the communication
+        # evaluation, so both are None when the template turned it off. None
+        # rather than 0 — a role that was never assessed on communication must
+        # not read as having scored zero for it.
+        "communication_required": _assessed_communication,
+        "communication_score": (
+            int(_normalize_interview_score({"overall_score": comm.get("communication_score") or comm.get("overall_score")}))
+            if _assessed_communication else None
+        ),
         "technical_score": int(_normalize_interview_score({"overall_score": report.get("technical_score") or report.get("overall_score")})),
-        "confidence_score": int(_normalize_interview_score({"overall_score": comm.get("presentation_score") or comm.get("confidence_score")})),
+        "confidence_score": (
+            int(_normalize_interview_score({"overall_score": comm.get("presentation_score") or comm.get("confidence_score")}))
+            if _assessed_communication else None
+        ),
         "strengths": [str(x) for x in (report.get("strengths") or [])][:8],
         "weaknesses": [str(x) for x in (report.get("gaps") or report.get("weaknesses") or report.get("improvements") or [])][:8],
         "skill_breakdown": _interview_skill_breakdown(record),
@@ -5101,6 +5345,17 @@ def hr_put_candidate_hr_decision(request: Request, candidate_id: str, payload: d
         _sync_latest_interview_from_hr_decision(AUTH_DB_TARGET, cid, normalized)
     except Exception as exc:
         logging.getLogger(__name__).warning("sync interview hr status from hr_decision failed: %s", exc)
+    # And into the CRM, so Candidate Profiles > AI Interview reflects it at once.
+    # `cid` is the lower-cased email for dashboard-keyed candidates, which is
+    # what the CRM link lookup falls back to.
+    newest = records[0] if records else {}
+    _push_decision_to_crm(
+        decision=normalized,
+        actor=request,
+        interview_record_id=newest.get("id"),
+        invite_token=newest.get("invite_token"),
+        candidate_email=cid,
+    )
     invalidate_hr_dashboard_cache()
     return {"status": "ok", "candidate_id": cid, "hr_decision": normalized}
 
@@ -5531,7 +5786,10 @@ async def template_sample_questions(
     )
     template_custom, validation_skills = _template_generation_options(
         edited=edited_prompt,
-        generated=generated_prompt,
+        # `generated_prompt` did not exist — this raised NameError whenever the
+        # branch ran. The parallel call site below passes `fresh_generated`,
+        # which is the freshly built default prompt this compares against.
+        generated=fresh_generated,
         effective=template_prompt,
         form_skills=skills,
     )

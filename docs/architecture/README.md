@@ -14,7 +14,7 @@ in the Cursor/VS Code Markdown preview.
 KARNEX is a single **FastAPI** backend (`backend/`) that fuses two systems sharing one
 **PostgreSQL** database: a **legacy AI-Interview platform** (raw-SQL, endpoints defined
 directly in `main.py`, secured by a `role`-claim JWT) and a modern **Karnex CRM**
-(SQLAlchemy 2.0 + Alembic, 19 routers under `/api/*`, secured by a 7-role DB-backed
+(SQLAlchemy 2.0 + Alembic, 20 routers under `/api/*`, secured by a 7-role DB-backed
 RBAC model). The backend also serves two frontends (`AI-Interview-Model-F-V2/frontend`):
 a vanilla-JS **candidate/HR interview UI** and a **React admin dashboard** (which embeds
 the CRM). External integrations are **OpenAI** (TTS, Whisper transcription, question
@@ -67,5 +67,4 @@ browser (offline/locked-down env), the Markdown diagrams still render everywhere
 - Role names match `models/rbac.py::RoleName` exactly.
 - Endpoint paths and table/column names match the code exactly so diagrams are greppable.
 
-_Last synced: 2026-07-25 — Platform top bar (`PlatformTopBar`: sticky tabs + More overflow,
-⌘K command palette, account menu); CRM_NAV extracted to `crm/nav.ts`._
+_Last synced: 2026-07-31 — CRM notifications dropdown portaled outside glass header (fixes white compositing patch)._

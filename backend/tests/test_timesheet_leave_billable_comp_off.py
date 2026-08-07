@@ -260,8 +260,8 @@ def test_weekend_half_day_comp_off_when_not_billable():
     assert comp_off_billed(entries, policy) == ZERO
 
 
-def test_week_off_billable_flag_does_not_bill_worked_weekend():
-    """Worked weekend billing is gated by comp_off_billable, not week_off_billable."""
+def test_week_off_billable_flag_bills_worked_weekend():
+    """ISSUE-1: week_off_billable ON bills weekend work even when comp_off_billable OFF."""
     proj = _project()
     policy = _policy(week_off_billable=True, comp_off_billable=False)
     bh, bd = compute_billables(
@@ -272,7 +272,11 @@ def test_week_off_billable_flag_does_not_bill_worked_weekend():
         project=proj,
         policy=policy,
     )
-    assert (bh, bd) == (ZERO, ZERO)
+    assert bh == D("8") and bd == ONE
+    saturday = date(2026, 6, 6)
+    entries = [_entry(entry_date=saturday, hours=D("8"))]
+    assert comp_off_earned(entries, policy) == ZERO
+    assert comp_off_billed(entries, policy) == ONE
 
 
 def test_holiday_work_bills_when_comp_off_billable():
@@ -386,12 +390,12 @@ def test_weekday_present_never_earns_or_bills_comp_off():
 
 
 def test_weekend_work_no_comp_off_when_week_off_billable():
-    """Legacy name: week_off_billable alone no longer blocks credit — use comp_off_billable."""
+    """week_off_billable ON → billed; earned = 0 (bill XOR credit)."""
     saturday = date(2026, 6, 6)
-    # week_off_billable ON but Comp Off Billable OFF → still credits leave.
     policy = _policy(week_off_billable=True, comp_off_billable=False)
     entries = [_entry(entry_date=saturday, hours=D("8"))]
-    assert comp_off_earned(entries, policy) == ONE
+    assert comp_off_earned(entries, policy) == ZERO
+    assert comp_off_billed(entries, policy) == ONE
 
 
 def test_weekend_work_earns_comp_off_when_week_off_not_billable():
@@ -402,8 +406,8 @@ def test_weekend_work_earns_comp_off_when_week_off_not_billable():
 
 
 def test_holiday_work_no_comp_off_when_holidays_billable():
-    """Holiday hours > 0: credit gated by comp_off_billable (holidays_billable is idle-day)."""
-    policy = _policy(holidays_billable=True, comp_off_billable=True)
+    """Holiday hours > 0 + holidays_billable → billed; no credit (even if comp_off off)."""
+    policy = _policy(holidays_billable=True, comp_off_billable=False)
     entries = [_entry(
         entry_date=date(2026, 6, 15),
         hours=D("8"),
@@ -411,6 +415,7 @@ def test_holiday_work_no_comp_off_when_holidays_billable():
         day_type=DayType.HOLIDAY,
     )]
     assert comp_off_earned(entries, policy) == ZERO
+    assert comp_off_billed(entries, policy) == ONE
 
 
 def test_holiday_work_earns_comp_off_when_holidays_not_billable():

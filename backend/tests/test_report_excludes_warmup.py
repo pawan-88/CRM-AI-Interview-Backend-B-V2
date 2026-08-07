@@ -44,7 +44,12 @@ def test_build_report_record_strips_warmup():
     rec = build_report_record(_make_session(), {"summary": "fine"}, _ist_stub())
     assert rec["questions"] == ["Explain async/await.", "What is FastAPI?"]
     assert rec["answers"] == ["async/await ...", "FastAPI is ..."]
-    assert rec["report"] == {"summary": "fine"}
+    # The report body is carried through unchanged, plus the communication flag
+    # the record now stamps (so a reader can tell "scored 0 for communication"
+    # apart from "communication was never assessed"). Assert on what the caller
+    # supplied rather than exact equality, so the record can keep growing.
+    assert rec["report"]["summary"] == "fine"
+    assert rec["report"]["communication_required"] is True
 
 
 def test_legacy_session_without_warmup_unchanged():

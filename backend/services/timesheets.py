@@ -25,8 +25,12 @@ from models import (
     TimesheetEntry, TimesheetStatus,
 )
 from services.employees import (
-    ensure_loss_of_pay_type, is_comp_off_name, is_loss_of_pay_name,
+    ensure_loss_of_pay_type,
+    is_comp_off_name,
+    is_loss_of_pay_name,
+    resolve_leave_policy_type,
 )
+from services.tax_invoice import line_description
 
 ZERO = Decimal("0")
 HALF = Decimal("0.5")
@@ -56,27 +60,187 @@ class BillingPolicy:
 
 
 def _project_branch(db: Session, project: Project) -> CustomerBranch | None:
-    """Branch the project bills against: project.branch_id, else opportunity.branch_id."""
+    """Branch the project bills against: project.branch_id, else opportunity.branch_id.
+
+    Customer-guarded: a branch whose customer_id != project.customer_id is ignored
+    (returns None) so display/billing never show another customer's branch.
+    """
+    import logging
+    log = logging.getLogger("karnex.timesheets")
+
     branch_id = getattr(project, "branch_id", None)
+    source = "project" if branch_id is not None else None
     if branch_id is None and project.opportunity_id:
         opp = db.get(Opportunity, project.opportunity_id)
-        if opp is not None:
+        if opp is not None and opp.branch_id is not None:
             branch_id = opp.branch_id
+            source = "opportunity"
     if branch_id is None:
         return None
     branch = db.get(CustomerBranch, branch_id)
-    # Defensive: ignore a branch that somehow belongs to another customer.
+    # Defensive: ignore a branch that belongs to another customer (stray opp.branch_id).
+    if branch is None:
+        return None
+    if branch.customer_id != project.customer_id:
+        log.warning(
+            "project_branch_foreign_customer",
+            extra={
+                "project_id": project.id,
+                "project_customer_id": project.customer_id,
+                "branch_id": branch.id,
+                "branch_customer_id": branch.customer_id,
+                "source": source,
+            },
+        )
+        return None
+    return branch
+
+
+def opportunity_branch_foreign_to_project(db: Session, project: Project) -> bool:
+    """True when opportunity.branch_id points at a branch of a different customer."""
+    if not project.opportunity_id:
+        return False
+    opp = db.get(Opportunity, project.opportunity_id)
+    if opp is None or opp.branch_id is None:
+        return False
+    branch = db.get(CustomerBranch, opp.branch_id)
+    return branch is not None and branch.customer_id != project.customer_id
+
+
+def resolve_timesheet_display_branch(
+    db: Session,
+    project: Project | None,
+    *,
+    pe: ProjectEmployee | None = None,
+) -> CustomerBranch | None:
+    """Display/header branch — same resolvers as holidays/billing (customer-guarded)."""
+    if project is None:
+        return None
+    if pe is not None:
+        from services.project_employees import pe_effective_branch
+        return pe_effective_branch(db, pe)
+    return _project_branch(db, project)
+
+
+def _log_project_opportunity_branch_disagree(
+    db: Session,
+    project: Project,
+) -> None:
+    """Flag when opportunity.branch_id and project.branch_id point at different rows."""
+    import logging
+
+    log = logging.getLogger("karnex.timesheets")
+    proj_bid = getattr(project, "branch_id", None)
+    if proj_bid is None or not project.opportunity_id:
+        return
+    opp = db.get(Opportunity, project.opportunity_id)
+    if opp is None or opp.branch_id is None or opp.branch_id == proj_bid:
+        return
+    log.warning(
+        "project_opportunity_branch_disagree",
+        extra={
+            "project_id": project.id,
+            "project_branch_id": proj_bid,
+            "opportunity_id": project.opportunity_id,
+            "opportunity_branch_id": opp.branch_id,
+            "project_customer_id": project.customer_id,
+            "opportunity_customer_id": getattr(opp, "customer_id", None),
+        },
+    )
+
+
+def _same_customer_opportunity_branch(
+    db: Session,
+    project: Project,
+) -> CustomerBranch | None:
+    """Opportunity.branch_id only when it belongs to the project's customer."""
+    if not project.opportunity_id:
+        return None
+    opp = db.get(Opportunity, project.opportunity_id)
+    if opp is None or opp.branch_id is None:
+        return None
+    branch = db.get(CustomerBranch, opp.branch_id)
     if branch is None or branch.customer_id != project.customer_id:
         return None
     return branch
 
 
-def effective_billing_policy(db: Session, project: Project) -> BillingPolicy:
+def ensure_project_branch_id(
+    db: Session,
+    project: Project,
+    *,
+    pe: ProjectEmployee | None = None,
+) -> CustomerBranch | None:
+    """Resolve billing/display branch; lazily set project.branch_id when unset.
+
+    MUST NEVER overwrite a non-null ``project.branch_id``. Backfill preference when
+    unset: (1) same-customer ``opportunity.branch_id``, (2) PE/display resolver
+    (leave-policy hint / unique calendar / unique customer branch). Never backfill
+    from a foreign-customer opportunity branch. Callers that commit later persist.
+    """
+    import logging
+
+    log = logging.getLogger("karnex.timesheets")
+    _log_project_opportunity_branch_disagree(db, project)
+
+    existing_id = getattr(project, "branch_id", None)
+    if existing_id is not None:
+        # Never overwrite — return the linked same-customer row (or None if orphan).
+        existing = db.get(CustomerBranch, existing_id)
+        if existing is not None and existing.customer_id == project.customer_id:
+            return existing
+        log.warning(
+            "project_branch_id_orphan_or_foreign",
+            extra={
+                "project_id": project.id,
+                "project_branch_id": existing_id,
+                "project_customer_id": project.customer_id,
+                "branch_customer_id": getattr(existing, "customer_id", None),
+            },
+        )
+        # Fall through to resolve a replacement for callers, but do not write it
+        # over the non-null (possibly stale) FK — operator must clear explicitly.
+        return resolve_timesheet_display_branch(db, project, pe=pe)
+
+    # Backfill only when unset.
+    source = None
+    branch = _same_customer_opportunity_branch(db, project)
+    if branch is not None:
+        source = "opportunity"
+    else:
+        branch = resolve_timesheet_display_branch(db, project, pe=pe)
+        if branch is not None:
+            source = "pe_or_fallback"
+
+    if branch is not None:
+        project.branch_id = branch.id
+        log.info(
+            "project_branch_id_backfill",
+            extra={
+                "project_id": project.id,
+                "branch_id": branch.id,
+                "branch_name": branch.branch_name,
+                "source": source,
+            },
+        )
+    return branch
+
+
+def effective_billing_policy(
+    db: Session,
+    project: Project,
+    *,
+    pe: ProjectEmployee | None = None,
+    branch: CustomerBranch | None = None,
+) -> BillingPolicy:
     """Resolve the effective policy: project override → branch → customer → defaults.
 
-    Project hour thresholds and billable flags win when set (not None), so
-    timesheet day-classification honors Edit Project §1 overrides instead of
-    hardcoding 8/4.
+    Branch resolution MUST match timesheet header / holidays:
+    ``pe_effective_branch`` when PE-mapped, else ``_project_branch`` (customer-guarded).
+    Without this, a null ``project.branch_id`` + foreign opp.branch_id yields no branch
+    and falls back to customer/default — so Comp Off Billable ON on BMW Pune is ignored.
+
+    Project hour thresholds and billable flags win when set (not None).
     """
     row = db.execute(
         select(CustomerBillingPolicy).where(CustomerBillingPolicy.customer_id == project.customer_id)
@@ -91,7 +255,8 @@ def effective_billing_policy(db: Session, project: Project) -> BillingPolicy:
             min_hours_full_day=Decimal(row.min_hours_full_day),
             min_hours_half_day=Decimal(row.min_hours_half_day),
         )
-    branch = _project_branch(db, project)
+    if branch is None:
+        branch = resolve_timesheet_display_branch(db, project, pe=pe)
     if branch is not None:
         base = BillingPolicy(
             week_off_billable=base.week_off_billable if branch.weekoff_billable is None
@@ -315,7 +480,12 @@ def _days_from_hours(hours: Decimal, policy: BillingPolicy) -> Decimal:
     return ZERO
 
 
-def leave_billable_by_type_map(db: Session, project: Project) -> dict[str, bool]:
+def leave_billable_by_type_map(
+    db: Session,
+    project: Project,
+    *,
+    pe: ProjectEmployee | None = None,
+) -> dict[str, bool]:
     """Project-scoped leave-type → billable. Same map for every employee on the project.
 
     Derived from CustomerLeavePolicy rows resolved via the project (customer +
@@ -328,7 +498,7 @@ def leave_billable_by_type_map(db: Session, project: Project) -> dict[str, bool]
     from services.project_employees import resolve_customer_leave_policies
 
     out: dict[str, bool] = {}
-    for pol in resolve_customer_leave_policies(db, project):
+    for pol in resolve_customer_leave_policies(db, project, pe=pe):
         name = (pol.leave_type.name if pol.leave_type else None) or ""
         name = name.strip()
         if not name:
@@ -355,16 +525,18 @@ def compute_billables(*, is_working: bool, hours_worked: Decimal,
     billable (excess Loss-of-Pay days contribute 0). Explicit Loss of Pay leave
     type is always non-billable.
 
-    Weekend / holiday *worked* hours (hours > 0) are gated by
-    ``comp_off_billable`` (mutually exclusive with leave-credit accrual).
-    Pure holiday-off (0 hours) still uses ``holidays_billable``.
+    Weekend / holiday *worked* hours (hours > 0) precedence (bill XOR credit):
+      1. ``week_off_billable`` / ``holidays_billable`` → bill as normal worked time
+      2. else ``comp_off_billable`` → bill as comp-off
+      3. else → not billed (comp-off leave credited elsewhere)
+    Pure holiday-off (0 hours) still uses ``holidays_billable`` only.
     """
     hours = Decimal(hours_worked or 0)
 
     if attendance_status == AttendanceStatus.HOLIDAY:
-        # Worked on a holiday → Comp Off Billable decides bill vs credit.
+        # DECISION (ISSUE-1): holidays_billable > comp_off_billable > credit.
         if hours > ZERO:
-            if policy.comp_off_billable:
+            if policy.holidays_billable or policy.comp_off_billable:
                 bh = _capped_hours(hours, project)
                 return bh, _days_from_hours(hours, policy)
             return ZERO, ZERO
@@ -374,8 +546,8 @@ def compute_billables(*, is_working: bool, hours_worked: Decimal,
         return ZERO, ZERO
 
     if not is_working:
-        # Week Off worked hours → Comp Off Billable (not week_off_billable).
-        if hours > ZERO and policy.comp_off_billable:
+        # DECISION (ISSUE-1): week_off_billable > comp_off_billable > credit.
+        if hours > ZERO and (policy.week_off_billable or policy.comp_off_billable):
             bh = _capped_hours(hours, project)
             return bh, _days_from_hours(hours, policy)
         return ZERO, ZERO
@@ -460,6 +632,12 @@ def recompute_entry_live(
     return attendance, bh, bd
 
 
+def _pe_for_timesheet(db: Session, ts: Timesheet) -> ProjectEmployee | None:
+    if not ts.project_employee_id:
+        return None
+    return db.get(ProjectEmployee, ts.project_employee_id)
+
+
 def live_entries_from_policy(
     db: Session,
     ts: Timesheet,
@@ -472,15 +650,56 @@ def live_entries_from_policy(
     days are non-billable.
     """
     project = db.get(Project, ts.project_id)
-    policy = effective_billing_policy(db, project) if project else BillingPolicy()
-    leave_map = leave_billable_by_type_map(db, project) if project else {}
+    pe = _pe_for_timesheet(db, ts)
+    if project is not None:
+        # Align project.branch_id with PE/display resolver when legacy null.
+        ensure_project_branch_id(db, project, pe=pe)
+    policy = effective_billing_policy(db, project, pe=pe) if project else BillingPolicy()
+    leave_map = leave_billable_by_type_map(db, project, pe=pe) if project else {}
     classification = classify_timesheet_leave_paid_vs_lop(db, ts, entries)
+    # CURRENT holiday calendar for this period — so holiday additions/removals
+    # reflect on read without re-saving the sheet (matches how holiday_dates is
+    # served to the UI). A day whose holiday status changed is recomputed here
+    # so both display day_type AND billables stay correct.
+    current_holidays = (
+        set(holidays_for_project_period(db, project, ts.year, ts.month)) if project else set()
+    )
     live: list = []
     for e in entries:
         split = classification.splits_by_date.get(e.entry_date)
         paid = split.paid_days if split is not None else None
+
+        # Reconcile the stored calendar nature with the CURRENT holiday set,
+        # but never touch employee-applied Leave or Week-Off rows.
+        eff = e
+        eff_day_type = e.day_type
+        eff_is_working = bool(e.is_working)
+        if e.leave_type is None and e.day_type != DayType.WEEK_OFF:
+            now_holiday = e.entry_date in current_holidays
+            was_holiday = (
+                e.day_type == DayType.HOLIDAY or e.attendance_status == AttendanceStatus.HOLIDAY
+            )
+            if now_holiday and not was_holiday:
+                eff_day_type, eff_is_working = DayType.HOLIDAY, False
+                eff = SimpleNamespace(
+                    hours_worked=e.hours_worked, is_working=False,
+                    attendance_status=AttendanceStatus.HOLIDAY,
+                    leave_type=None, leave_period=None, day_type=DayType.HOLIDAY,
+                    entry_date=e.entry_date, location=e.location,
+                )
+            elif was_holiday and not now_holiday:
+                # No longer a holiday → treat as a normal working day; attendance
+                # is re-derived from hours by recompute_entry_live below.
+                eff_day_type, eff_is_working = DayType.WORKING, True
+                eff = SimpleNamespace(
+                    hours_worked=e.hours_worked, is_working=True,
+                    attendance_status=AttendanceStatus.PRESENT,
+                    leave_type=None, leave_period=None, day_type=DayType.WORKING,
+                    entry_date=e.entry_date, location=e.location,
+                )
+
         att, bh, bd = recompute_entry_live(
-            e, policy=policy, project=project, leave_billable_by_type=leave_map,
+            eff, policy=policy, project=project, leave_billable_by_type=leave_map,
             paid_leave_days=paid,
         )
         live.append(SimpleNamespace(
@@ -488,8 +707,8 @@ def live_entries_from_policy(
             timesheet_id=e.timesheet_id,
             entry_date=e.entry_date,
             day_of_week=e.day_of_week,
-            day_type=e.day_type,
-            is_working=e.is_working,
+            day_type=eff_day_type,
+            is_working=eff_is_working,
             hours_worked=e.hours_worked,
             attendance_status=att,
             leave_type=e.leave_type,
@@ -516,8 +735,11 @@ def persist_recomputed_entries(
     Applies paid-vs-LOP classification so excess leave days store as non-billable.
     """
     project = db.get(Project, ts.project_id)
-    policy = effective_billing_policy(db, project) if project else BillingPolicy()
-    leave_map = leave_billable_by_type_map(db, project) if project else {}
+    pe = _pe_for_timesheet(db, ts)
+    if project is not None:
+        ensure_project_branch_id(db, project, pe=pe)
+    policy = effective_billing_policy(db, project, pe=pe) if project else BillingPolicy()
+    leave_map = leave_billable_by_type_map(db, project, pe=pe) if project else {}
     classification = classify_timesheet_leave_paid_vs_lop(db, ts, entries)
     for e in entries:
         split = classification.splits_by_date.get(e.entry_date)
@@ -537,8 +759,8 @@ def timesheet_leave_balances_map(
     """Leave-type name → remaining balance for the Leave Balance column.
 
     PE-mapped timesheets use ``project_employee_leave_details`` (same pool
-    ``consume_timesheet_leaves`` debits on approval); otherwise employee yearly balances.
-    Paid-type balances are clamped at >= 0 for display; Comp-Off may stay negative.
+    ``consume_timesheet_leaves`` debits on submit/approve); otherwise employee
+    yearly balances. All balances (incl. Comp-Off) are clamped at >= 0 for display.
     """
     out: dict[str, float] = {}
     if ts.project_employee_id is not None:
@@ -549,10 +771,7 @@ def timesheet_leave_balances_map(
         ).all()
         for row, name in rows:
             if name:
-                bal = float(row.leave_balance or 0)
-                if not is_comp_off_name(name):
-                    bal = max(0.0, bal)
-                out[str(name)] = bal
+                out[str(name)] = max(0.0, float(row.leave_balance or 0))
         return out
     rows = db.execute(
         select(EmployeeLeaveBalance, LeavePolicyType.name)
@@ -564,10 +783,7 @@ def timesheet_leave_balances_map(
     ).all()
     for row, name in rows:
         if name:
-            bal = float(row.balance or 0)
-            if not is_comp_off_name(name):
-                bal = max(0.0, bal)
-            out[str(name)] = bal
+            out[str(name)] = max(0.0, float(row.balance or 0))
     return out
 
 
@@ -608,6 +824,30 @@ def _is_leave_attendance(status) -> bool:
     return val == AttendanceStatus.LEAVE or val == "Leave"
 
 
+def _is_working_day_type(day_type) -> bool:
+    val = getattr(day_type, "value", day_type)
+    return val == DayType.WORKING or val == "Working"
+
+
+def _attendance_reporting_lop(entries) -> tuple[Decimal, Decimal]:
+    """Reporting-only LOP from Absent (1.0) and Half_Day (0.5) on Working days.
+
+    Does not affect compute_billables / billed amounts — visibility only.
+    """
+    lop_absent = ZERO
+    lop_half = ZERO
+    for e in entries:
+        if not _is_working_day_type(getattr(e, "day_type", None)):
+            continue
+        status = getattr(e, "attendance_status", None)
+        status_val = getattr(status, "value", status)
+        if status_val in (AttendanceStatus.ABSENT, "Absent"):
+            lop_absent += ONE
+        elif status_val in (AttendanceStatus.HALF_DAY, "Half_Day"):
+            lop_half += HALF
+    return lop_absent, lop_half
+
+
 def _timesheet_prior_consumption(db: Session, ts: Timesheet) -> dict[int, Decimal]:
     """leave_type_id → days already consumed by ledger source timesheet:{id}."""
     prior: dict[int, Decimal] = {}
@@ -621,29 +861,46 @@ def _timesheet_prior_consumption(db: Session, ts: Timesheet) -> dict[int, Decima
     return prior
 
 
+def _supports_row_lock(db: Session) -> bool:
+    """Postgres supports SELECT … FOR UPDATE; SQLite tests skip the lock."""
+    try:
+        name = db.get_bind().dialect.name
+        return isinstance(name, str) and name != "sqlite"
+    except Exception:
+        return False
+
+
 def _available_balances_before_timesheet(
-    db: Session, ts: Timesheet,
+    db: Session, ts: Timesheet, *, for_update: bool = False,
 ) -> dict[int, Decimal]:
-    """Balance by leave_type_id BEFORE this timesheet's own ledger consumption."""
+    """Balance by leave_type_id BEFORE this timesheet's own ledger consumption.
+
+    DECISION (ISSUE-5): when ``for_update`` (commit path), lock PE leave detail /
+    EmployeeLeaveBalance rows with ``FOR UPDATE`` on Postgres so concurrent
+    submit/approve of two sheets cannot over-consume the same balance.
+    """
     prior = _timesheet_prior_consumption(db, ts)
     balances: dict[int, Decimal] = {}
+    lock = for_update and _supports_row_lock(db)
     if ts.project_employee_id is not None:
-        rows = db.execute(
-            select(ProjectEmployeeLeaveDetail).where(
-                ProjectEmployeeLeaveDetail.project_employee_id == ts.project_employee_id
-            )
-        ).scalars().all()
+        stmt = select(ProjectEmployeeLeaveDetail).where(
+            ProjectEmployeeLeaveDetail.project_employee_id == ts.project_employee_id
+        )
+        if lock:
+            stmt = stmt.with_for_update()
+        rows = db.execute(stmt).scalars().all()
         for row in rows:
             balances[row.leave_type_id] = (
                 Decimal(row.leave_balance or 0) + prior.get(row.leave_type_id, ZERO)
             )
     else:
-        rows = db.execute(
-            select(EmployeeLeaveBalance).where(
-                EmployeeLeaveBalance.employee_id == ts.employee_id,
-                EmployeeLeaveBalance.year == ts.year,
-            )
-        ).scalars().all()
+        stmt = select(EmployeeLeaveBalance).where(
+            EmployeeLeaveBalance.employee_id == ts.employee_id,
+            EmployeeLeaveBalance.year == ts.year,
+        )
+        if lock:
+            stmt = stmt.with_for_update()
+        rows = db.execute(stmt).scalars().all()
         for row in rows:
             balances[row.leave_type_id] = (
                 Decimal(row.balance or 0) + prior.get(row.leave_type_id, ZERO)
@@ -658,15 +915,19 @@ def classify_timesheet_leave_paid_vs_lop(
     db: Session,
     ts: Timesheet,
     entries: list[TimesheetEntry] | list,
+    *,
+    for_update: bool = False,
 ) -> TimesheetLeaveClassification:
     """Split each leave day into paid vs Loss-of-Pay (date order, per type).
 
     AVAIL = max(paid_balance, 0) before this sheet's consumption (prior
     timesheet:{id} ledger rows are added back). PAID = min(REQ, AVAIL);
-    EXCESS → Loss of Pay. Comp-Off takes full REQ (may go negative). Explicit
-    Loss of Pay entries are all LOP.
+    EXCESS → Loss of Pay. Comp-Off uses the same cap (no overdraft); floor
+    running balance at 0. Explicit Loss of Pay entries are all LOP.
+
+    Pass ``for_update=True`` on commit paths (consume) to row-lock balances.
     """
-    running = _available_balances_before_timesheet(db, ts)
+    running = _available_balances_before_timesheet(db, ts, for_update=for_update)
     type_cache: dict[str, LeavePolicyType] = {}
     leave_rows: list[tuple] = []
     for e in entries:
@@ -678,9 +939,7 @@ def classify_timesheet_leave_paid_vs_lop(
         key = name.lower()
         lt = type_cache.get(key)
         if lt is None:
-            lt = db.execute(
-                select(LeavePolicyType).where(func.lower(LeavePolicyType.name) == key)
-            ).scalars().first()
+            lt = resolve_leave_policy_type(db, name)
             if lt is None:
                 raise HTTPException(
                     status_code=400,
@@ -709,11 +968,10 @@ def classify_timesheet_leave_paid_vs_lop(
         is_comp = is_comp_off_name(name)
         is_lop = is_loss_of_pay_name(name)
 
-        if is_comp:
-            paid, lop = req, ZERO
-            running[lt.id] = running.get(lt.id, ZERO) - req
-            paid_by_type[lt.id] = paid_by_type.get(lt.id, ZERO) + paid
-        elif is_lop:
+        # DECISION (ISSUE-3): Comp-Off is capped like other paid types —
+        # PAID = min(REQ, max(AVAIL, 0)); excess → LOP; never allow negative
+        # leave-application overdraft. Accrue reversal still uses allow_negative.
+        if is_lop:
             paid, lop = ZERO, req
             lop_total += req
         else:
@@ -961,19 +1219,35 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
     project = db.get(Project, ts.project_id)
     customer = db.get(Customer, project.customer_id) if project else None
     opp = db.get(Opportunity, project.opportunity_id) if project and project.opportunity_id else None
-    branch = db.get(CustomerBranch, opp.branch_id) if opp and opp.branch_id is not None else None
+    pe = (
+        db.get(ProjectEmployee, ts.project_employee_id)
+        if ts.project_employee_id
+        else None
+    )
+    # Header BRANCH must match billing/holidays (customer-guarded). Never use raw
+    # opportunity.branch_id — it can point at another customer's branch.
+    if project is not None:
+        branch = ensure_project_branch_id(db, project, pe=pe)
+    else:
+        branch = None
+    foreign_opp_branch = (
+        opportunity_branch_foreign_to_project(db, project) if project else False
+    )
     emp = db.get(Employee, ts.employee_id)
     start, end = period_bounds(ts.year, ts.month)
     # Header/display enrichment (all null-safe). Note: employees has no
     # employee_code column, so the employee's primary key doubles as the code.
     data["project_title"] = project_title_label(customer=customer, employee=emp,
-                                                pe=db.get(ProjectEmployee, ts.project_employee_id)
-                                                if ts.project_employee_id else None,
-                                                project=project)
+                                                pe=pe, project=project)
     data["customer_id"] = customer.id if customer else None
     data["customer_name"] = customer.name if customer else None
     data["branch_id"] = branch.id if branch else None
     data["branch_name"] = branch.branch_name if branch else None
+    # Only flag when opp points at a foreign-customer branch and we refuse to show it.
+    data["branch_unlinked"] = bool(branch is None and foreign_opp_branch)
+    data["branch_link_message"] = (
+        "Branch not linked to this customer" if data["branch_unlinked"] else None
+    )
     data["project_type"] = getattr(opp.opp_type, "value", opp.opp_type) if opp else None
     data["timesheet_period"] = period_range_label(ts.year, ts.month)
     data["period_start_date"] = start.isoformat()
@@ -1027,7 +1301,7 @@ def _billable_rollup(project: Project | None,
     for e in entries:
         billable_hours += Decimal(e.billable_hours or 0)
         billable_days += Decimal(e.billable_days or 0)
-        if e.attendance_status == AttendanceStatus.LEAVE:
+        if _is_leave_attendance(e.attendance_status):
             leave_billable_days += Decimal(e.billable_days or 0)
         if e.is_working:
             working_days += 1
@@ -1063,6 +1337,32 @@ def _is_comp_off_work_day(e) -> bool:
     return False
 
 
+def _is_holiday_work_day(e) -> bool:
+    """True when the entry is a holiday day (calendar / attendance / day_type)."""
+    att = e.attendance_status
+    att_val = getattr(att, "value", att)
+    day = getattr(e, "day_type", None)
+    day_val = getattr(day, "value", day)
+    return (
+        att_val in (AttendanceStatus.HOLIDAY, "Holiday")
+        or day_val in (DayType.HOLIDAY, "Holiday")
+    )
+
+
+def _work_day_is_billed(e, policy: BillingPolicy) -> bool:
+    """Weekend/holiday worked hours billed by direct flag OR comp_off_billable.
+
+    Precedence (ISSUE-1): week_off_billable / holidays_billable > comp_off_billable.
+    Either path bills → no leave credit (bill XOR credit).
+    """
+    hours = Decimal(e.hours_worked or 0)
+    if hours <= ZERO or not _is_comp_off_work_day(e):
+        return False
+    if _is_holiday_work_day(e):
+        return bool(policy.holidays_billable or policy.comp_off_billable)
+    return bool(policy.week_off_billable or policy.comp_off_billable)
+
+
 def _comp_off_day_fraction(hours: Decimal, policy: BillingPolicy) -> Decimal:
     if hours >= policy.min_hours_full_day:
         return ONE
@@ -1075,34 +1375,34 @@ def comp_off_earned(entries: list[TimesheetEntry], policy: BillingPolicy) -> Dec
     """Comp-off leave credit earned by working on week-offs or holidays.
 
     Mutually exclusive with billing (project policy, same for every employee):
-    - When ``comp_off_billable`` is ON → work is billed; no leave credit.
-    - When OFF → credit leave (full/half by hour thresholds); do not bill.
+    - Billed by ``week_off_billable`` / ``holidays_billable`` OR ``comp_off_billable``
+      → no leave credit.
+    - Otherwise → credit leave (full/half by hour thresholds); do not bill.
 
     Full credit (1.0) when hours >= the policy's full-day threshold, half (0.5)
     when >= the half-day threshold, else none.
     """
-    if policy.comp_off_billable:
-        return ZERO
     earned = ZERO
     for e in entries:
         hours = Decimal(e.hours_worked or 0)
         if hours <= ZERO or not _is_comp_off_work_day(e):
+            continue
+        # DECISION (ISSUE-1): any billing path → earned = 0 for that day.
+        if _work_day_is_billed(e, policy):
             continue
         earned += _comp_off_day_fraction(hours, policy)
     return earned
 
 
 def comp_off_billed(entries: list[TimesheetEntry], policy: BillingPolicy) -> Decimal:
-    """Day-fractions of weekend/holiday work billed when Comp Off Billable is ON.
+    """Day-fractions of weekend/holiday work billed (direct flag OR Comp Off Billable).
 
     Mutually exclusive with ``comp_off_earned`` — never both bill and credit.
     """
-    if not policy.comp_off_billable:
-        return ZERO
     billed = ZERO
     for e in entries:
         hours = Decimal(e.hours_worked or 0)
-        if hours <= ZERO or not _is_comp_off_work_day(e):
+        if hours <= ZERO or not _work_day_is_billed(e, policy):
             continue
         billed += _comp_off_day_fraction(hours, policy)
     return billed
@@ -1110,14 +1410,12 @@ def comp_off_billed(entries: list[TimesheetEntry], policy: BillingPolicy) -> Dec
 
 def comp_off_billed_hours(entries: list[TimesheetEntry], policy: BillingPolicy,
                           project: Project | None = None) -> Decimal:
-    """Capped hours of weekend/holiday work included in billables when Comp Off Billable."""
-    if not policy.comp_off_billable:
-        return ZERO
+    """Capped hours of weekend/holiday work included in billables when billed."""
     total = ZERO
     proj = project if project is not None else SimpleNamespace(max_billable_hours_day=None)
     for e in entries:
         hours = Decimal(e.hours_worked or 0)
-        if hours <= ZERO or not _is_comp_off_work_day(e):
+        if hours <= ZERO or not _work_day_is_billed(e, policy):
             continue
         total += _capped_hours(hours, proj)  # type: ignore[arg-type]
     return total
@@ -1126,15 +1424,18 @@ def comp_off_billed_hours(entries: list[TimesheetEntry], policy: BillingPolicy,
 def accrue_comp_off(db: Session, ts: Timesheet, entries: list[TimesheetEntry]) -> Decimal:
     """Idempotently credit earned comp-off into PE or employee leave balance.
 
-    Called on timesheet approval. Skips entirely when Comp Off Billable is ON
-    (work is invoiced instead). Applies only the DELTA versus what this
-    timesheet already granted (ts.comp_off_accrued), so re-approval after a
-    reject/resubmit cycle never double-credits. PE-mapped sheets credit
-    ``project_employee_leave_details``; otherwise employee yearly balances.
-    Caller commits.
+    Called on timesheet submit AND approve (DECISION ISSUE-2). Skips credit when
+    weekend/holiday work is billed (direct billable flag or Comp Off Billable).
+    Applies only the DELTA versus what this timesheet already granted
+    (ts.comp_off_accrued), so submit→approve never double-credits. PE-mapped
+    sheets credit ``project_employee_leave_details``; otherwise employee yearly
+    balances. Caller commits.
     """
     project = db.get(Project, ts.project_id)
-    policy = effective_billing_policy(db, project) if project else BillingPolicy()
+    pe = _pe_for_timesheet(db, ts)
+    if project is not None:
+        ensure_project_branch_id(db, project, pe=pe)
+    policy = effective_billing_policy(db, project, pe=pe) if project else BillingPolicy()
     earned = comp_off_earned(entries, policy)
     prior = Decimal(ts.comp_off_accrued or 0)
     delta = earned - prior
@@ -1158,7 +1459,7 @@ def accrue_comp_off(db: Session, ts: Timesheet, entries: list[TimesheetEntry]) -
         if delta > ZERO:
             pe_row = credit_pe_leave(db, ts.project_employee_id, leave_type.id, delta)
         else:
-            # Reverse prior credit (consume without insufficient-balance block).
+            # DECISION (ISSUE-3): reverse prior credit may go negative temporarily.
             from services.project_employees import consume_pe_leave
             pe_row = consume_pe_leave(
                 db, ts.project_employee_id, leave_type.id, -delta,
@@ -1195,7 +1496,7 @@ def accrue_comp_off(db: Session, ts: Timesheet, entries: list[TimesheetEntry]) -
         amount=delta,
         balance_after=balance_after,
         source=f"timesheet:{ts.id}",
-        note=f"Comp-off from approved timesheet {period_label(ts.year, ts.month)} "
+        note=f"Comp-off from timesheet {period_label(ts.year, ts.month)} "
              f"(earned {float(earned):g}, prior {float(prior):g})",
     ))
     return earned
@@ -1206,10 +1507,9 @@ def consume_timesheet_leaves(
 ) -> dict[int, Decimal]:
     """Idempotently consume leave for LEAVE days (submit + approve).
 
-    Paid portion of each leave type is consumed from PE/employee balances
-    (``allow_negative=False``, floor 0). Excess days plus explicit Loss of Pay
-    entries debit the seeded Loss of Pay type. Comp-Off takes the full request
-    (``allow_negative=True``).
+    Paid portion of each leave type (incl. Comp-Off) is consumed from PE/employee
+    balances (``allow_negative=False``, floor 0). Excess days plus explicit Loss
+    of Pay entries debit the seeded Loss of Pay type.
 
     Applies only the DELTA vs existing ``LeaveAccrualEvent`` Consumption rows
     with ``source == timesheet:{id}`` so reject → resubmit → re-approve never
@@ -1218,7 +1518,10 @@ def consume_timesheet_leaves(
     """
     from services.project_employees import consume_pe_leave
 
-    classification = classify_timesheet_leave_paid_vs_lop(db, ts, entries)
+    # DECISION (ISSUE-5): lock balance rows at commit (Postgres FOR UPDATE).
+    classification = classify_timesheet_leave_paid_vs_lop(
+        db, ts, entries, for_update=True,
+    )
     required: dict[int, Decimal] = dict(classification.paid_required_by_type_id)
     type_names: dict[int, str] = {}
     for split in classification.splits_by_date.values():
@@ -1245,11 +1548,11 @@ def consume_timesheet_leaves(
         if not leave_name:
             lt_row = db.get(LeavePolicyType, leave_type_id)
             leave_name = lt_row.name if lt_row else f"type#{leave_type_id}"
-        exempt = is_comp_off_name(leave_name) or is_loss_of_pay_name(leave_name)
+        # LOP tracking may go above available; Comp-Off / paid types floor at 0.
+        exempt = is_loss_of_pay_name(leave_name)
 
         if ts.project_employee_id is not None:
             if delta > ZERO:
-                # Paid types: never drive below 0; LOP/Comp-Off may.
                 pe_row = consume_pe_leave(
                     db, ts.project_employee_id, leave_type_id, delta,
                     allow_negative=exempt,
@@ -1331,6 +1634,23 @@ def release_timesheet_leaves(db: Session, ts: Timesheet) -> dict[int, Decimal]:
     return consume_timesheet_leaves(db, ts, [])
 
 
+def release_timesheet_comp_off(db: Session, ts: Timesheet) -> Decimal:
+    """Reverse comp-off accrual for this timesheet (reject / revert-to-draft).
+
+    Forces earned target to 0 via ``accrue_comp_off`` delta vs ``ts.comp_off_accrued``.
+    """
+    return accrue_comp_off(db, ts, [])
+
+
+def reverse_timesheet_ledger_effects(db: Session, ts: Timesheet) -> None:
+    """DECISION (ISSUE-2): on REJECT / DELETE / revert to draft, reverse ledger keyed on
+    ``source=timesheet:{id}`` — re-credit paid leave, remove LOP consumption, and
+    reverse any submit-time comp-off credit.
+    """
+    release_timesheet_leaves(db, ts)
+    release_timesheet_comp_off(db, ts)
+
+
 def validate_timesheet_leave_balances(
     db: Session,
     ts: Timesheet,
@@ -1351,9 +1671,7 @@ def validate_timesheet_leave_balances(
         key = name.lower()
         if key in type_cache:
             continue
-        lt = db.execute(
-            select(LeavePolicyType).where(func.lower(LeavePolicyType.name) == key)
-        ).scalars().first()
+        lt = resolve_leave_policy_type(db, name)
         if lt is None:
             raise HTTPException(
                 status_code=400,
@@ -1364,13 +1682,13 @@ def validate_timesheet_leave_balances(
 
 def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry]) -> dict:
     project, policy, _leave_map, live = live_entries_from_policy(db, ts, entries)
+    # Same classification the billable recompute uses (paid vs LOP per leave day).
     classification = classify_timesheet_leave_paid_vs_lop(db, ts, entries)
     rollup = _billable_rollup(project, live)  # type: ignore[arg-type]
     total_days = len(live)
     working_days = 0
     comp_off_days = 0
     hours_worked = ZERO
-    leave_days = ZERO
     holidays = 0
     present_days = 0
     absent_days = 0
@@ -1381,7 +1699,9 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
         status = e.attendance_status
         if e.is_working:
             working_days += 1
-        elif status not in (AttendanceStatus.LEAVE, AttendanceStatus.HOLIDAY):
+        elif not _is_leave_attendance(status) and status not in (
+            AttendanceStatus.HOLIDAY, "Holiday",
+        ):
             # Non-working row that isn't a leave/holiday = weekend / week-off.
             total_week_off += 1
         if (e.leave_type or "").strip().lower() == "comp-off":
@@ -1390,16 +1710,41 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
         hours_worked += hours
         if hours > ZERO:
             total_no_of_days_worked += 1
-        if status == AttendanceStatus.LEAVE:
-            leave_days += HALF if e.leave_period in (LeavePeriod.HALF_AM, LeavePeriod.HALF_PM) else ONE
-        elif status == AttendanceStatus.HOLIDAY:
+        if status in (AttendanceStatus.HOLIDAY, "Holiday"):
             holidays += 1
-        elif status == AttendanceStatus.PRESENT:
+        elif status in (AttendanceStatus.PRESENT, "Present"):
             present_days += 1
-        elif status == AttendanceStatus.ABSENT:
+        elif status in (AttendanceStatus.ABSENT, "Absent"):
             absent_days += 1
-        elif status == AttendanceStatus.HALF_DAY:
+        elif status in (AttendanceStatus.HALF_DAY, "Half_Day"):
             half_days += 1
+
+    # Leave / LOP MUST match classify_timesheet_leave_paid_vs_lop (same as billing
+    # recompute + grid). Count every Leave attendance (paid + LOP), not only the
+    # billable/paid subset. Prefer classification req_days when splits exist so
+    # half-days match the paid/LOP split; otherwise sum entry leave fractions.
+    leave_days = sum(
+        (_entry_leave_days(e) for e in entries if _is_leave_attendance(e.attendance_status)),
+        ZERO,
+    )
+    leave_req_from_clf = sum(
+        (s.req_days for s in classification.splits_by_date.values()),
+        ZERO,
+    )
+    if leave_req_from_clf > ZERO:
+        leave_days = leave_req_from_clf
+    # LOP reporting = leave excess + Absent working days + Half_Day unworked half.
+    # Billing math is unchanged; this is visibility only.
+    lop_from_leave = classification.lop_days_total
+    lop_from_absent, lop_from_half = _attendance_reporting_lop(live)
+    total_lop_days = lop_from_leave + lop_from_absent + lop_from_half
+    paid_leave_days = sum(
+        (s.paid_days for s in classification.splits_by_date.values()),
+        ZERO,
+    )
+    # Paid leave that actually bills (LOP excess already zeroed in live recompute).
+    leave_billable_days = Decimal(str(rollup["leave_billable_days"]))
+
     return {
         "total_days": total_days,
         "working_days": working_days,
@@ -1421,11 +1766,16 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
         "actual_billable_hours": float(rollup["actual_billable_hours"]),
         "actual_billable_days": float(rollup["actual_billable_days"]),
         "actual_billable_day": float(display_billable_day(rollup["actual_billable_hours"])),
-        # Leaves TAKEN (attendance LEAVE), not working_days − billable residual.
+        # Leave attendance only (paid + leave-LOP). Absent/Half_Day are NOT leave.
+        # Invariant when leave types are billable:
+        # total_leave_days == total_leave_billable_days + loss_of_pay_from_leave
         "total_leave_days": float(leave_days),
-        # Paid leave billable only (LOP excess excluded via live recompute).
-        "total_leave_billable_days": float(rollup["leave_billable_days"]),
-        "total_loss_of_pay_days": float(classification.lop_days_total),
+        "total_leave_billable_days": float(leave_billable_days),
+        "loss_of_pay_from_leave": float(lop_from_leave),
+        "loss_of_pay_from_absent": float(lop_from_absent),
+        "loss_of_pay_from_half_day": float(lop_from_half),
+        "total_loss_of_pay_days": float(total_lop_days),
+        "total_leave_paid_days": float(paid_leave_days),
         # Comp-off EARNED by weekend/holiday work (leave credit) when NOT billable.
         # Comp-off BILLED when Comp Off Billable ON (invoiced instead of credit).
         "comp_off_earned": float(comp_off_earned(live, policy)),  # type: ignore[arg-type]
@@ -1489,10 +1839,7 @@ def timesheet_report_out(db: Session, ts: Timesheet,
     hours_worked = sum((Decimal(e.hours_worked or 0) for e in live), ZERO)
     actual_billable_hours = rollup["actual_billable_hours"]
     actual_billable_day = display_billable_day(actual_billable_hours)
-    leave_days = ZERO
-    for e in live:
-        if e.attendance_status == AttendanceStatus.LEAVE:
-            leave_days += HALF if e.leave_period in (LeavePeriod.HALF_AM, LeavePeriod.HALF_PM) else ONE
+    summary = timesheet_summary(db, ts, entries)
 
     data.update({
         "project_title": project_title_label(customer=customer, employee=emp, pe=pe, project=project),
@@ -1508,10 +1855,11 @@ def timesheet_report_out(db: Session, ts: Timesheet,
         "total_hours_worked": float(hours_worked),
         "total_leave_billable_days": float(rollup["leave_billable_days"]),
         "actual_billable_day": float(actual_billable_day),
-        "total_leave_days": float(leave_days),
-        "total_loss_of_pay_days": float(
-            classify_timesheet_leave_paid_vs_lop(db, ts, entries).lop_days_total
-        ),
+        "total_leave_days": summary["total_leave_days"],
+        "loss_of_pay_from_leave": summary["loss_of_pay_from_leave"],
+        "loss_of_pay_from_absent": summary["loss_of_pay_from_absent"],
+        "loss_of_pay_from_half_day": summary["loss_of_pay_from_half_day"],
+        "total_loss_of_pay_days": summary["total_loss_of_pay_days"],
         "attachments": list_attachments(db, ts),
     })
     if invoice is None:
@@ -1735,14 +2083,15 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         ).scalars().all()
     # Live recompute so invoice preview matches CURRENT Leave/Holiday Billing Policy.
     project, policy, _leave_map, live = live_entries_from_policy(db, ts, entries)
+    # LOP reporting (leave excess + Absent + Half_Day) — display only; billing unchanged.
+    lop_summary = timesheet_summary(db, ts, entries)
     entries = live  # type: ignore[assignment]
     rollup = _billable_rollup(project, entries)
 
     rate_rows = load_rate_rows(db, assignment.id)
     unit = assignment.billing_unit
-    period = period_label(ts.year, ts.month)
+    period_month = f"{calendar.month_abbr[ts.month]} {ts.year}"
     employee_name = employee_display_name(emp) or f"Employee #{ts.employee_id}"
-    project_name = project.name if project else f"Project #{ts.project_id}"
     period_start, period_end = period_bounds(ts.year, ts.month)
 
     fallback_rate = Decimal(assignment.billing_rate or 0)
@@ -1829,7 +2178,7 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
 
     line = {
         "s_no": 1,
-        "description": f"{employee_name} — {project_name} professional services, {period}",
+        "description": line_description(employee_name, period_month),
         "monthly_cost": float(monthly_cost) if monthly_cost is not None else None,
         "total_billed_qty": float(qty),
         "rate_per_unit": float(rate),
@@ -1840,6 +2189,8 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
             if unit == BillingUnit.HOURLY
             else comp_off_billed(entries, policy)  # type: ignore[arg-type]
         ),
+        # Reporting only — does not change billed qty/amount.
+        "loss_of_pay_days": float(lop_summary["total_loss_of_pay_days"]),
         "amount": float(amount),
         "rate_split": rate_changed,
     }

@@ -16,3 +16,8 @@ SQLAlchemy>=2.0
 alembic>=1.13
 python-docx
 reportlab
+weasyprint
+# openpyxl already listed above — used by Tax Invoice Excel bulk/template
+# WeasyPrint on Windows needs the GTK3 runtime:
+#   https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#windows
+# Without GTK the Tax Invoice PDF falls back to ReportLab (same API contract).

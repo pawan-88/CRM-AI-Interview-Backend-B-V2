@@ -264,6 +264,20 @@ def leave_detail_out(row: ProjectEmployeeLeaveDetail, leave_type: LeavePolicyTyp
         "yearly_entitlement": eligibility.get("yearly_days"),
         "monthly_entitlement": eligibility.get("monthly_days"),
         "is_loss_of_pay": bool(name and is_loss_of_pay_name(name)),
+        # Policy cycle metadata so the employee's leave section can show WHEN
+        # credits are granted and WHEN unused balance lapses (project override
+        # → branch → customer inheritance).
+        "leave_credit_type": policy.leave_credit_type if policy else None,
+        "leave_credit_timing": getattr(policy, "leave_credit_timing", None) if policy else None,
+        "leave_expire": policy.leave_expire if policy else None,
+        "leave_expire_timing": getattr(policy, "leave_expire_timing", None) if policy else None,
+        # Provenance: which layer this row's crediting rules came from.
+        "policy_source": (
+            "project" if getattr(row, "project_leave_policy_id", None)
+            else ("branch" if (policy is not None and getattr(policy, "branch_id", None) is not None)
+                  else ("customer" if policy is not None else None))
+        ),
+        "project_leave_policy_id": getattr(row, "project_leave_policy_id", None),
     }
     if settlement:
         data["settlement_leave_balance"] = float(display_balance)
@@ -392,6 +406,40 @@ def resolve_customer_leave_policies(
     return [p for p in all_pols if p.branch_id is None] or all_pols
 
 
+def resolve_effective_leave_policies(
+    db: Session,
+    project: Project,
+    *,
+    pe: ProjectEmployee | None = None,
+    branch: CustomerBranch | None = None,
+) -> list[tuple[object, str]]:
+    """CREDITING policy chain: Project override → Branch → Customer.
+
+    Returns ``[(policy, source)]`` where ``policy`` is a ProjectLeavePolicy
+    ("project") or CustomerLeavePolicy ("branch"/"customer"). A project row for
+    a leave type REPLACES the branch/customer row for that type; other types
+    keep inheriting. Billability (`is_billable`) intentionally stays on the
+    branch/customer chain (`resolve_customer_leave_policies`) — project rows do
+    not carry it.
+    """
+    from models import ProjectLeavePolicy
+
+    merged: dict[int, tuple[object, str]] = {}
+    for pol in resolve_customer_leave_policies(db, project, pe=pe, branch=branch):
+        merged[pol.leave_type_id] = (
+            pol, "branch" if pol.branch_id is not None else "customer",
+        )
+    overrides = db.execute(
+        select(ProjectLeavePolicy).where(
+            ProjectLeavePolicy.project_id == project.id,
+            ProjectLeavePolicy.is_active.is_(True),
+        )
+    ).scalars().all()
+    for pol in overrides:
+        merged[pol.leave_type_id] = (pol, "project")
+    return list(merged.values())
+
+
 def seed_leave_details_from_customer_policy(
     db: Session,
     pe: ProjectEmployee,
@@ -425,7 +473,7 @@ def seed_leave_details_from_customer_policy(
         ).scalars().all()
     }
     created: list[ProjectEmployeeLeaveDetail] = []
-    for policy in resolve_customer_leave_policies(db, project, pe=pe):
+    for policy, policy_source in resolve_effective_leave_policies(db, project, pe=pe):
         if policy.leave_type_id in existing_types:
             continue
         initial, accrual = _seed_balance_from_policy(policy)
@@ -455,20 +503,24 @@ def seed_leave_details_from_customer_policy(
                     )
                 else:
                     accrual = period_amt
-        elif _is_upfront and policy.prorate_balance_credit and initial > 0:
+        elif _is_upfront and getattr(policy, "prorate_balance_credit", False) and initial > 0:
             # Prorate by accrual_start month (onboarding, or later effective_date).
+            # ProjectLeavePolicy has no prorate flag → treated as False.
             proration_date = start or pe.onboarding_date
             if proration_date is not None:
                 factor = Decimal(13 - proration_date.month) / Decimal(12)
                 factor = min(max(factor, Decimal("0")), Decimal("1"))
                 initial = (initial * factor).quantize(Decimal("0.01"))
         bal = initial
-        if policy.is_max_limit and policy.max_limit is not None:
-            bal = min(bal, Decimal(policy.max_limit))
+        _max_limit = getattr(policy, "max_limit", None)  # not on ProjectLeavePolicy
+        if policy.is_max_limit and _max_limit is not None:
+            bal = min(bal, Decimal(_max_limit))
         row = ProjectEmployeeLeaveDetail(
             project_employee_id=pe.id,
             leave_type_id=policy.leave_type_id,
-            customer_leave_policy_id=policy.id,
+            # Exactly one FK per row: project override OR customer/branch policy.
+            customer_leave_policy_id=policy.id if policy_source != "project" else None,
+            project_leave_policy_id=policy.id if policy_source == "project" else None,
             initial_balance=initial,
             opening_balance=initial,
             leave_accrual=accrual,
@@ -486,7 +538,7 @@ def seed_leave_details_from_customer_policy(
                 amount=initial,
                 balance_after=bal,
                 source=f"pe_seed:{pe.id}:{policy.leave_type_id}",
-                note=f"PE#{pe.id} leave seeded from customer policy #{policy.id}",
+                note=f"PE#{pe.id} leave seeded from {policy_source} policy #{policy.id}",
             ))
     if created:
         db.flush()
@@ -821,6 +873,15 @@ def timesheet_rollups_for_pe(db: Session, pe: ProjectEmployee) -> list[dict]:
         Timesheet.employee_id == pe.employee_id,
     ).order_by(Timesheet.year.desc(), Timesheet.month.desc())
     sheets = db.execute(stmt).scalars().all()
+    # Batch-load ALL entries for these timesheets in ONE query (was N+1: a SELECT
+    # per timesheet), grouped by timesheet_id — identical data, far fewer queries.
+    entries_by_ts: dict[int, list[TimesheetEntry]] = {}
+    _sheet_ids = [ts.id for ts in sheets]
+    if _sheet_ids:
+        for _e in db.execute(
+            select(TimesheetEntry).where(TimesheetEntry.timesheet_id.in_(_sheet_ids))
+        ).scalars().all():
+            entries_by_ts.setdefault(_e.timesheet_id, []).append(_e)
     out: list[dict] = []
     # Client holiday calendar for this mapping, counted per period (weekend holidays
     # still count — a client holiday on a Saturday is a non-billable day under T&M).
@@ -831,9 +892,7 @@ def timesheet_rollups_for_pe(db: Session, pe: ProjectEmployee) -> list[dict]:
             m = int(hd[5:7])
             holiday_dates_by_month[m] = holiday_dates_by_month.get(m, 0) + 1
     for ts in sheets:
-        entries = db.execute(
-            select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
-        ).scalars().all()
+        entries = entries_by_ts.get(ts.id, [])
         billable_hours = Decimal("0")
         billable_days_stored = Decimal("0")
         leave = 0
@@ -916,8 +975,14 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
     holiday_year = date.today().year
     branch = pe_effective_branch(db, pe, year=holiday_year) if project else None
     opp_branch = _project_branch(db, project) if project else None
+    from services.timesheets import opportunity_branch_foreign_to_project
+    foreign = opportunity_branch_foreign_to_project(db, project) if project else False
     data["branch_id"] = branch.id if branch else None
     data["branch_name"] = branch.branch_name if branch else None
+    data["branch_unlinked"] = bool(branch is None and foreign)
+    data["branch_link_message"] = (
+        "Branch not linked to this customer" if data["branch_unlinked"] else None
+    )
     data["branch_resolved_via"] = (
         "opportunity" if (branch is not None and opp_branch is not None and branch.id == opp_branch.id)
         else ("fallback" if branch is not None else None)
@@ -938,12 +1003,29 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
             select(CustomerLeavePolicy).where(CustomerLeavePolicy.id.in_(policy_ids or [-1]))
         ).scalars().all()
     } if policy_ids else {}
+    # Project-level overrides: rows seeded from a ProjectLeavePolicy carry that
+    # FK instead — load them in one query so cycle metadata + provenance render.
+    from models import ProjectLeavePolicy
+    proj_policy_ids = {
+        r.project_leave_policy_id
+        for r, _ in leave_rows
+        if getattr(r, "project_leave_policy_id", None)
+    }
+    proj_policies = {
+        p.id: p
+        for p in db.execute(
+            select(ProjectLeavePolicy).where(ProjectLeavePolicy.id.in_(proj_policy_ids or [-1]))
+        ).scalars().all()
+    } if proj_policy_ids else {}
     details_out = []
     consumed_total = Decimal("0")
     lop_consumed = Decimal("0")
     from services.employees import is_loss_of_pay_name
     for r, lt in leave_rows:
-        policy = policies.get(r.customer_leave_policy_id) if r.customer_leave_policy_id else None
+        if getattr(r, "project_leave_policy_id", None):
+            policy = proj_policies.get(r.project_leave_policy_id)
+        else:
+            policy = policies.get(r.customer_leave_policy_id) if r.customer_leave_policy_id else None
         details_out.append(leave_detail_out(r, lt, settlement=settlement, policy=policy))
         if lt is not None and is_loss_of_pay_name(lt.name):
             lop_consumed += Decimal(r.leave_consumed or 0)
@@ -1118,6 +1200,30 @@ def employee_project_leave(db: Session, employee_id: int) -> dict:
             .where(ProjectEmployeeLeaveDetail.project_employee_id == pe.id)
             .order_by(ProjectEmployeeLeaveDetail.id)
         ).all()
+        # Bulk-load linked policies (customer/branch + project override) so
+        # each row serializes with cycle metadata and provenance.
+        from models import ProjectLeavePolicy
+        cust_ids = {r.customer_leave_policy_id for r, _ in rows if r.customer_leave_policy_id}
+        proj_ids = {
+            r.project_leave_policy_id for r, _ in rows
+            if getattr(r, "project_leave_policy_id", None)
+        }
+        cust_pols = {
+            p.id: p for p in db.execute(
+                select(CustomerLeavePolicy).where(CustomerLeavePolicy.id.in_(cust_ids or [-1]))
+            ).scalars().all()
+        } if cust_ids else {}
+        proj_pols = {
+            p.id: p for p in db.execute(
+                select(ProjectLeavePolicy).where(ProjectLeavePolicy.id.in_(proj_ids or [-1]))
+            ).scalars().all()
+        } if proj_ids else {}
+
+        def _pol(r):
+            if getattr(r, "project_leave_policy_id", None):
+                return proj_pols.get(r.project_leave_policy_id)
+            return cust_pols.get(r.customer_leave_policy_id) if r.customer_leave_policy_id else None
+
         subtotal = sum((Decimal(r.leave_balance or 0) for r, _ in rows), Decimal("0"))
         grand_total += subtotal
         projects_out.append({
@@ -1128,7 +1234,7 @@ def employee_project_leave(db: Session, employee_id: int) -> dict:
             "is_active": bool(pe.is_active),
             "is_exit": bool(pe.is_exit),
             "leave_balance_total": float(subtotal),
-            "leave_details": [leave_detail_out(r, lt) for r, lt in rows],
+            "leave_details": [leave_detail_out(r, lt, policy=_pol(r)) for r, lt in rows],
         })
     return {
         "employee_id": employee_id,

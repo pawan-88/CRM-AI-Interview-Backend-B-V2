@@ -33,6 +33,17 @@ class Candidate(Base, TimestampMixin):
     current_ctc = sa.Column(sa.Numeric(14, 2), nullable=True)
     expected_ctc = sa.Column(sa.Numeric(14, 2), nullable=True)
     preferred_location_id = sa.Column(sa.Integer, sa.ForeignKey("locations.id"), nullable=True)
+    # --- Zoho NEXUS candidate export (migration 0057) ------------------------
+    # Durable external id: re-imports and the applied-opportunities bridge key on
+    # this rather than email, which users can edit in the app.
+    zoho_candidate_id = sa.Column(sa.String(32), nullable=True)
+    city = sa.Column(sa.String(120), nullable=True)
+    # Full preferred-location list, comma separated. preferred_location_id still
+    # holds the primary one so existing filters keep working.
+    preferred_locations = sa.Column(sa.String(500), nullable=True)
+    recruiter_email = sa.Column(sa.String(255), nullable=True)
+    cv_original_filename = sa.Column(sa.String(255), nullable=True)
+    source_created_date = sa.Column(sa.Date, nullable=True)
 
     education = relationship("CandidateEducation", back_populates="candidate", cascade="all, delete-orphan")
     experience = relationship("CandidateExperience", back_populates="candidate", cascade="all, delete-orphan")

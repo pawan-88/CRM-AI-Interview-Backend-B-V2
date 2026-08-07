@@ -71,6 +71,11 @@ class CustomerLeavePolicy(Base):
     maximum_carry_forward = sa.Column(sa.Numeric(5, 2), nullable=True)
     leave_credit_timing = sa.Column(sa.String(24), nullable=False,
                                     server_default="Start_Of_Period")  # Start_Of_Period|End_Of_Period
+    # When within the expiry cycle (leave_expire Monthly/Quarterly/Yearly) the
+    # unused remainder lapses: Start_Of_Period|End_Of_Period. Batch rollovers
+    # apply either at the cycle boundary; the field records the contractual
+    # intent and is surfaced on PE leave details.
+    leave_expire_timing = sa.Column(sa.String(24), nullable=True)
     effective_date = sa.Column(sa.Date, nullable=True)
     is_billable = sa.Column(sa.Boolean, nullable=True)  # spec §5 "Billable Leave Policy" flag; NULL = unset
     is_active = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
@@ -110,7 +115,7 @@ class LeaveApplication(Base):
     __tablename__ = "leave_applications"
     id = sa.Column(sa.Integer, primary_key=True)
     employee_id = sa.Column(sa.Integer, sa.ForeignKey("employees.id"), nullable=False, index=True)
-    project_id = sa.Column(sa.Integer, sa.ForeignKey("projects.id"), nullable=True)
+    project_id = sa.Column(sa.Integer, sa.ForeignKey("projects.id"), nullable=True, index=True)
     project_employee_id = sa.Column(sa.Integer, sa.ForeignKey("project_employees.id"),
                                     nullable=True, index=True)
     leave_type_id = sa.Column(sa.Integer, sa.ForeignKey("leave_policy_types.id"), nullable=False)

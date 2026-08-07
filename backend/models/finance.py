@@ -16,8 +16,10 @@ from models.base import Base, USERS_FK, pg_enum
 
 
 class POType(str, enum.Enum):
-    STANDARD = "Standard"
-    BLANKET = "Blanket"
+    STANDARD = "Standard"   # legacy rows
+    BLANKET = "Blanket"     # legacy rows
+    OPEN = "Open PO"
+    REGULAR = "Regular PO"
 
 
 class POStatus(str, enum.Enum):
@@ -50,6 +52,9 @@ class PurchaseOrder(Base):
     end_date = sa.Column(sa.Date, nullable=True)
     # List of {"name": str, "url": str, "kind": "image" | "file"} upload refs.
     attachments = sa.Column(JSONB, nullable=True)
+    # Editable snapshots filled from branch on the New PO form; not FK'd to branch rows.
+    billing_address_snapshot = sa.Column(JSONB, nullable=True)
+    delivery_address_snapshot = sa.Column(JSONB, nullable=True)
     contact_person_id = sa.Column(sa.Integer, sa.ForeignKey("contact_persons.id"), nullable=True)
     po_type = sa.Column(pg_enum(POType, "po_type"), nullable=False, server_default=POType.STANDARD.value)
     payment_terms = sa.Column(sa.Text, nullable=True)
@@ -117,6 +122,9 @@ class Invoice(Base):
     sub_total = sa.Column(sa.Numeric(14, 2), nullable=False)
     tax_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
     grand_total = sa.Column(sa.Numeric(14, 2), nullable=False)
+    # Per-invoice GST buyer state override (2-digit). Resolution:
+    # invoice.buyer_state_code → branch.state (2-digit) → GSTIN[:2].
+    buyer_state_code = sa.Column(sa.String(2), nullable=True)
     payment_status = sa.Column(pg_enum(PaymentStatus, "invoice_payment_status"), nullable=False,
                                server_default=PaymentStatus.UNPAID.value, index=True)
     paid_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")

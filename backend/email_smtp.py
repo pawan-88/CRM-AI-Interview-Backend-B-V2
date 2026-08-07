@@ -25,7 +25,10 @@ def smtp_configured() -> bool:
     return bool(host and user and pwd)
 
 
-def send_email(to_address: str, subject: str, body_text: str, body_html: str | None = None) -> dict[str, Any]:
+def send_email(to_address: str, subject: str, body_text: str, body_html: str | None = None,
+               attachments: list[tuple[str, bytes, str]] | None = None) -> dict[str, Any]:
+    """`attachments`: optional list of (filename, content_bytes, mime_type) —
+    e.g. ("invite.ics", b"BEGIN:VCALENDAR...", "text/calendar")."""
     if not smtp_configured():
         return {"ok": False, "error": "SMTP not configured (set SMTP_HOST, SMTP_USER, SMTP_PASSWORD)."}
 
@@ -36,13 +39,31 @@ def send_email(to_address: str, subject: str, body_text: str, body_html: str | N
     from_addr = (os.getenv("SMTP_FROM") or user).strip()
     use_tls = (os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"})
 
-    msg = MIMEMultipart("alternative")
+    if attachments:
+        # mixed container wrapping the alternative body + file parts
+        msg = MIMEMultipart("mixed")
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body_text, "plain", "utf-8"))
+        if body_html:
+            alt.attach(MIMEText(body_html, "html", "utf-8"))
+        msg.attach(alt)
+        from email.mime.base import MIMEBase
+        from email import encoders
+        for fname, content, mime in attachments:
+            main, _, sub = (mime or "application/octet-stream").partition("/")
+            part = MIMEBase(main or "application", sub or "octet-stream")
+            part.set_payload(content)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{fname}"')
+            msg.attach(part)
+    else:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body_text, "plain", "utf-8"))
+        if body_html:
+            msg.attach(MIMEText(body_html, "html", "utf-8"))
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_address
-    msg.attach(MIMEText(body_text, "plain", "utf-8"))
-    if body_html:
-        msg.attach(MIMEText(body_html, "html", "utf-8"))
 
     try:
         if use_tls and port == 465:

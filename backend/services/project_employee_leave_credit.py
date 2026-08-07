@@ -32,6 +32,23 @@ from services.project_employee_billing import carry_forward, prorate_credit
 ZERO = Decimal("0")
 
 
+def _row_policy(db: Session, row: ProjectEmployeeLeaveDetail):
+    """Crediting policy for a PE leave row: PROJECT override wins, else the
+    customer/branch policy. Both types share the crediting field surface
+    (credit type/timing, balances, expire cycle/timing, carry cap); fields a
+    ProjectLeavePolicy lacks (prorate_balance_credit, max_limit) are read via
+    getattr with safe defaults by the callers."""
+    if getattr(row, "project_leave_policy_id", None):
+        from models import ProjectLeavePolicy
+        pol = db.get(ProjectLeavePolicy, row.project_leave_policy_id)
+        if pol is not None:
+            return pol
+    return (
+        db.get(CustomerLeavePolicy, row.customer_leave_policy_id)
+        if row.customer_leave_policy_id else None
+    )
+
+
 def accrual_start(
     policy: CustomerLeavePolicy | None,
     pe: ProjectEmployee | None,
@@ -140,13 +157,15 @@ def _credit_deferred_upfront(
         return ZERO
 
     amount = pending
-    if policy.prorate_balance_credit and start is not None:
+    # getattr: ProjectLeavePolicy has no prorate/max_limit — defaults apply.
+    if getattr(policy, "prorate_balance_credit", False) and start is not None:
         factor = Decimal(13 - start.month) / Decimal(12)
         factor = min(max(factor, Decimal("0")), Decimal("1"))
         amount = (amount * factor).quantize(Decimal("0.01"))
 
-    if policy.is_max_limit and policy.max_limit is not None:
-        room = Decimal(policy.max_limit) - Decimal(row.leave_balance or 0)
+    _max_limit = getattr(policy, "max_limit", None)
+    if policy.is_max_limit and _max_limit is not None:
+        room = Decimal(_max_limit) - Decimal(row.leave_balance or 0)
         if room <= 0:
             return ZERO
         amount = min(amount, room)
@@ -169,6 +188,57 @@ def _credit_deferred_upfront(
     return amount
 
 
+def _apply_cycle_expiry(
+    db: Session,
+    pe: ProjectEmployee,
+    row: ProjectEmployeeLeaveDetail,
+    policy: CustomerLeavePolicy,
+    as_of: date,
+    period: str,
+    start: date | None,
+) -> Decimal:
+    """Cycle expiry for Monthly/Quarterly `leave_expire` policies.
+
+    "Use it in the cycle or lose it": before this period's credit is applied,
+    the remainder carried in from PRIOR periods expires to zero (ledgered as a
+    negative Adjustment, idempotent via `pe_cycle_expire:{pe}:{type}:{period}`).
+    Monthly expires at every month rollover; Quarterly at quarter starts
+    (Jan/Apr/Jul/Oct). Yearly keeps the existing Dec-31 `apply_year_end_carry`
+    path. The accrual-start period itself never expires (opening/seed balances
+    granted that month must survive their own month).
+    """
+    cycle = str(policy.leave_expire or "").strip().lower()
+    if cycle.startswith("month"):
+        pass
+    elif cycle.startswith("quarter"):
+        if as_of.month not in (1, 4, 7, 10):
+            return ZERO
+    else:
+        return ZERO  # Yearly / blank → Dec-31 job handles it
+    if start is not None and (start.year, start.month) == (as_of.year, as_of.month):
+        return ZERO
+    remaining = Decimal(row.leave_balance or 0)
+    if remaining <= 0:
+        return ZERO
+    src = f"pe_cycle_expire:{pe.id}:{row.leave_type_id}:{period}"
+    already = db.execute(
+        select(LeaveAccrualEvent.id).where(LeaveAccrualEvent.source == src).limit(1)
+    ).first()
+    if already is not None:
+        return ZERO
+    row.leave_balance = ZERO
+    db.add(LeaveAccrualEvent(
+        employee_id=pe.employee_id,
+        leave_type_id=row.leave_type_id,
+        event_type="Adjustment",
+        amount=-remaining,
+        balance_after=ZERO,
+        source=src,
+        note=f"{policy.leave_expire} leave expiry before {period} credit",
+    ))
+    return remaining
+
+
 def credit_one_pe_leave_row(
     db: Session,
     pe: ProjectEmployee,
@@ -184,12 +254,14 @@ def credit_one_pe_leave_row(
     if not force and _already_credited(db, pe.id, row.leave_type_id, period):
         return ZERO
 
-    policy = (
-        db.get(CustomerLeavePolicy, row.customer_leave_policy_id)
-        if row.customer_leave_policy_id else None
-    )
+    policy = _row_policy(db, row)
     start = accrual_start(policy, pe)
     credit_type = (policy.leave_credit_type if policy else "Monthly") or "Monthly"
+
+    # Monthly/Quarterly expiry cycles: expire the prior remainder BEFORE this
+    # period's credit so each cycle starts from only its own grant.
+    if policy is not None:
+        _apply_cycle_expiry(db, pe, row, policy, as_of, period, start)
 
     # Deferred One_Time / Yearly-start: leave_accrual holds the pending grant.
     if policy is not None and _is_upfront_credit(policy, credit_type):
@@ -206,15 +278,16 @@ def credit_one_pe_leave_row(
         return ZERO
 
     days_present, dim = _days_present_in_month(pe, as_of, not_before=start)
-    do_prorate = bool(policy and policy.prorate_balance_credit)
+    do_prorate = bool(policy and getattr(policy, "prorate_balance_credit", False))
     amount = prorate_credit(accrual, days_present, dim) if do_prorate else accrual
     if days_present <= 0:
         amount = ZERO
     if amount <= 0:
         return ZERO
 
-    if policy and policy.is_max_limit and policy.max_limit is not None:
-        room = Decimal(policy.max_limit) - Decimal(row.leave_balance or 0)
+    _max_limit = getattr(policy, "max_limit", None) if policy else None
+    if policy and policy.is_max_limit and _max_limit is not None:
+        room = Decimal(_max_limit) - Decimal(row.leave_balance or 0)
         if room <= 0:
             return ZERO
         amount = min(amount, room)
@@ -243,10 +316,7 @@ def apply_year_end_carry(
         return ZERO, ZERO
     if as_of.month != 12 or as_of.day != 31:
         return ZERO, ZERO
-    policy = (
-        db.get(CustomerLeavePolicy, row.customer_leave_policy_id)
-        if row.customer_leave_policy_id else None
-    )
+    policy = _row_policy(db, row)
     remaining = Decimal(row.leave_balance or 0)
     if remaining <= 0 or policy is None:
         return ZERO, ZERO

@@ -31,6 +31,7 @@ from crm_deps import CurrentUser, get_crm_db, role_required
 from models import Requirement, RequirementActivityLog, RequirementStatus, Resume
 from schemas.common import envelope
 from services.crm_common import log_activity, save_upload_hashed
+from auth_secret import auth_secret as _shared_auth_secret
 
 router = APIRouter(tags=["CRM: Apply"])
 
@@ -47,11 +48,12 @@ _MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # --------------------------------------------------------------------------- token
 def _secret() -> str:
-    # Mirror crm_deps._auth_secret so links survive the same secret config.
-    raw = (os.getenv("AUTH_SECRET") or os.getenv("REPORT_CODE") or "change-me-auth-secret").strip()
-    if len(raw.encode("utf-8")) >= 32:
-        return raw
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """Same signing key as the rest of the app — see auth_secret.py.
+
+    Public apply links are HMAC'd with this, so a guessable default meant anyone
+    could mint a link for any requirement.
+    """
+    return _shared_auth_secret()
 
 
 def make_apply_token(requirement_id: int) -> str:
@@ -261,6 +263,16 @@ def submit_application(
         select(Resume).where(Resume.requirement_id == req.id, Resume.file_sha256 == file_sha256)
     ).scalars().first()
     if dup is not None:
+        # Same file re-submitted: still make sure a Candidate exists for it (the
+        # original submission may predate immediate candidate creation).
+        if dup.candidate_id is None:
+            try:
+                from services.slot_booking import find_or_create_candidate_from_resume
+                cand = find_or_create_candidate_from_resume(db, dup)
+                dup.candidate_id = cand.id
+                db.commit()
+            except Exception:
+                db.rollback()
         return envelope(data={"received": True}, message="Application already received")
     resume = Resume(
         requirement_id=req.id,
@@ -275,6 +287,16 @@ def submit_application(
         file_size=file_size,
     )
     db.add(resume)
+    db.flush()  # assign resume.id before deriving the candidate
+    # Create/enrich the Candidate immediately so the applicant appears in the
+    # Candidate tab right away, with the details they submitted (experience,
+    # education, domain, skills, CTC). Best-effort — never block the submission.
+    try:
+        from services.slot_booking import find_or_create_candidate_from_resume
+        cand = find_or_create_candidate_from_resume(db, resume)
+        resume.candidate_id = cand.id
+    except Exception:
+        pass
     existing = db.execute(
         select(func.count()).select_from(Resume).where(Resume.requirement_id == req.id)
     ).scalar() or 0

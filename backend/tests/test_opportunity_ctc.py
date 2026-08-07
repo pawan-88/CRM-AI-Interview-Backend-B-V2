@@ -149,8 +149,13 @@ def test_opportunity_type_switch_recalculates_instead_of_reusing_stale_annual():
 
 def test_normalize_tm_details_applies_form_defaults():
     details = normalize_tm_billing_details({"billing_type": "Per Hour"})
-    assert details["actual_billing_days"] == 227
-    assert details["actual_billing_hours"] == 1816
+    # No phantom holidays/weekoff/leave — blank deducts as 0 → 365 days × 8h.
+    assert "holidays" not in details
+    assert "weekoff" not in details
+    assert "leave" not in details
+    assert details["hours_per_day"] == 8
+    assert details["actual_billing_days"] == 365
+    assert details["actual_billing_hours"] == 2920
 
 
 def test_exp_max_is_midpoint_of_exp_min_and_target_exp():

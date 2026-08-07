@@ -9,6 +9,17 @@ from pydantic import BaseModel, Field
 from models import POType
 
 
+class AddressSnapshotIn(BaseModel):
+    """Editable billing/delivery address captured on the New PO form."""
+
+    address_line_1: str | None = Field(default=None, max_length=512)
+    address_line_2: str | None = Field(default=None, max_length=512)
+    city: str | None = Field(default=None, max_length=128)
+    state: str | None = Field(default=None, max_length=128)
+    pincode: str | None = Field(default=None, max_length=32)
+    country: str | None = Field(default=None, max_length=128)
+
+
 class PurchaseOrderCreate(BaseModel):
     po_number: str | None = Field(default=None, max_length=64)
     customer_id: int
@@ -18,12 +29,14 @@ class PurchaseOrderCreate(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     contact_person_id: int | None = None
-    po_type: POType = POType.STANDARD
+    po_type: POType = POType.OPEN
     payment_terms: str | None = None
     terms_conditions: str | None = None
     tax_slab: Decimal | None = Field(default=None, ge=0, le=100)
     inter_state: bool = False
     total_value: Decimal = Field(gt=0)
+    billing_address: AddressSnapshotIn | None = None
+    delivery_address: AddressSnapshotIn | None = None
 
 
 class PurchaseOrderUpdate(BaseModel):
@@ -40,6 +53,8 @@ class PurchaseOrderUpdate(BaseModel):
     tax_slab: Decimal | None = Field(default=None, ge=0, le=100)
     inter_state: bool | None = None
     total_value: Decimal | None = Field(default=None, gt=0)
+    billing_address: AddressSnapshotIn | None = None
+    delivery_address: AddressSnapshotIn | None = None
 
 
 class AllocationIn(BaseModel):
@@ -88,6 +103,8 @@ class InvoiceCreate(BaseModel):
 class InvoiceUpdate(BaseModel):
     invoice_date: date | None = None
     due_date: date | None = None
+    # Per-invoice GST buyer state override: exactly 2 digits, or blank/null to clear.
+    buyer_state_code: str | None = None
 
 
 class PaymentIn(BaseModel):

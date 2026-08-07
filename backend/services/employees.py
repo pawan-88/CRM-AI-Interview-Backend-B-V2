@@ -339,6 +339,42 @@ def _normalize_leave_type_key(name: str) -> str:
     return n
 
 
+_LEAVE_CODE_TO_STEM = {code.lower(): key for code, _label, key in LEAVE_MATRIX_ROWS}
+
+
+def resolve_leave_policy_type(db: Session, name: str) -> LeavePolicyType | None:
+    """Resolve a timesheet/UI leave label to a LeavePolicyType row.
+
+    Accepts display names ("Casual Leave"), stems ("casual"), and matrix
+    codes ("CL") so approvals/classify do not 400 when entries store a stem.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return None
+    key = raw.lower()
+    want = _normalize_leave_type_key(raw)
+    stem = _LEAVE_CODE_TO_STEM.get(key) or _LEAVE_CODE_TO_STEM.get(want) or want
+    candidates: set[str] = {key}
+    if want:
+        candidates.add(want)
+    if stem:
+        candidates.add(stem)
+        candidates.add(f"{stem} leave")
+    lt = db.execute(
+        select(LeavePolicyType).where(
+            sa.func.lower(LeavePolicyType.name).in_(tuple(sorted(candidates)))
+        )
+    ).scalars().first()
+    if lt is not None:
+        return lt
+    if not stem:
+        return None
+    for row in db.execute(select(LeavePolicyType)).scalars().all():
+        if _normalize_leave_type_key(row.name or "") == stem:
+            return row
+    return None
+
+
 def is_loss_of_pay_name(name: str | None) -> bool:
     return _normalize_leave_type_key(name or "") == LOSS_OF_PAY_NAME
 

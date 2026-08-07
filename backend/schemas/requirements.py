@@ -7,6 +7,29 @@ from pydantic import BaseModel, Field, field_validator
 
 PRIORITY_VALUES = {"High", "Medium", "Low"}
 WORK_MODE_VALUES = {"Remote", "Onsite", "Hybrid"}
+ATS_WEIGHT_KEYS = {"mandatory", "optional", "experience", "location", "education", "jd"}
+
+
+def _validate_ats_weights(cls, v: dict | None) -> dict | None:
+    """ATS component weights: keys limited to known components, values numeric ≥ 0.
+    An empty dict is normalised to None (use scorer defaults). Shared reusable
+    validator — Pydantic passes (cls, value)."""
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise ValueError("ats_weights must be an object of component → weight")
+    clean: dict[str, float] = {}
+    for key, val in v.items():
+        if key not in ATS_WEIGHT_KEYS:
+            raise ValueError(f"Unknown ATS weight '{key}'; allowed: {', '.join(sorted(ATS_WEIGHT_KEYS))}")
+        try:
+            fv = float(val)
+        except (TypeError, ValueError):
+            raise ValueError(f"ATS weight '{key}' must be a number")
+        if fv < 0:
+            raise ValueError(f"ATS weight '{key}' must be ≥ 0")
+        clean[key] = fv
+    return clean or None
 
 
 class RequirementSkillIn(BaseModel):
@@ -60,6 +83,7 @@ class RequirementUpdate(BaseModel):
     priority: str | None = None
     target_closure_date: date | None = None
     skills: list[RequirementSkillIn] | None = None
+    ats_weights: dict | None = None
 
     @field_validator("priority")
     @classmethod
@@ -75,11 +99,23 @@ class RequirementUpdate(BaseModel):
             raise ValueError(f"work_mode must be one of: {', '.join(sorted(WORK_MODE_VALUES))}")
         return v
 
+    _ats = field_validator("ats_weights")(_validate_ats_weights)
+
 
 class EngineeringApproveIn(BaseModel):
-    """RMG engineering approve — requires JD text and/or a prior rmg_jd attachment."""
+    """RMG engineering approve — requires JD text and/or a prior rmg_jd attachment.
+
+    RMG may also set the Skill Evaluation Details here: when `skills` is provided
+    (not None) it REPLACES the requirement's skill set. Omit it to leave skills
+    untouched; send `[]` to clear them.
+    """
     comment: str | None = None
     rmg_jd_text: str | None = None
+    skills: list[RequirementSkillIn] | None = None
+    # Optional per-requirement ATS component weights (null = leave unchanged).
+    ats_weights: dict | None = None
+
+    _ats = field_validator("ats_weights")(_validate_ats_weights)
 
 
 class JobPostingIn(BaseModel):

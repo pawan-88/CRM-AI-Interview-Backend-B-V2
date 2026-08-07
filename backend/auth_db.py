@@ -2425,6 +2425,62 @@ def get_schedule_by_token(db_target: DbTarget, invite_token: str) -> dict | None
     return dict(row)
 
 
+def get_schedules_by_tokens(db_target: DbTarget, invite_tokens) -> dict[str, dict]:
+    """Bulk form of get_schedule_by_token, keyed by invite_token.
+
+    The calendar renders a week of AI interviews at once, and the scheduled time
+    for each lives on this legacy row rather than on ai_interview_links. Calling
+    the single-token reader per event would be one round trip per interview —
+    an easy 30-60 queries to draw one week.
+
+    Never raises: a missing legacy row just means that event has no time, which
+    the caller already has to handle.
+    """
+    tokens = [str(t).strip() for t in (invite_tokens or []) if str(t or "").strip()]
+    if not tokens:
+        return {}
+    cols = ("invite_token, id, candidate_name, candidate_email, scheduled_at_local, provider, "
+            "meeting_link, status, notes, access_key, session_status, verified_at, "
+            "interview_started_at, interview_completed_at, violation_count")
+    fallback_cols = ("invite_token, id, candidate_name, candidate_email, scheduled_at_local, "
+                     "provider, meeting_link, status, notes")
+    rows: list = []
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        f"SELECT {cols} FROM interview_schedule WHERE invite_token = ANY(%s)",
+                        (tokens,),
+                    )
+                    rows = cur.fetchall()
+        else:
+            placeholders = ",".join("?" for _ in tokens)
+            with _connect_sqlite(Path(db_target)) as conn:
+                try:
+                    rows = conn.execute(
+                        f"SELECT {cols} FROM interview_schedule "
+                        f"WHERE invite_token IN ({placeholders})",
+                        tokens,
+                    ).fetchall()
+                except Exception:
+                    # Older deployments predate some of these columns.
+                    rows = conn.execute(
+                        f"SELECT {fallback_cols} FROM interview_schedule "
+                        f"WHERE invite_token IN ({placeholders})",
+                        tokens,
+                    ).fetchall()
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for row in rows:
+        data = dict(row)
+        token = str(data.get("invite_token") or "").strip()
+        if token:
+            out[token] = data
+    return out
+
+
 def update_schedule_field(db_target: DbTarget, invite_token: str, **kwargs) -> None:
     """Update one or more fields on an interview_schedule row by invite_token."""
     token = (invite_token or "").strip()
@@ -3259,6 +3315,23 @@ def bulk_import_interview_records(db_target: DbTarget, records: list[dict]) -> i
     return count
 
 
+#: Columns never returned by the diagnostic snapshot. Password material lets an
+#: attacker crack accounts offline; invite_token + access_key together are the
+#: full credential pair for entering a candidate's interview.
+_SNAPSHOT_REDACTED = {
+    "password_hash", "password_salt", "password", "reset_token",
+    "invite_token", "access_key", "active_device_id",
+}
+
+
+def _redact_snapshot_row(row: dict) -> dict:
+    """Replace secret columns with a marker, keeping the shape for the UI."""
+    return {
+        key: ("***redacted***" if key in _SNAPSHOT_REDACTED and value not in (None, "") else value)
+        for key, value in dict(row).items()
+    }
+
+
 def get_database_snapshot(db_target: DbTarget, limit: int = 200) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit or 200), 1000))
     tables = [
@@ -3289,7 +3362,7 @@ def get_database_snapshot(db_target: DbTarget, limit: int = 200) -> dict[str, An
                         )
                     else:
                         cur.execute(f"SELECT * FROM {table} ORDER BY 1 DESC LIMIT %s", (safe_limit,))
-                    rows = [dict(r) for r in (cur.fetchall() or [])]
+                    rows = [_redact_snapshot_row(r) for r in (cur.fetchall() or [])]
                     snapshot["tables"][table] = {"count": count, "rows": rows}
     else:
         with _connect_sqlite(Path(db_target)) as conn:
@@ -3302,6 +3375,6 @@ def get_database_snapshot(db_target: DbTarget, limit: int = 200) -> dict[str, An
                     sql = f"SELECT * FROM {table} ORDER BY COALESCE(NULLIF(last_activity_at, ''), updated_at_ist, created_at_ist) DESC LIMIT ?"
                 else:
                     sql = f"SELECT * FROM {table} ORDER BY 1 DESC LIMIT ?"
-                rows = [dict(row) for row in conn.execute(sql, (safe_limit,)).fetchall()]
+                rows = [_redact_snapshot_row(row) for row in conn.execute(sql, (safe_limit,)).fetchall()]
                 snapshot["tables"][table] = {"count": count, "rows": rows}
     return snapshot

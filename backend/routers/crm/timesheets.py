@@ -25,16 +25,20 @@ from services import tax
 from services.crm_common import log_activity, next_sequence_number, paginate, save_upload, save_upload_hashed
 from services.finance import (
     active_po_allocation_for_project, assert_po_allows_new_drawdown,
-    log_invoice_created_on_po, serialize_invoice,
+    resolve_or_create_po_allocation_for_project,
+    karnex_gst_tax_and_grand, log_invoice_created_on_po, serialize_invoice,
 )
 from services.notify import notify_role, notify_user
 from services.timesheets import (
+    BillingPolicy,
     accrue_comp_off, approvals_report_rows, attachment_out, build_generated_entry,
     compute_billables, consume_timesheet_leaves, day_name, due_report_rows, effective_billing_policy,
+    ensure_project_branch_id, resolve_timesheet_display_branch,
+    reverse_timesheet_ledger_effects,
     employee_for_user, entry_out, for_submission_report_rows,
     get_timesheet_or_404, holidays_for_project_period, leave_billable_by_type_map,
     linked_invoice_for, list_attachments, month_days, period_label, persist_recomputed_entries,
-    release_timesheet_leaves, resolve_entry_fields, validate_timesheet_leave_balances,
+    resolve_entry_fields, validate_timesheet_leave_balances,
     timesheet_detail_out, timesheet_invoice_preview, timesheet_out, timesheet_summary,
     _due_rows, _project_branch,
 )
@@ -136,8 +140,10 @@ def create_timesheet(
     db.flush()
     if body.generate_days:
         holiday_dates = holidays_for_project_period(db, project, body.year, body.month)
-        policy = effective_billing_policy(db, project)
-        branch = _project_branch(db, project)
+        pe = assignment
+        ensure_project_branch_id(db, project, pe=pe)
+        policy = effective_billing_policy(db, project, pe=pe)
+        branch = resolve_timesheet_display_branch(db, project, pe=pe)
         for d in month_days(body.year, body.month):
             db.add(build_generated_entry(
                 timesheet_id=ts.id, d=d, holiday_dates=holiday_dates,
@@ -213,9 +219,12 @@ def upsert_entries(
     if not entries:
         raise HTTPException(status_code=400, detail="At least one entry is required")
     project = db.get(Project, ts.project_id)
-    policy = effective_billing_policy(db, project)
+    pe = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
+    if project is not None:
+        ensure_project_branch_id(db, project, pe=pe)
+    policy = effective_billing_policy(db, project, pe=pe) if project else BillingPolicy()
     # Project-scoped leave-type → billable map (same for every employee on this project).
-    leave_by_type = leave_billable_by_type_map(db, project) if project else {}
+    leave_by_type = leave_billable_by_type_map(db, project, pe=pe) if project else {}
     holiday_dates = holidays_for_project_period(db, project, ts.year, ts.month)
     existing = {
         e.entry_date: e
@@ -319,8 +328,10 @@ def submit_timesheet(
     ).scalars().all()
     validate_timesheet_leave_balances(db, ts, entries)
     persist_recomputed_entries(db, ts, entries)
-    # Consume paid leave + LOP excess now (idempotent with approve).
+    # DECISION (ISSUE-2): apply leave consume + comp-off accrue at submit
+    # (idempotent with approve via timesheet:{id} / ts.comp_off_accrued deltas).
     consume_timesheet_leaves(db, ts, entries)
+    accrue_comp_off(db, ts, entries)
     # NEVER block timesheet submit for PO reasons (D8). Invoice generate still gates.
     ts.status = TimesheetStatus.SUBMITTED
     ts.submitted_at = datetime.now(timezone.utc)
@@ -344,15 +355,13 @@ def approve_timesheet(
     ts.status = TimesheetStatus.APPROVED
     ts.approved_by = user.id
     ts.approved_at = datetime.now(timezone.utc)
-    # Comp-off earning: weekend/holiday days actually worked credit leave
-    # only when Comp Off Billable is OFF (idempotent — delta vs prior grants).
-    # When Comp Off Billable is ON those hours are billed instead (no credit).
+    # Idempotent with submit-time consume + accrue (deltas vs prior ledger /
+    # ts.comp_off_accrued — no double-apply on submit then approve).
     entries = db.execute(
         select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
         .order_by(TimesheetEntry.entry_date)
     ).scalars().all()
     earned = accrue_comp_off(db, ts, entries)
-    # Idempotent with submit-time consumption (paid + LOP excess).
     consume_timesheet_leaves(db, ts, entries)
     comp_off_note = ""
     if earned and float(earned) > 0:
@@ -382,8 +391,8 @@ def reject_timesheet(
         raise HTTPException(status_code=400, detail=str(exc))
     ts.status = TimesheetStatus.REJECTED
     ts.rejection_reason = reason
-    # Reverse leave consumption applied on submit (paid + LOP).
-    release_timesheet_leaves(db, ts)
+    # DECISION (ISSUE-2): reverse leave consume + comp-off credit from submit.
+    reverse_timesheet_ledger_effects(db, ts)
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "TS_REJECTED",
                  f"Timesheet rejected: {reason}")
     db.commit()
@@ -481,27 +490,46 @@ def delete_timesheet_attachment(
 @router.delete("/{timesheet_id}")
 def delete_timesheet(
     timesheet_id: int,
+    force: bool = False,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(get_current_user),
     _acc: CurrentUser = Depends(TS_EDIT),
 ):
-    """Hard-delete a timesheet. Blocks Approved or invoice-linked sheets."""
+    """Hard-delete a timesheet (Draft/Submitted/Approved/Rejected).
+
+    Reverses leave consume + comp-off accrual first (same as reject). A linked
+    invoice normally blocks (409). ADMIN/CEO may pass ``force=true`` to also
+    cascade-delete the linked invoice (reversing its PO consumption) in the same
+    transaction — used to clean up test data. The invoice's own hard blockers
+    (recorded payments / TDS payments / credit notes) still prevent deletion.
+    """
     from services.crm_common import commit_or_conflict
 
     ts = get_timesheet_or_404(db, timesheet_id)
     _require_owner_or(db, user, ts, "HR", "Finance", "RMG", "Sales", "Sales_Head")
-    status = ts.status.value if hasattr(ts.status, "value") else str(ts.status)
-    if status == TimesheetStatus.APPROVED.value:
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot delete: timesheet is Approved. Reject it first or leave it for audit.",
-        )
     linked = linked_invoice_for(db, ts)
     if linked is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot delete: timesheet is linked to invoice {linked.invoice_number}.",
+        # Force delete (cascade the invoice too) is allowed for Sales / Sales_Head
+        # / RMG plus Admin/CEO (Admin/CEO satisfy every gate implicitly).
+        can_force = user.is_admin or bool(
+            {"Sales", "Sales_Head", "RMG"} & set(getattr(user, "roles", []))
         )
+        if not (force and can_force):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot delete: timesheet is linked to invoice "
+                    f"{linked.invoice_number}. Delete that invoice first, or use "
+                    f"Force delete to remove both."
+                ),
+            )
+        # Force path (Admin/CEO): cascade the invoice — reverses PO consumption,
+        # still blocks on the invoice's own payments/TDS/credit notes.
+        from services.crm_delete import cascade_delete_invoice
+        cascade_delete_invoice(db, linked)
+    # DECISION (ISSUE-2): Submitted/Approved may have leave + comp-off ledger rows;
+    # reverse is idempotent for Draft/Rejected (no prior deltas).
+    reverse_timesheet_ledger_effects(db, ts)
     # Activity log has no cascade — remove manually.
     for log in db.execute(
         select(TimesheetActivityLog).where(TimesheetActivityLog.timesheet_id == ts.id)
@@ -554,9 +582,9 @@ def generate_invoice_from_timesheet(
 ):
     """Create an Invoice from an Approved timesheet (one invoice per timesheet).
 
-    sub_total comes from the invoice preview; tax uses the slab of the
-    project's active PO allocation when one exists (otherwise tax 0, no PO),
-    and PO/allocation balances are consumed exactly as in POST /api/invoices.
+    sub_total comes from the invoice preview; tax uses the KARNEX GST engine
+    (tax_invoice CGST/SGST/IGST from the customer branch), and PO/allocation
+    balances are consumed exactly as in POST /api/invoices.
     """
     ts = get_timesheet_or_404(db, timesheet_id)
     if ts.status != TimesheetStatus.APPROVED:
@@ -569,42 +597,54 @@ def generate_invoice_from_timesheet(
     preview = timesheet_invoice_preview(db, ts)  # 400s when no assignment exists
     sub_total = Decimal(str(preview["totals"]["sub_total"]))
 
-    alloc = active_po_allocation_for_project(db, ts.project_id)
+    # Explicit allocation wins; else auto-link when the customer has exactly
+    # one active, unexpired PO with balance (creates the allocation row).
+    alloc = resolve_or_create_po_allocation_for_project(db, ts.project_id)
     po = db.get(PurchaseOrder, alloc.po_id) if alloc is not None else None
     assert_po_allows_new_drawdown(po, action="generate invoice")
-    if po is not None and po.tax_slab is not None:
-        tax_amount = tax.gst_amount(sub_total, po.tax_slab)
-    else:
-        tax_amount = Decimal("0")
-    grand_total = sub_total + tax_amount
+
+    line_rows = [
+        InvoiceLine(
+            s_no=int(li.get("s_no") or i),
+            description=str(li.get("description") or ""),
+            qty=Decimal(str(li.get("total_billed_qty") or 0)),
+            rate=Decimal(str(li.get("rate_per_unit") or 0)),
+            amount=Decimal(str(li.get("amount") or 0)),
+        )
+        for i, li in enumerate(preview["line_items"], start=1)
+    ]
+    tax_amount, grand_total, _gst = karnex_gst_tax_and_grand(
+        db, po=po, project_id=ts.project_id, lines=line_rows, sub_total=sub_total,
+    )
     if po is not None and Decimal(str(po.balance_value)) < grand_total:
         raise HTTPException(status_code=400, detail="PO balance insufficient")
 
+    # Invoice is dated the day it is GENERATED (product decision 2026-07-29).
+    # Due date = invoice date + credit days parsed from the PO's payment terms
+    # ("Net 30 Days" → 30); default 30.
+    import re as _re
+    invoice_dt = date.today()
+    credit_days = 30
+    if po is not None and po.payment_terms:
+        m = _re.search(r"(\d+)", str(po.payment_terms))
+        if m:
+            credit_days = max(0, min(int(m.group(1)), 365))
+    from datetime import timedelta as _td
     invoice_number = next_sequence_number(db, Invoice, Invoice.invoice_number, "INV")
     invoice = Invoice(
         invoice_number=invoice_number,
         po_id=po.id if po is not None else None,
         project_id=ts.project_id,
         timesheet_id=ts.id,
-        invoice_date=date.today(),
-        due_date=None,
+        invoice_date=invoice_dt,
+        due_date=invoice_dt + _td(days=credit_days),
         sub_total=sub_total,
         tax_amount=tax_amount,
         grand_total=grand_total,
         paid_amount=Decimal("0"),
         balance_amount=grand_total,
         payment_status=PaymentStatus.UNPAID,
-        # Persist the preview line items as InvoiceLine rows (Tab 11).
-        lines=[
-            InvoiceLine(
-                s_no=int(li.get("s_no") or i),
-                description=str(li.get("description") or ""),
-                qty=Decimal(str(li.get("total_billed_qty") or 0)),
-                rate=Decimal(str(li.get("rate_per_unit") or 0)),
-                amount=Decimal(str(li.get("amount") or 0)),
-            )
-            for i, li in enumerate(preview["line_items"], start=1)
-        ],
+        lines=line_rows,
     )
     db.add(invoice)
     if po is not None:
@@ -764,4 +804,9 @@ def get_timesheet(
         select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
         .order_by(TimesheetEntry.entry_date)
     ).scalars().all()
-    return envelope(data=timesheet_detail_out(db, ts, entries))
+    data = timesheet_detail_out(db, ts, entries)
+    # Persist lazy same-customer branch backfill from ensure_project_branch_id.
+    project = db.get(Project, ts.project_id)
+    if project is not None and db.is_modified(project):
+        db.commit()
+    return envelope(data=data)

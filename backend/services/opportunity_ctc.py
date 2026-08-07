@@ -49,13 +49,15 @@ def calculate_billing_bases(details: dict | None) -> tuple[Decimal, Decimal | No
 
 
 def normalize_tm_billing_details(details: dict | None) -> dict:
-    """Apply displayed T&M defaults and authoritative billing-day/hour bases."""
+    """Apply T&M billable-flag / hours defaults and authoritative billing bases.
+
+    Holidays / weekoff / leave are NOT invented here — blank means 0 in
+    ``calculate_billing_bases`` (via ``_zero_when_blank``). Callers must send
+    real estimates from the form (branch-linked leave policy prefill or user input).
+    """
     out = dict(details or {})
     defaults = {
         "hours_per_day": 8,
-        "holidays": 10,
-        "weekoff": 104,
-        "leave": 24,
         "holidays_billable": False,
         "weekoff_billable": False,
         "leave_billable": False,

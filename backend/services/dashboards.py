@@ -396,3 +396,182 @@ def requirements_dashboard(db: Session) -> dict:
         "avg_days_in_stage": avg_days_in_stage,
         "positions": {"open": int(open_positions), "filled": int(filled_positions)},
     }
+
+
+# ------------------------------------------------------- interview calendar
+
+def upcoming_interview_events(db: Session, days: int = 30) -> list[dict]:
+    """Human interview rounds (L2 F2F / customer) from today forward, soonest
+    first. Undated events (free-form 'when') are included at the end."""
+    from datetime import datetime, timedelta, timezone
+
+    from models import Candidate as Cand, InterviewEvent
+
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=days)
+    rows = db.execute(
+        select(InterviewEvent, Cand)
+        .join(Cand, Cand.id == InterviewEvent.candidate_id, isouter=True)
+        .where(
+            sa.or_(
+                sa.and_(InterviewEvent.scheduled_at.isnot(None),
+                        InterviewEvent.scheduled_at >= now - timedelta(hours=12),
+                        InterviewEvent.scheduled_at <= horizon),
+                InterviewEvent.scheduled_at.is_(None),
+            )
+        )
+        .order_by(InterviewEvent.scheduled_at.asc().nullslast(), InterviewEvent.id.desc())
+        .limit(100)
+    ).all()
+    out: list[dict] = []
+    for ev, cand in rows:
+        name = (f"{cand.first_name} {cand.last_name or ''}".strip()
+                if cand else f"Candidate #{ev.candidate_id or '?'}")
+        out.append({
+            "id": ev.id,
+            "profile_id": ev.profile_id,
+            "candidate_name": name,
+            "kind": ev.kind,
+            "scheduled_at": ev.scheduled_at.isoformat() if ev.scheduled_at else None,
+            "raw_when": ev.raw_when,
+            "meeting_link": ev.meeting_link,
+            "note": ev.note,
+        })
+    return out
+
+
+# --------------------------------------------------------- bench / roll-offs
+
+def bench_rolloffs(db: Session, days: int = 60) -> list[dict]:
+    """Active project employees whose project's PO coverage ends within `days`
+    (or already ended) — the redeployment radar. Coverage = the LATEST end_date
+    across the project's POs, so renewed projects don't false-alarm."""
+    from datetime import timedelta
+
+    from models import POProjectAllocation, ProjectEmployee
+
+    today = date.today()
+    horizon = today + timedelta(days=days)
+    # Latest PO end per project (NULL end dates = open-ended → excluded).
+    po_end = (
+        select(
+            POProjectAllocation.project_id.label("project_id"),
+            func.max(PurchaseOrder.end_date).label("last_end"),
+        )
+        .join(PurchaseOrder, PurchaseOrder.id == POProjectAllocation.po_id)
+        .where(PurchaseOrder.end_date.isnot(None))
+        .group_by(POProjectAllocation.project_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(ProjectEmployee, Employee, Project, Customer.name, po_end.c.last_end)
+        .join(Employee, Employee.id == ProjectEmployee.employee_id)
+        .join(Project, Project.id == ProjectEmployee.project_id)
+        .join(Customer, Customer.id == Project.customer_id, isouter=True)
+        .join(po_end, po_end.c.project_id == ProjectEmployee.project_id)
+        .where(
+            ProjectEmployee.is_active.is_(True),
+            ProjectEmployee.is_exit.is_(False),
+            po_end.c.last_end <= horizon,
+        )
+        .order_by(po_end.c.last_end.asc())
+        .limit(100)
+    ).all()
+    out: list[dict] = []
+    for pe, emp, project, customer_name, last_end in rows:
+        days_left = (last_end - today).days if last_end else None
+        out.append({
+            "project_employee_id": pe.id,
+            "employee_id": emp.id,
+            "employee_name": f"{emp.first_name} {emp.last_name or ''}".strip(),
+            "role_title": pe.role_title,
+            "project_id": project.id,
+            "project_name": project.name,
+            "customer_name": customer_name,
+            "po_end_date": last_end.isoformat() if last_end else None,
+            "days_left": days_left,
+            "candidate_profile_id": emp.candidate_profile_id,
+        })
+    return out
+
+
+def bench_requirement_matches(db: Session, employee_id: int) -> list[dict]:
+    """Rank open requirements for a rolling-off employee using the real ATS
+    scorer over their CV (falls back to skill-name overlap without a CV)."""
+    from models import CandidateProfile as CP, CandidateSkill, RequirementSkill, Skill
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        return []
+    # Resolve the employee back to a candidate (CV + skills live there).
+    candidate = None
+    if emp.candidate_profile_id:
+        prof = db.get(CP, emp.candidate_profile_id)
+        if prof is not None:
+            from models import Candidate as Cand
+            candidate = db.get(Cand, prof.candidate_id)
+    cv_text = ""
+    if candidate is not None and candidate.cv_url:
+        try:
+            from services.resumes import extract_resume_text
+            cv_text = extract_resume_text(candidate.cv_url)
+        except Exception:
+            cv_text = ""
+    emp_skills: set[str] = set()
+    if candidate is not None:
+        emp_skills = {
+            n.lower() for n in db.execute(
+                select(Skill.name).join(CandidateSkill, CandidateSkill.skill_id == Skill.id)
+                .where(CandidateSkill.candidate_id == candidate.id)
+            ).scalars().all()
+        }
+
+    open_statuses = (
+        RequirementStatus.OPEN_FOR_SOURCING, RequirementStatus.POSTED_ON_PORTALS,
+        RequirementStatus.IN_PROGRESS,
+    )
+    reqs = db.execute(
+        select(Requirement).where(Requirement.status.in_(open_statuses))
+        .order_by(Requirement.id.desc()).limit(25)
+    ).scalars().all()
+    out: list[dict] = []
+    for req in reqs:
+        skill_rows = db.execute(
+            select(RequirementSkill, Skill.name)
+            .join(Skill, Skill.id == RequirementSkill.skill_id)
+            .where(RequirementSkill.requirement_id == req.id)
+        ).all()
+        mandatory = [name for rs, name in skill_rows if rs.is_mandatory]
+        optional = [name for rs, name in skill_rows if not rs.is_mandatory]
+        score = None
+        matched: list[str] = []
+        if cv_text and mandatory:
+            try:
+                from services.ats_scoring import score_resume_against_requirement
+                res = score_resume_against_requirement(
+                    cv_text, mandatory, optional,
+                    float(req.experience_min) if req.experience_min is not None else None,
+                    float(req.experience_max) if req.experience_max is not None else None,
+                    None, jd_text=req.rmg_jd_text,
+                )
+                score = res["ats_score"]
+                matched = res["breakdown"].get("skills_matched", [])
+            except Exception:
+                score = None
+        if score is None:
+            # Skill-name overlap fallback (no CV / unscorable requirement).
+            all_names = [n for _, n in skill_rows]
+            hits = [n for n in all_names if n.lower() in emp_skills]
+            score = round(100.0 * len(hits) / len(all_names), 1) if all_names else 0.0
+            matched = hits
+        out.append({
+            "requirement_id": req.id,
+            "req_number": req.req_number,
+            "title": req.title,
+            "status": getattr(req.status, "value", str(req.status)),
+            "match_score": score,
+            "skills_matched": matched[:10],
+            "mandatory_total": len(mandatory),
+        })
+    out.sort(key=lambda x: x["match_score"] or 0, reverse=True)
+    return out[:10]

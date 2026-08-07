@@ -71,6 +71,52 @@ def validate_document_type(db: Session, document_type_id: int) -> DocumentType:
     return doc_type
 
 
+def detach_branch_references(db: Session, branch_id: int) -> dict[str, int]:
+    """Admin/CEO force-delete helper: NULL every nullable branch_id pointing at
+    this branch so it can be removed without destroying business records.
+
+    Nothing is deleted here — contacts, opportunities, projects, POs, holidays
+    and leave policies survive, they simply lose their branch link. Branch
+    holiday-year headers cascade with the branch by FK (ON DELETE CASCADE).
+    Returns a {table: rows_detached} summary for the API response.
+    """
+    from sqlalchemy import update
+
+    from models import (
+        ContactPerson,
+        CustomerLeavePolicy,
+        Holiday,
+        Opportunity,
+        Project,
+        PurchaseOrder,
+    )
+
+    targets = [
+        ("contacts", ContactPerson.__table__, [ContactPerson.__table__.c.branch_id]),
+        ("opportunities", Opportunity.__table__, [Opportunity.__table__.c.branch_id]),
+        ("projects", Project.__table__, [Project.__table__.c.branch_id]),
+        ("purchase orders", PurchaseOrder.__table__,
+         [PurchaseOrder.__table__.c.billing_branch_id,
+          PurchaseOrder.__table__.c.delivery_branch_id]),
+        ("holidays", Holiday.__table__, [Holiday.__table__.c.branch_id]),
+        ("leave policies", CustomerLeavePolicy.__table__,
+         [CustomerLeavePolicy.__table__.c.branch_id]),
+    ]
+
+    detached: dict[str, int] = {}
+    for label, table, columns in targets:
+        rows = 0
+        for col in columns:
+            res = db.execute(
+                update(table).where(col == branch_id).values({col.name: None})
+            )
+            rows += res.rowcount or 0
+        if rows:
+            detached[label] = rows
+    db.flush()
+    return detached
+
+
 def clear_other_primaries(db: Session, customer_id: int, keep_branch_id: int | None) -> None:
     """Enforce the single-primary rule: unset is_primary on every other branch."""
     others = db.execute(
@@ -194,6 +240,8 @@ def serialize_contact(contact: ContactPerson) -> dict:
         "phone": contact.phone,
         "designation": contact.designation,
         "role": getattr(contact, "role", None),
+        "contact_priority": getattr(contact, "contact_priority", None),
+        "notification": getattr(contact, "notification", None),
         "is_hiring_manager": contact.is_hiring_manager,
         "is_active": contact.is_active,
     }

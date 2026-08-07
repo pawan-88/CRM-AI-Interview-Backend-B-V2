@@ -10,6 +10,8 @@ An empty pool / missing constraint awards its full points (nothing to fail).
 """
 from __future__ import annotations
 
+import logging
+
 import re
 
 from fastapi import HTTPException
@@ -17,7 +19,69 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models import AtsStatus, Location, Requirement, RequirementSkill, Resume, Skill
+from models.ai_links import hr_decision_label
 from services.crm_common import resolve_crm_file
+
+logger = logging.getLogger("karnex.crm.ats")
+
+#: Which OpenAI key pool the ATS resume↔JD review draws on. Its own purpose (not
+#: "eval") so scan-all bursts have their own spend line and rate limit, and can
+#: never exhaust the quota a live interview is relying on. Resolution order is
+#: OPENAI_ATS_API_KEY / OPENAI_API_KEY_ATS -> the eval key -> OPENAI_API_KEY.
+ATS_OPENAI_PURPOSE = "ats"
+
+
+def _ai_semantic_review(jd_text: str | None, mandatory: list[str], optional: list[str],
+                        resume_text: str) -> dict | None:
+    """OpenAI semantic assessment of resume↔role fit (returns None when no key /
+    on any failure — the deterministic score always stands on its own).
+
+    Unlike keyword matching, this understands synonyms, related tech and context
+    (e.g. 'AUTOSAR stack work' implies embedded C), so the final score reflects
+    real fit rather than literal word overlap."""
+    try:
+        from openai_client import get_openai_client, openai_key_configured
+        if not openai_key_configured(ATS_OPENAI_PURPOSE):
+            # Surface WHY rather than silently returning the keyword-only score.
+            # Without this the blend just vanishes and the number looks wrong with
+            # no explanation anywhere in the UI.
+            return {"unavailable": "No OpenAI key configured for ATS "
+                                   "(set OPENAI_API_KEY_ATS) — score is "
+                                   "keyword-only, which under-rates candidates "
+                                   "whose wording differs from the JD."}
+        import json as _json
+        skills_line = ", ".join(mandatory) or "—"
+        opt_line = ", ".join(optional) or "—"
+        prompt = (
+            "You are a strict technical recruiter. Assess how well the RESUME fits the ROLE.\n"
+            f"Required skills: {skills_line}\nNice-to-have skills: {opt_line}\n"
+            + (f"Job description:\n{(jd_text or '')[:4000]}\n" if (jd_text or '').strip() else "")
+            + f"\nRESUME:\n{resume_text[:9000]}\n\n"
+            "Consider synonyms, related technologies and actual project evidence — not just "
+            "literal keyword matches. Do not reward keyword stuffing. Return ONLY JSON: "
+            '{"match_percent": 0-100, "summary": "2-3 sentence fit assessment", '
+            '"strengths": ["..."], "gaps": ["..."]}'
+        )
+        res = get_openai_client(ATS_OPENAI_PURPOSE).chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        data = _json.loads(res.choices[0].message.content or "{}")
+        pct = float(data.get("match_percent"))
+        if not (0 <= pct <= 100):
+            return {"unavailable": f"AI returned an out-of-range score ({pct})"}
+        return {
+            "match_percent": round(pct, 1),
+            "summary": str(data.get("summary") or "").strip()[:1000],
+            "strengths": [str(s).strip() for s in (data.get("strengths") or []) if str(s).strip()][:8],
+            "gaps": [str(s).strip() for s in (data.get("gaps") or []) if str(s).strip()][:8],
+            "model": "gpt-4o-mini",
+        }
+    except Exception as exc:  # noqa: BLE001 - never block scoring on the AI call
+        logger.warning("ATS semantic review failed: %s", exc)
+        return {"unavailable": f"AI review failed: {type(exc).__name__}: {exc}"[:300]}
 
 CRM_FILES_PREFIX = "/api/crm-files/"
 
@@ -117,6 +181,36 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
         except Exception:
             access_by_token[token] = ""
 
+    # Pipeline status of each linked profile — lets the requirement's Resumes tab
+    # surface "RMG review needed" (and the RMG decision actions) per row.
+    from models import CandidateProfile, CandidateProfileActivityLog, PipelineStatus
+    from services.crm_common import log_activity as _log_activity
+    prof_ids = {link.profile_id for link in latest.values() if link.profile_id}
+    passed_profiles = {link.profile_id for link in latest.values()
+                       if link.profile_id and link.result == "Passed"}
+    status_by_profile: dict[int, str] = {}
+    if prof_ids:
+        healed = False
+        for p in db.execute(
+            select(CandidateProfile).where(CandidateProfile.id.in_(prof_ids))
+        ).scalars().all():
+            status = getattr(p.pipeline_status, "value", str(p.pipeline_status))
+            # Self-heal profiles whose L1 passed before the RMG hand-off existed.
+            if status == PipelineStatus.TECHNICAL_SCREENING.value and p.id in passed_profiles:
+                p.pipeline_status = PipelineStatus.RMG_REVIEW
+                status = PipelineStatus.RMG_REVIEW.value
+                # Automatic self-heal: no acting user — log_activity falls back
+                # to the system user (never a candidate id, which is a
+                # different table and corrupts the audit trail).
+                _log_activity(db, CandidateProfileActivityLog, "profile_id", p.id, None,
+                              "STATUS_CHANGE",
+                              "Technical_Screening -> RMG_Review: AI L1 already passed — "
+                              "auto-forwarded for RMG review")
+                healed = True
+            status_by_profile[p.id] = status
+        if healed:
+            db.commit()
+
     for d, r in zip(data, rows):
         link = latest.get(r.id)
         if link is None:
@@ -125,8 +219,17 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
             float(link.overall_score_percent) if link.overall_score_percent is not None else None
         )
         d["ai_interview_result"] = link.result
+        # The recruiter's override, when they disagreed with the AI verdict.
+        # Without these the Resumes tab kept showing the raw score-threshold
+        # result, so a candidate already marked Selected still read "Failed
+        # 57.2%" here — the same mismatch that was fixed on the profile page.
+        d["ai_hr_decision"] = link.hr_decision
+        d["ai_hr_decision_label"] = hr_decision_label(link.hr_decision)
+        d["ai_effective_result"] = link.effective_result
+        d["ai_is_overridden"] = bool(link.hr_decision) and link.effective_result != link.result
         d["ai_interview_record_id"] = link.interview_record_id
         d["profile_id"] = link.profile_id
+        d["profile_pipeline_status"] = status_by_profile.get(link.profile_id)
         email = (r.email or "").strip().lower() or emails_by_cand.get(link.candidate_id, "")
         d["ai_report_link"] = (
             f"/admin?view=candidateReport&cid={email}&iid={link.interview_record_id}"
@@ -202,6 +305,26 @@ def _detect_experience_years(text: str) -> float | None:
     return max(found) if found else None
 
 
+#: Above this word-overlap the "resume" is really the JD (or a copy of it).
+_JD_SELF_MATCH_THRESHOLD = 0.85
+
+
+def _texts_are_near_identical(a: str, b: str) -> bool:
+    """Jaccard overlap on the distinct words of two documents.
+
+    Used to catch the case where the JD itself was uploaded as the resume. A
+    genuine CV shares maybe 10-25% of its vocabulary with the JD; the JD shares
+    ~100% with itself, and a lightly-edited copy still shares most of it.
+    """
+    def bag(t: str) -> set[str]:
+        return {w for w in re.findall(r"[a-z0-9]+", (t or "").lower()) if len(w) > 2}
+
+    wa, wb = bag(a), bag(b)
+    if len(wa) < 20 or len(wb) < 20:
+        return False
+    return len(wa & wb) / len(wa | wb) >= _JD_SELF_MATCH_THRESHOLD
+
+
 def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id: int) -> dict:
     """Score a resume against its requirement; mutates the resume row (caller commits).
 
@@ -219,6 +342,16 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
     text = extract_resume_text(resume.resume_file_url)  # raises 422 on empty / image-only
     is_resume, signals = looks_like_resume(text)
     if not is_resume:
+        if signals.get("looks_like_job_description"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "This file looks like a job description, not a resume "
+                    f"(found: {', '.join(signals.get('jd_markers') or [])}). "
+                    "Scoring a JD against its own requirement returns a near-perfect "
+                    "score that means nothing. Upload the candidate's CV instead."
+                ),
+            )
         raise HTTPException(
             status_code=422,
             detail="Document does not appear to be a resume (no contact details or résumé sections found).",
@@ -253,11 +386,26 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
             continue
     jd_text = "\n\n".join(jd_parts).strip() or None
 
+    # Belt and braces: even if the JD sneaks past looks_like_resume, refuse to
+    # score a document that IS the job description. Without this the candidate
+    # scores ~100 for having uploaded the wrong file.
+    if jd_text and _texts_are_near_identical(text, jd_text):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The uploaded file is (almost) the same document as this "
+                "requirement's job description, so it cannot be scored against "
+                "it — the result would be a meaningless near-100. Please upload "
+                "the candidate's CV."
+            ),
+        )
+
     try:
         result = score_resume_against_requirement(
             text, mandatory, optional,
             _num(requirement.experience_min), _num(requirement.experience_max), city,
             jd_text=jd_text,
+            weights=getattr(requirement, "ats_weights", None),
         )
     except AtsConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -267,6 +415,31 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
     breakdown["parse_confidence"] = "high" if signals["word_count"] >= 120 else "low"
     if jd_text:
         breakdown["jd_text_preview"] = jd_text[:500]
+
+    # OpenAI semantic review — blends real understanding (synonyms, related tech,
+    # project evidence) with the deterministic keyword score. Deterministic-only
+    # when no key is configured or the call fails.
+    ai = _ai_semantic_review(jd_text, mandatory, optional, text)
+    if ai is not None and ai.get("unavailable"):
+        # Record the reason so the breakdown can say "keyword-only, because ..."
+        breakdown["ai_review"] = ai
+        details = breakdown.get("score_details") or {}
+        details["blend"] = "keyword/criteria only — AI review unavailable"
+        details["ai_unavailable_reason"] = ai["unavailable"]
+        breakdown["score_details"] = details
+    elif ai is not None:
+        deterministic = float(total)
+        blended = round(0.6 * deterministic + 0.4 * ai["match_percent"], 2)
+        # Honest cap preserved: only a full required-skill match may reach 100.
+        details = breakdown.get("score_details") or {}
+        if not details.get("all_required_matched") and blended >= 100.0:
+            blended = 99.0
+        breakdown["ai_review"] = ai
+        details["deterministic_score"] = deterministic
+        details["ai_semantic_score"] = ai["match_percent"]
+        details["blend"] = "60% keyword/criteria + 40% AI semantic"
+        breakdown["score_details"] = details
+        total = blended
 
     resume.ats_score = total
     resume.ats_score_breakdown = breakdown

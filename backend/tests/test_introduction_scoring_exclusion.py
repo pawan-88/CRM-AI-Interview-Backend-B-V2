@@ -42,7 +42,7 @@ def test_per_question_batch_excludes_warmup_text(monkeypatch):
 
 
 def test_merge_mean_ignores_introduction_when_present(monkeypatch):
-    def _fake_batch(questions, answers, model="gpt-4o-mini", *, meta=None):
+    def _fake_batch(questions, answers, model="gpt-4o-mini", *, meta=None, **_kw):
         return [
             {"question_index": 1, "score": 0.0, "feedback": "Introduction warmup (not counted toward overall score)."},
             {"question_index": 2, "score": 8.0, "strengths": [], "weaknesses": [], "feedback": "Good"},

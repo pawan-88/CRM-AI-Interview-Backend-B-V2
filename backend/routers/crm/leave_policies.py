@@ -18,6 +18,7 @@ from models import Customer, CustomerBranch, CustomerLeavePolicy, LeaveCreditCon
 from schemas.common import envelope
 from schemas.leave import (
     CustomerLeavePolicyCreate, CustomerLeavePolicyUpdate, LeaveCreditConceptIn,
+    apply_leave_expire_timing_consistency,
 )
 from services.crm_common import paginate, to_dict
 
@@ -115,6 +116,7 @@ def create_customer_leave_policy(
             detail="A leave policy for this customer/branch/leave type already exists",
         )
     data = body.model_dump(exclude={"concepts"})
+    apply_leave_expire_timing_consistency(data)
     policy = CustomerLeavePolicy(**data)
     db.add(policy)
     db.flush()
@@ -152,6 +154,7 @@ def update_customer_leave_policy(
             status_code=409,
             detail="A leave policy for this customer/branch/leave type already exists",
         )
+    apply_leave_expire_timing_consistency(data, existing_expire=policy.leave_expire)
     for field, value in data.items():
         setattr(policy, field, value)
     db.commit()

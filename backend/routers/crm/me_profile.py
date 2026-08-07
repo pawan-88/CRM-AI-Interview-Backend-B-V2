@@ -124,9 +124,15 @@ def upload_avatar(
 ):
     filename = (file.filename or "").lower()
     ctype = (file.content_type or "").lower()
-    if ctype not in _AVATAR_TYPES and not any(filename.endswith(e) for e in _AVATAR_EXTS):
+    # BOTH must pass. With `and` (the old test) it was enough to satisfy either,
+    # so `Content-Type: image/png` + `filename="x.html"` slipped through and was
+    # stored as .html — then served inline from the app origin as stored XSS.
+    if ctype not in _AVATAR_TYPES or not any(filename.endswith(e) for e in _AVATAR_EXTS):
         raise HTTPException(status_code=400, detail="Avatar must be a JPG, PNG or WEBP image")
     data = file.file.read()
+    # Trust the bytes, not the headers: both of the above are attacker-controlled.
+    if not _looks_like_image(data):
+        raise HTTPException(status_code=400, detail="That file is not a valid image")
     if len(data) > _MAX_AVATAR_BYTES:
         raise HTTPException(status_code=400, detail="Image is larger than 5 MB")
     if not data:
@@ -143,6 +149,27 @@ def upload_avatar(
     return envelope({"avatar_url": public_url}, message="Avatar updated")
 
 
+
+#: Extension -> the media type we will serve it as. Anything outside this map is
+#: refused rather than guessed.
+_AVATAR_MEDIA_BY_EXT = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".webp": "image/webp",
+}
+
+#: Magic bytes for the formats we accept.
+_IMAGE_SIGNATURES = (
+    b"\xff\xd8\xff",       # jpeg
+    b"\x89PNG\r\n\x1a\n",  # png
+)
+
+
+def _looks_like_image(data: bytes) -> bool:
+    if data.startswith(_IMAGE_SIGNATURES):
+        return True
+    # webp: "RIFF....WEBP"
+    return len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
 @router.get("/avatar-file/{rel_path:path}")
 def serve_avatar(rel_path: str):
     """Public avatar file server (no auth): restricted to the avatars/ subdir with
@@ -152,7 +179,17 @@ def serve_avatar(rel_path: str):
     path = resolve_crm_file(rel_path)
     if path is None:
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path)
+    # Pin the type from our own allowlist. Letting Starlette guess meant an
+    # .html upload was returned as text/html and executed on this origin.
+    media_type = _AVATAR_MEDIA_BY_EXT.get(path.suffix.lower())
+    if media_type is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"X-Content-Type-Options": "nosniff",
+                 "Content-Security-Policy": "default-src 'none'; img-src 'self'"},
+    )
 
 
 @router.delete("/avatar")

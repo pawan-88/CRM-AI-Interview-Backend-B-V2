@@ -280,12 +280,41 @@ def test_delete_timesheet_draft_ok(client):
     assert s.get(Timesheet, ts.id) is None
 
 
-def test_delete_timesheet_approved_blocked(client):
+def test_delete_timesheet_approved_ok(client):
+    """Approved (no invoice) may be deleted; ledger reverse runs first."""
     s = client._session
     _, _, _, _, _, ts = _seed_project(s, with_pe=True, with_ts=True, ts_status=TimesheetStatus.APPROVED)
+    ts_id = ts.id
+    r = client.delete(f"/api/timesheets/{ts_id}")
+    assert r.status_code == 200, r.text
+    assert s.get(Timesheet, ts_id) is None
+
+
+def test_delete_timesheet_submitted_ok(client):
+    s = client._session
+    _, _, _, _, _, ts = _seed_project(s, with_pe=True, with_ts=True, ts_status=TimesheetStatus.SUBMITTED)
+    ts_id = ts.id
+    r = client.delete(f"/api/timesheets/{ts_id}")
+    assert r.status_code == 200, r.text
+    assert s.get(Timesheet, ts_id) is None
+
+
+def test_delete_timesheet_invoice_linked_blocked(client):
+    s = client._session
+    _, _, _, proj, _, ts = _seed_project(s, with_pe=True, with_ts=True, ts_status=TimesheetStatus.APPROVED)
+    inv = Invoice(
+        invoice_number="INV-TS-DEL-1", project_id=proj.id, timesheet_id=ts.id,
+        invoice_date=date(2026, 1, 1),
+        sub_total=D("500"), tax_amount=D("90"), grand_total=D("590"),
+        paid_amount=D("0"), balance_amount=D("590"),
+        payment_status=PaymentStatus.UNPAID,
+    )
+    s.add(inv)
+    s.commit()
     r = client.delete(f"/api/timesheets/{ts.id}")
     assert r.status_code == 409
-    assert "approved" in r.json()["detail"].lower()
+    assert "invoice" in r.json()["detail"].lower()
+    assert s.get(Timesheet, ts.id) is not None
 
 
 def test_delete_leave_application_pending_ok(client):

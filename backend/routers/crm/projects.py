@@ -17,6 +17,7 @@ from models import (
     ProjectEmployeeRate, ProjectLeavePolicy, ProjectStatus, Timesheet, TimesheetStatus,
 )
 from schemas.common import envelope
+from schemas.leave import apply_leave_expire_timing_consistency
 from schemas.projects import (
     CommMatrixIn, ProjectCreate, ProjectEmployeeIn, ProjectEmployeeLeaveDetailUpdate,
     ProjectEmployeeRateIn, ProjectEmployeeRateUpdate, ProjectEmployeeUpdate,
@@ -70,6 +71,7 @@ def _apply_leave_policy_update(
                 status_code=409,
                 detail="A leave policy for this project/leave type already exists",
             )
+    apply_leave_expire_timing_consistency(changes, existing_expire=policy.leave_expire)
     for field, value in changes.items():
         setattr(policy, field, value)
     db.commit()
@@ -144,7 +146,12 @@ def create_project(
     else:
         opp = db.get(Opportunity, body.opportunity_id)
         if opp is not None and opp.branch_id is not None:
-            resolved_branch_id = opp.branch_id
+            opp_branch = db.get(CustomerBranch, opp.branch_id)
+            # Never copy a foreign-customer opportunity.branch_id onto the project.
+            if opp_branch is not None and opp_branch.customer_id == body.customer_id:
+                resolved_branch_id = opp.branch_id
+            else:
+                resolved_branch_id = None
     # Apply only fields the client sent so unset policy columns can seed from branch.
     provided = body.model_fields_set
     project = Project(
@@ -648,12 +655,17 @@ def update_project(
         )
     for field, value in changes.items():
         setattr(project, field, value)
-    # If opportunity changed and branch_id was not explicitly set, refresh from opp.
+    # If opportunity changed and branch_id was not explicitly set, adopt opp.branch_id
+    # only when same-customer. Never clear an existing non-null project.branch_id
+    # when the new opportunity points at a foreign/missing branch.
     if "opportunity_id" in changes and "branch_id" not in changes:
         from models import Opportunity
-        opp = db.get(Opportunity, project.opportunity_id)
+        opp = db.get(Opportunity, project.opportunity_id) if project.opportunity_id else None
         if opp is not None and opp.branch_id is not None:
-            project.branch_id = opp.branch_id
+            opp_branch = db.get(CustomerBranch, opp.branch_id)
+            if opp_branch is not None and opp_branch.customer_id == project.customer_id:
+                project.branch_id = opp.branch_id
+            # else: keep existing project.branch_id (do not null it)
     db.commit()
     db.refresh(project)
     return envelope(data=project_out(project), message="Project updated")
@@ -787,10 +799,11 @@ def create_project_leave_policy(
             ProjectLeavePolicy.leave_type_id == body.leave_type_id,
         ).limit(1)
     ).scalars().first()
+    data = apply_leave_expire_timing_consistency(body.model_dump())
     if dup is not None:
         if not dup.is_active:
             # Reactivate soft-deleted row with new values
-            for field, value in body.model_dump().items():
+            for field, value in data.items():
                 setattr(dup, field, value)
             dup.is_active = True
             db.commit()
@@ -801,7 +814,7 @@ def create_project_leave_policy(
             status_code=409,
             detail="A leave policy for this project/leave type already exists",
         )
-    policy = ProjectLeavePolicy(project_id=project_id, **body.model_dump())
+    policy = ProjectLeavePolicy(project_id=project_id, **data)
     db.add(policy)
     db.commit()
     db.refresh(policy)

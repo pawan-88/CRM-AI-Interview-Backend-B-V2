@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 
 from models.base import Base
 
@@ -111,3 +112,33 @@ class AppSetting(Base):
     key = sa.Column(sa.String(120), primary_key=True)
     value = sa.Column(sa.String(255), nullable=False)
     description = sa.Column(sa.String(255), nullable=True)
+
+
+class UserTablePreference(Base):
+    """A user's saved layout for one list screen.
+
+    `config` holds the whole layout so adding a customisable table needs no
+    migration:
+
+        {"columns": [{"key": "candidate_name", "visible": true}, ...],
+         "sort":    [{"by": "customer", "dir": "asc"}, ...]}
+
+    Column ORDER is the array order. Sort is a list because the UI offers
+    Excel-style multi-level sort (first key wins, later keys break ties).
+    """
+
+    __tablename__ = "user_table_preferences"
+    id = sa.Column(sa.Integer, primary_key=True)
+    user_id = sa.Column(sa.Integer,
+                        sa.ForeignKey("registration_data.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    table_key = sa.Column(sa.String(64), nullable=False)
+    config = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    created_at = sa.Column(sa.DateTime(timezone=True),
+                           server_default=sa.func.now(), nullable=False)
+    updated_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(),
+                           onupdate=sa.func.now(), nullable=False)
+
+    __table_args__ = (
+        sa.UniqueConstraint("user_id", "table_key", name="uq_user_table_preference"),
+    )

@@ -100,6 +100,10 @@ class ProjectLeavePolicy(Base):
     leave_credit_balance = sa.Column(sa.Numeric(5, 2), nullable=False, server_default="0")
     initial_credit_balance = sa.Column(sa.Numeric(5, 2), nullable=False, server_default="0")
     leave_expire = sa.Column(sa.String(40), nullable=False, server_default="Annually")
+    # Start_Of_Period | End_Of_Period — when the cycle credit is granted / when
+    # the unused remainder lapses (mirrors customer_leave_policies).
+    leave_credit_timing = sa.Column(sa.String(24), nullable=True)
+    leave_expire_timing = sa.Column(sa.String(24), nullable=True)
     is_max_limit = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     maximum_carry_forward = sa.Column(sa.Integer, nullable=False, server_default="0")
     effective_date = sa.Column(sa.Date, nullable=True)
@@ -154,6 +158,12 @@ class ProjectEmployeeLeaveDetail(Base):
     leave_type_id = sa.Column(sa.Integer, sa.ForeignKey("leave_policy_types.id"), nullable=False)
     customer_leave_policy_id = sa.Column(sa.Integer, sa.ForeignKey("customer_leave_policies.id"),
                                          nullable=True)
+    # Set when this row was seeded from a PROJECT-level override (project wins
+    # over branch/customer in the crediting chain). Exactly one of
+    # project_leave_policy_id / customer_leave_policy_id is set per row.
+    project_leave_policy_id = sa.Column(sa.Integer,
+                                        sa.ForeignKey("project_leave_policies.id"),
+                                        nullable=True)
     initial_balance = sa.Column(sa.Numeric(5, 2), nullable=False, server_default="0")
     opening_balance = sa.Column(sa.Numeric(5, 2), nullable=False, server_default="0")
     leave_accrual = sa.Column(sa.Numeric(5, 2), nullable=False, server_default="0")
@@ -165,6 +175,7 @@ class ProjectEmployeeLeaveDetail(Base):
     project_employee = relationship("ProjectEmployee", back_populates="leave_details")
     leave_type = relationship("LeavePolicyType")
     customer_leave_policy = relationship("CustomerLeavePolicy")
+    project_leave_policy = relationship("ProjectLeavePolicy")
 
 
 class ProjectEmployeeRate(Base):

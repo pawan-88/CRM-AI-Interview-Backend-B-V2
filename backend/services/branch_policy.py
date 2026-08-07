@@ -205,6 +205,9 @@ _EFFECTIVE_FIELDS: tuple[tuple[str, str, str | None, object], ...] = (
     ("billing_type", "billing_type", "billing_type", None),
     # billing_frequency has no customer-level counterpart — branch value or null.
     ("billing_frequency", "billing_frequency", None, None),
+    # Contractual monthly hours cap (branch Billing Properties) — consumed by the
+    # New Opportunity CTC slab so projected revenue never exceeds the cap.
+    ("max_billable_hours_month", "max_billable_hours_per_month", None, None),
 )
 
 _BOOL_KEYS = frozenset(
@@ -251,11 +254,14 @@ def effective_customer_branch_policy(db: Session, branch: CustomerBranch) -> dic
     # BranchHolidayYear rows are per-year headers, so "today's year" is used).
     # Calendar membership mirrors services.project_employees: branch-specific
     # rows OR customer-wide rows (branch NULL) OR global rows (customer NULL).
-    # One COUNT query. Blank (null) when zero — same convention as
-    # branch_holiday_years' derived Holiday Count.
+    # COUNT DISTINCT DATES, not rows: the same date often exists both as a
+    # global National row AND inside the branch calendar (e.g. Independence
+    # Day) — the timesheet deducts by distinct dates (a date SET), so a
+    # double-counted date would inflate this to 11 when the calendar has 10.
+    # Blank (null) when zero — same convention as branch_holiday_years' count.
     holiday_year = date.today().year
     holidays_count = int(db.execute(
-        select(func.count(Holiday.id)).where(
+        select(func.count(func.distinct(Holiday.holiday_date))).where(
             Holiday.is_active.is_(True),
             Holiday.year == holiday_year,
             or_(
@@ -296,12 +302,55 @@ def effective_customer_branch_policy(db: Session, branch: CustomerBranch) -> dic
             return None
         return "branch" if any(p.branch_id is not None for p in pols) else "customer"
 
+    def _annual_leave(p) -> Decimal:
+        """Annual leave-day entitlement for ONE policy, mirroring the APPLIED
+        computation in services.project_employees (so the estimate matches what
+        is actually credited):
+          One_Time          → initial + period   (upfront, once)
+          Monthly           → period × 12 + initial   (period = per-month credit)
+          Yearly/Quarterly  → period + initial    (period is already the yearly amount)
+        `period` = leave_credit_balance, `initial` = initial_credit_balance.
+        """
+        ct = (p.leave_credit_type or "Monthly")
+        period = Decimal(str(p.leave_credit_balance or 0))
+        initial = Decimal(str(p.initial_credit_balance or 0))
+        if ct == "One_Time":
+            return initial + period
+        if ct == "Monthly":
+            return period * Decimal(12) + initial
+        return period + initial
+
     picked = [p for p, _ in chosen.values()]
     data["leave_total"] = (
-        float(sum(Decimal(str(p.leave_credit_balance or 0)) for p in picked))
+        float(sum(_annual_leave(p) for p in picked))
         if picked else None
     )
     sources["leave_total"] = _agg_source(picked)
+
+    # Strict branch link: at least one active leave policy row with THIS branch_id.
+    # New Opportunity Leave & Holiday estimates use this — customer-wide / global
+    # calendars alone must not invent Holidays/Leave/Weekoff on the form.
+    branch_linked = [p for p in picked if p.branch_id is not None]
+    data["has_branch_leave_policy"] = bool(branch_linked)
+    sources["has_branch_leave_policy"] = "branch" if branch_linked else None
+    data["branch_leave_total"] = (
+        float(sum(_annual_leave(p) for p in branch_linked))
+        if branch_linked else None
+    )
+    sources["branch_leave_total"] = "branch" if branch_linked else None
+
+    # Holidays that belong to THIS branch calendar only (not customer-wide / global).
+    branch_holidays_count = int(db.execute(
+        select(func.count(func.distinct(Holiday.holiday_date))).where(
+            Holiday.is_active.is_(True),
+            Holiday.year == holiday_year,
+            Holiday.branch_id == branch.id,
+        )
+    ).scalar() or 0)
+    data["branch_holidays_count"] = (
+        branch_holidays_count if branch_holidays_count > 0 else None
+    )
+    sources["branch_holidays_count"] = "branch" if branch_holidays_count > 0 else None
 
     monthly = [p for p in picked if p.leave_credit_type == "Monthly"]
     data["credit_leave_monthly"] = (

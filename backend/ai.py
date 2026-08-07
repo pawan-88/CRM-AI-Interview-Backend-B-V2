@@ -113,7 +113,13 @@ def _meaningful_tokens(text: str) -> set[str]:
         "of", "in", "on", "for", "to", "and", "or", "with", "about", "explain", "describe",
         "tell", "define", "difference", "between", "please", "give", "example", "examples",
     }
-    return {t for t in _normalize_eval_text(text).split() if len(t) > 2 and t not in stop}
+    # Numeric tokens (e.g. "64", "8", "500") are kept regardless of length — a
+    # number is frequently THE answer (e.g. "max payload in CAN FD is 64 bytes"),
+    # so dropping it made correct factual answers look like the question echoed back.
+    return {
+        t for t in _normalize_eval_text(text).split()
+        if (len(t) > 2 or t.isdigit()) and t not in stop
+    }
 
 
 def answer_echoes_question(question: str, answer: str) -> tuple[bool, str]:
@@ -206,7 +212,10 @@ def answer_is_incomplete(answer: str) -> tuple[bool, str]:
     if not a:
         return True, "Empty answer."
     words = _normalize_eval_text(a).split()
-    if len(words) < 4:
+    # A numeric fact ("64 bytes", "8 nodes") is a substantive answer even when
+    # terse, so don't treat short numeric answers as incomplete.
+    has_number = any(ch.isdigit() for ch in a)
+    if len(words) < 4 and not has_number:
         return True, "Incomplete answer — too few words to constitute an explanation."
     dangling = (
         " of",
@@ -226,8 +235,10 @@ def answer_is_incomplete(answer: str) -> tuple[bool, str]:
     low = a.lower().rstrip()
     if any(low.endswith(d) for d in dangling):
         return True, "Incomplete answer — sentence appears unfinished."
-    if not re.search(r"[.!?]\s*$", a) and len(words) < 10:
-        return True, "Incomplete answer — response ends abruptly without a complete thought."
+    # Missing terminal punctuation is NOT treated as incomplete: typed and
+    # transcribed answers routinely omit it, and the dangling-word check above
+    # already flags genuinely unfinished sentences. (Previously this zeroed valid
+    # short answers like "CAN FD supports up to 64 bytes of payload".)
     return False, ""
 
 
@@ -657,12 +668,16 @@ def answer_turn_is_substantive(answer: Optional[str], *, min_chars: int | None =
     s = (answer or "").strip()
     if not s or s in ("---", "—", "…", "...", "--", "–"):
         return False
-    if len(s) < mc:
-        return False
     low = s.lower()
     if low in _TRIVIAL_ANSWERS:
         return False
-    if len(re.sub(r"[\W_]+", "", low)) < max(6, mc // 3):
+    # A terse numeric/factual answer ("64 bytes", "8 nodes") is substantive — a
+    # number is frequently the exact correct answer — so exempt it from the raw
+    # length floors (blank / trivial answers are already rejected above).
+    has_number = any(ch.isdigit() for ch in s)
+    if len(s) < mc and not has_number:
+        return False
+    if len(re.sub(r"[\W_]+", "", low)) < max(6, mc // 3) and not has_number:
         return False
     return True
 
@@ -1149,6 +1164,7 @@ def evaluate_per_question_interview_batch(
     model: str = "gpt-4o-mini",
     *,
     meta: dict | None = None,
+    assess_communication: bool = True,
 ) -> List[dict]:
     """
     Per-question scores for the full session list (UI alignment).
@@ -1236,7 +1252,8 @@ def evaluate_per_question_interview_batch(
         ca = [t[2] for t in block]
         idxs = [t[0] for t in block]
         part = _evaluate_per_question_chunk_openai_indexed(
-            cq, ca, idxs, model=model, role_hint=_role_hint_from_meta(meta)
+            cq, ca, idxs, model=model, role_hint=_role_hint_from_meta(meta),
+            assess_communication=assess_communication,
         )
         if len(part) != len(block):
             for gi, q, a in block:
@@ -1265,6 +1282,7 @@ def _evaluate_per_question_chunk_openai_indexed(
     model: str,
     *,
     role_hint: str = "",
+    assess_communication: bool = True,
 ) -> List[dict]:
     """Score a chunk of answers; ``zero_based_indices[k]`` is the session index for qs[k]/ans[k]."""
     if len(qs) != len(ans) or len(qs) != len(zero_based_indices):
@@ -1284,6 +1302,29 @@ def _evaluate_per_question_chunk_openai_indexed(
         if role_ctx
         else "Infer role context from each question (e.g. Android, CAN bus, Java, Python).\n"
     )
+    # When the template says communication is not a requirement for this role,
+    # it must not sit at 10% of the technical score either — otherwise a
+    # "technical only" report is still quietly marking the candidate on how they
+    # speak. That 10% is redistributed to technical accuracy and completeness,
+    # which is what the toggle is asking the interview to focus on.
+    if assess_communication:
+        comm_step = "Step 6: Evaluate communication quality and confidence signals.\n"
+        weight_line = (
+            "  Question Relevance 30% + Technical Accuracy 30% + Completeness 20% + "
+            "Practical Knowledge 10% + Communication 10%.\n"
+        )
+    else:
+        comm_step = (
+            "Step 6: Do NOT assess communication, fluency, articulation or delivery. "
+            "This role is assessed on technical substance only — judge WHAT the candidate "
+            "said, never HOW they said it. Do not penalise broken grammar, hesitation, "
+            "accent, or an awkward phrasing when the technical content is correct.\n"
+        )
+        weight_line = (
+            "  Question Relevance 30% + Technical Accuracy 35% + Completeness 25% + "
+            "Practical Knowledge 10%. Communication is NOT scored.\n"
+        )
+
     user = (
         "You are an experienced hiring manager reviewing technical interview answers. "
         "For EACH item produce a professional assessment.\n"
@@ -1294,7 +1335,7 @@ def _evaluate_per_question_chunk_openai_indexed(
         "Step 3: Evaluate technical correctness.\n"
         "Step 4: Evaluate completeness (unfinished/partial sentences score 0-0.5).\n"
         "Step 5: Evaluate practical knowledge and depth.\n"
-        "Step 6: Evaluate communication quality and confidence signals.\n"
+        f"{comm_step}"
         "Step 7: Never invent strengths — only list concepts the candidate actually explained correctly. "
         "If score is 0 or no real strengths, set correct_concepts to [] and strengths to "
         "[\"No significant technical strengths identified.\"].\n"
@@ -1303,8 +1344,7 @@ def _evaluate_per_question_chunk_openai_indexed(
         "do NOT copy or paraphrase the candidate's answer.\n"
         "Step 10: Provide 2-4 manager follow-up questions to probe gaps.\n"
         "Weighted score formula (0-10, one decimal allowed):\n"
-        "  Question Relevance 30% + Technical Accuracy 30% + Completeness 20% + "
-        "Practical Knowledge 10% + Communication 10%.\n"
+        f"{weight_line}"
         "Question repetition or keyword-only answers without explanation MUST score 0.\n"
         "Return ONLY JSON with this schema per item:\n"
         "{\"items\":[{\"i\":N,\"score\":0,\"overall_rating\":0,\"summary\":\"2-4 line evaluation summary\","
@@ -1387,6 +1427,7 @@ def merge_per_question_eval_into_report(
     model: str,
     *,
     session_meta: dict | None = None,
+    assess_communication: bool = True,
 ) -> dict:
     """
     Final validation pass: OpenAI per-question scores drive technical / problem-solving
@@ -1397,7 +1438,10 @@ def merge_per_question_eval_into_report(
     Unattempted pool questions are ignored in the denominator; per-question rows for
     the full session are unchanged for display.
     """
-    rows = evaluate_per_question_interview_batch(questions, answers, model=model, meta=session_meta)
+    rows = evaluate_per_question_interview_batch(
+        questions, answers, model=model, meta=session_meta,
+        assess_communication=assess_communication,
+    )
     out = dict(result) if isinstance(result, dict) else {}
     n = len(rows)
     if n == 0:
@@ -1549,6 +1593,43 @@ def synthesize_speech_bytes(
         input=content,
     ) as response:
         return response.read()
+
+
+#: Bytes per chunk when relaying TTS audio to the browser. 8 KB of MP3 is roughly
+#: half a second of speech at OpenAI's default bitrate — small enough that the
+#: first chunk arrives almost immediately, large enough to avoid syscall churn.
+TTS_STREAM_CHUNK_BYTES = 8192
+
+
+def stream_speech_bytes(
+    text: str,
+    voice: str = "nova",
+    model: str = "gpt-4o-mini-tts",
+):
+    """Yield TTS audio in chunks as OpenAI produces it.
+
+    `synthesize_speech_bytes` above calls `.read()`, which waits for the ENTIRE
+    MP3 before returning — so the candidate hears nothing until the last byte of
+    a whole spoken question has been generated, transferred to us, and then
+    transferred again to them. On a 25-word question that is a two-to-three
+    second silence before every single question.
+
+    Streaming lets the browser start playing while the rest is still arriving.
+    Kept as a separate function rather than changing the one above, because the
+    prefetch path genuinely does want the complete blob in one piece.
+    """
+    content = " ".join((text or "").split()).strip()
+    if not content:
+        return
+    client = _client("tts")
+    with client.audio.speech.with_streaming_response.create(
+        model=model,
+        voice=voice,
+        input=content,
+    ) as response:
+        for chunk in response.iter_bytes(chunk_size=TTS_STREAM_CHUNK_BYTES):
+            if chunk:
+                yield chunk
 
 
 def followup_is_duplicate(new_q: str, prior: List[str]) -> bool:
@@ -1941,10 +2022,17 @@ def evaluate_turn_with_model(
     skill_focus: str,
     current_difficulty: str,
     model: str = "gpt-4o-mini",
+    *,
+    assess_communication: bool = True,
 ) -> dict:
     """
     Per-answer signal for adaptive difficulty. Returns
     { score (1-10), feedback, next_difficulty: easy|medium|hard }.
+
+    `assess_communication=False` mirrors the template setting: this signal steers
+    follow-up difficulty, so leaving communication in it would make the interview
+    get harder or easier based on how the candidate speaks even when the role is
+    explicitly not assessed on that.
     """
     q = (question or "").strip()[:700]
     a = (answer or "").strip()[:2200]
@@ -1987,19 +2075,30 @@ def evaluate_turn_with_model(
 
         cache_key = response_cache.make_key(
             "evaluate_turn",
-            {"q": q, "a": a, "sk": sk, "cur": cur, "model": model},
+            # `comm` is part of the key because it changes the rubric. Without it
+            # a score computed WITH communication weighting would be served back
+            # to a template that switched it off, and vice versa.
+            {"q": q, "a": a, "sk": sk, "cur": cur, "model": model,
+             "comm": bool(assess_communication)},
         )
         cached = response_cache.get(_db_target(), cache_key)
         if isinstance(cached, dict) and cached.get("score") is not None:
             return cached
     except Exception:
         cache_key = None
+    step3 = (
+        "Step 3: Score technical correctness, completeness, practical knowledge, and communication.\n"
+        "Apply weights: Relevance 30%, Technical 30%, Completeness 20%, Practical 10%, Communication 10%.\n"
+        if assess_communication else
+        "Step 3: Score technical correctness, completeness and practical knowledge ONLY. "
+        "Ignore communication, fluency and delivery entirely.\n"
+        "Apply weights: Relevance 30%, Technical 35%, Completeness 25%, Practical 10%.\n"
+    )
     user_prompt = (
         f"Difficulty: {cur}. Skill: {sk}.\nQ: {q}\nA: {a}\n"
         "Step 1: Verify answer relevance to the question (reject off-topic answers).\n"
         "Step 2: If the candidate repeats or copies the question without explaining, score 0.\n"
-        "Step 3: Score technical correctness, completeness, practical knowledge, and communication.\n"
-        "Apply weights: Relevance 30%, Technical 30%, Completeness 20%, Practical 10%, Communication 10%.\n"
+        f"{step3}"
         "If answer is off-topic, generic, incomplete, or question repetition, score <= 1 and next_difficulty=easy.\n"
         "If answer is strong and concrete with examples, score >= 7 and next_difficulty=hard.\n"
         "JSON: {\"score\":0-10,\"feedback\":\"\",\"next_difficulty\":\"easy|medium|hard\",\"reason\":\"\"}"
@@ -3227,6 +3326,101 @@ def extract_candidate_profile(cv_text: str) -> dict:
         "email": email,
         "role_hint": role_hint,
     }
+
+
+def _merge_cv_profile(out: dict, data: dict) -> None:
+    """Merge an OpenAI-extracted profile dict into the regex baseline (baseline
+    values win only when the model returned nothing for that key)."""
+    def _s(v):
+        return str(v).strip() if v not in (None, "") else ""
+
+    def _f(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    out["technical_domain"] = out["technical_domain"] or _s(data.get("technical_domain"))
+    out["linkedin_url"] = out["linkedin_url"] or _s(data.get("linkedin_url"))
+    out["preferred_location"] = out["preferred_location"] or _s(data.get("preferred_location"))
+    out["designation"] = out["designation"] or _s(data.get("designation"))
+    if out["experience_years"] is None:
+        out["experience_years"] = _f(data.get("experience_years"))
+    if out["current_ctc"] is None:
+        out["current_ctc"] = _f(data.get("current_ctc"))
+    if out["expected_ctc"] is None:
+        out["expected_ctc"] = _f(data.get("expected_ctc"))
+    if isinstance(data.get("skills"), list):
+        out["skills"] = [s for s in (str(x).strip() for x in data["skills"]) if s][:40]
+    if isinstance(data.get("education"), list):
+        out["education"] = [e for e in data["education"] if isinstance(e, dict)][:12]
+    if isinstance(data.get("experience"), list):
+        out["experience"] = [x for x in data["experience"] if isinstance(x, dict)][:15]
+
+
+def parse_cv_profile(cv_text: str) -> dict:
+    """Best-effort STRUCTURED extraction of a candidate profile from CV text.
+
+    Returns a dict (keys always present, empty/None when unknown):
+      technical_domain, experience_years, linkedin_url, current_ctc, expected_ctc,
+      preferred_location, designation, skills[], education[], experience[].
+    Uses OpenAI JSON mode when configured; regex heuristics provide the baseline
+    (and the whole result when no key is set). Never raises."""
+    text = (cv_text or "").strip()
+    out: dict = {
+        "technical_domain": "", "experience_years": None, "linkedin_url": "",
+        "current_ctc": None, "expected_ctc": None, "preferred_location": "",
+        "designation": "", "skills": [], "education": [], "experience": [],
+    }
+    if not text:
+        return out
+
+    # Regex baseline — works even with no OpenAI key.
+    m = re.search(r"(\d+(?:\.\d+)?)\+?\s*(?:years|yrs)", text, re.IGNORECASE)
+    if m:
+        try:
+            out["experience_years"] = float(m.group(1))
+        except ValueError:
+            pass
+    lk = re.search(r"(https?://)?(www\.)?linkedin\.com/[A-Za-z0-9_/\-%.]+", text, re.IGNORECASE)
+    if lk:
+        url = lk.group(0)
+        out["linkedin_url"] = url if url.lower().startswith("http") else "https://" + url
+
+    try:
+        from openai_client import openai_key_configured
+        has_key = bool(openai_key_configured())
+    except Exception:
+        has_key = False
+    if has_key:
+        try:
+            import json as _json
+            prompt = (
+                "You are a resume parser. Extract the candidate's data from the RESUME "
+                "below and return ONLY a JSON object with these keys: "
+                "technical_domain (short area of expertise, e.g. 'Embedded/Automotive', "
+                "'Backend', 'Data Engineering'), experience_years (total years as a number or null), "
+                "linkedin_url (string or ''), current_ctc (annual number or null), "
+                "expected_ctc (annual number or null), preferred_location (city or ''), "
+                "designation (current or most recent job title), "
+                "skills (array of concise skill/technology names), "
+                "education (array of {course, institution, year}), "
+                "experience (array of {company, title, start_year, end_year, is_current}). "
+                "Use null or empty values when absent. Do NOT invent data.\n\nRESUME:\n"
+                + text[:12000]
+            )
+            res = _client().chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            data = _json.loads((res.choices[0].message.content or "{}"))
+            if isinstance(data, dict):
+                _merge_cv_profile(out, data)
+        except Exception:
+            pass  # keep the regex baseline
+    return out
 
 
 def evaluate_communication_skills(

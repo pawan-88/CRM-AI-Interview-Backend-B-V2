@@ -28,6 +28,7 @@ from schemas.requirements import (
 )
 from services.crm_common import log_activity, next_sequence_number, paginate, save_upload_hashed
 from services.notify import notify_role, notify_user
+from services.opportunities import backfill_requirement_from_opportunity
 from services.requirements import (
     EDITABLE_STATUSES, TERMINAL_STATUSES, apply_visibility, enrich_requirement_jd, ensure_visible,
     get_requirement_or_404, serialize_attachment_row, serialize_job_posting, serialize_requirement,
@@ -158,6 +159,11 @@ def get_requirement(
 ):
     req = get_requirement_or_404(db, requirement_id)
     ensure_visible(user, req)
+    # Backfill Experience/Budget/Work mode/Location/Target closure from the
+    # linked opportunity for requirements created before the carry-over existed.
+    if backfill_requirement_from_opportunity(db, req):
+        db.commit()
+        db.refresh(req)
     return envelope(_one(db, req))
 
 
@@ -300,6 +306,21 @@ def engineering_approve(
         )
     if jd_text:
         req.rmg_jd_text = jd_text
+    # Skill Evaluation Details are RMG's to set at this stage. When `skills` is
+    # provided it replaces the requirement's skill set (None = leave untouched).
+    if payload is not None and payload.skills is not None:
+        skills = _validated_skills(db, payload.skills)
+        db.execute(
+            RequirementSkill.__table__.delete().where(
+                RequirementSkill.requirement_id == req.id
+            )
+        )
+        for s in skills:
+            db.add(RequirementSkill(requirement_id=req.id, skill_id=s.skill_id,
+                                    is_mandatory=s.is_mandatory, min_rating=s.min_rating))
+    # ATS component weights — RMG may tune them at review (None = leave unchanged).
+    if payload is not None and payload.ats_weights is not None:
+        req.ats_weights = payload.ats_weights or None
     req.status = RequirementStatus.OPEN_FOR_SOURCING
     req.engineering_reviewed_by = user.id
     req.engineering_reviewed_at = _now()

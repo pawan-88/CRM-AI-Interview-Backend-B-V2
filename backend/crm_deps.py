@@ -7,7 +7,6 @@ platform. Token decoding mirrors main.py so existing JWTs keep working.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 
 import jwt
@@ -18,17 +17,15 @@ from sqlalchemy.orm import Session
 
 from crm_db import CrmNotConfiguredError, get_session_factory
 from models import Role, UserRole
+from auth_secret import auth_secret as _shared_auth_secret
 
 
 def _auth_secret() -> str:
-    # Must mirror main.py::_auth_secret exactly — including the sha256
-    # normalization of short secrets — or tokens issued by /auth/login fail
-    # verification here (the default fallback secret is only 21 bytes).
-    raw = (os.getenv("AUTH_SECRET") or os.getenv("REPORT_CODE") or "change-me-auth-secret").strip()
-    if len(raw.encode("utf-8")) >= 32:
-        return raw
-    import hashlib
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """Delegates to auth_secret.py — no local fallback (see that module).
+
+    A default here meant tokens could be forged by anyone reading the source.
+    """
+    return _shared_auth_secret()
 
 
 def _decode_bearer(request: Request) -> dict | None:

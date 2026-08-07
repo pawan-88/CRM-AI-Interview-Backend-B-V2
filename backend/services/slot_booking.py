@@ -8,6 +8,7 @@ logic lives in exactly one place.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 
 from sqlalchemy import func, select
@@ -18,6 +19,7 @@ from models import (
     RequirementActivityLog, Resume, SlotBooking,
 )
 from services.candidate_comms import notify_candidate, slot_invite_message
+from services.candidates import apply_cv_profile_to_candidate
 from services.crm_common import get_app_setting, log_activity
 from services.notify import notify_role
 
@@ -33,6 +35,67 @@ def split_candidate_name(full_name: str) -> tuple[str, str | None]:
     if not parts:
         return "Unknown", None
     return parts[0], (parts[1] if len(parts) > 1 else None)
+
+
+def _years_from_str(v) -> float | None:
+    if not v:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", str(v))
+    try:
+        return float(m.group(1)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _ctc_from_str(v) -> float | None:
+    """Parse a self-reported CTC ('12 LPA', '18,00,000', '1.5 Cr') to rupees."""
+    if not v:
+        return None
+    s = str(v).lower().replace(",", "")
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        num = float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    if "cr" in s or "crore" in s:
+        return num * 10_000_000
+    if "lpa" in s or "lakh" in s or "lac" in s:
+        return num * 100_000
+    # Bare number: small values are almost certainly in lakhs; large ones rupees.
+    return num * 100_000 if num < 1000 else num
+
+
+def _skills_from_str(v) -> list[str]:
+    if not v:
+        return []
+    return [p.strip() for p in re.split(r"[,;/|\n]+", str(v)) if p.strip()][:40]
+
+
+def profile_from_resume_application(resume: Resume) -> dict:
+    """Build a candidate-profile dict from the apply-form data captured on a
+    Resume (application_details JSON + applicant_experience), shaped for
+    apply_cv_profile_to_candidate."""
+    details = resume.application_details or {}
+    edu = (details.get("education") or "").strip()
+    return {
+        "technical_domain": (details.get("technical_domain") or "").strip(),
+        "experience_years": _years_from_str(resume.applicant_experience),
+        "linkedin_url": "",
+        "current_ctc": _ctc_from_str(details.get("current_ctc")),
+        "expected_ctc": _ctc_from_str(details.get("expected_ctc")),
+        "preferred_location": (details.get("preferred_location") or "").strip(),
+        "designation": "",
+        # The apply form asks for notice period and it shows on the Resumes tab,
+        # but it was never copied onto the candidate — so the Notice Period
+        # column on Candidate Profiles was blank for everyone who applied online,
+        # which is most people.
+        "notice_period": (str(details.get("notice_period") or "").strip() or None),
+        "skills": _skills_from_str(details.get("skills")),
+        "education": [{"course": edu}] if edu else [],
+        "experience": [],
+    }
 
 
 def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candidate:
@@ -51,17 +114,29 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
         if last:
             stmt = stmt.where(func.lower(func.coalesce(Candidate.last_name, "")) == last.lower())
         candidate = db.execute(stmt).scalars().first()
-    if candidate is not None:
-        return candidate
-    candidate = Candidate(
-        first_name=first,
-        last_name=last,
-        email=email or f"resume-{resume.id}@noemail.karnex.local",
-        phone=resume.phone,
-        cv_url=resume.resume_file_url,
-    )
-    db.add(candidate)
-    db.flush()
+    if candidate is None:
+        candidate = Candidate(
+            first_name=first,
+            last_name=last,
+            email=email or f"resume-{resume.id}@noemail.karnex.local",
+            phone=resume.phone,
+            cv_url=resume.resume_file_url,
+        )
+        db.add(candidate)
+        db.flush()
+    else:
+        # Backfill core identifiers on an already-known candidate.
+        if not candidate.phone and resume.phone:
+            candidate.phone = resume.phone
+        if not candidate.cv_url and resume.resume_file_url:
+            candidate.cv_url = resume.resume_file_url
+    # Carry the applicant's self-reported details (experience, education, domain,
+    # skills, CTC) from the apply form into the candidate profile so every role
+    # sees them. Fills only empty fields; best-effort.
+    try:
+        apply_cv_profile_to_candidate(db, candidate, profile_from_resume_application(resume))
+    except Exception:
+        logger.warning("apply_form_autofill_failed for resume %s", getattr(resume, "id", "?"), exc_info=True)
     return candidate
 
 

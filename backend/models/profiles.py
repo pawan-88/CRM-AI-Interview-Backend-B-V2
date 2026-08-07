@@ -46,6 +46,53 @@ class CandidateProfile(Base, TimestampMixin):
                                 server_default=PipelineStatus.SOURCING.value, index=True)
     commercial_approved = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     ctc_approval_amount = sa.Column(sa.Numeric(14, 2), nullable=True)
+    # Durable link back to the Zoho Candidate Profile record — makes re-imports
+    # idempotent without depending on (candidate, opportunity).
+    zoho_profile_id = sa.Column(sa.String(32), nullable=True)
+    # TA who owns this application (Zoho "TA Person"). ta_owner_id is set when the
+    # name matches a CRM user; ta_owner_name always keeps the original text.
+    ta_owner_name = sa.Column(sa.String(120), nullable=True)
+    ta_owner_id = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True, index=True)
+    # When the candidate actually applied (Zoho "Added Time"); created_at is the row's
+    # insert time, which for imported rows is the import run, not the application date.
+    applied_on = sa.Column(sa.DateTime(timezone=True), nullable=True)
+
+    # --- provenance + visibility (migration 0059) ---------------------------
+    #: 'app' for rows created in the CRM, 'zoho_import' for imported ones.
+    source = sa.Column(sa.String(32), nullable=True, index=True)
+    #: Hide a profile from the lists without deleting it (nothing is ever purged).
+    is_hidden = sa.Column(sa.Boolean, nullable=False, server_default=sa.false(), index=True)
+
+    # --- workflow dates -----------------------------------------------------
+    sales_submission_date = sa.Column(sa.Date, nullable=True)
+    technical_submission_date = sa.Column(sa.Date, nullable=True)
+    #: Stamped when the profile is submitted to the customer.
+    customer_submission_date = sa.Column(sa.Date, nullable=True)
+    customer_onboarding_date = sa.Column(sa.Date, nullable=True)
+
+    # --- approvals / commercials -------------------------------------------
+    commercial_approval_status = sa.Column(sa.String(120), nullable=True)
+    approved_ctc = sa.Column(sa.Numeric(14, 2), nullable=True)
+    offer_letter_reference = sa.Column(sa.String(255), nullable=True)
+
+    # --- documents ----------------------------------------------------------
+    #: The resume attached to THIS application (may differ from the candidate's CV).
+    resume_url = sa.Column(sa.String(1024), nullable=True)
+    cv_original_filename = sa.Column(sa.String(255), nullable=True)
+    resignation_certificate_url = sa.Column(sa.String(1024), nullable=True)
+
+    # --- Zoho attributes ----------------------------------------------------
+    stage = sa.Column(sa.String(60), nullable=True)              # RMG / Sales / HR
+    candidate_pre_status = sa.Column(sa.String(120), nullable=True)
+    employee_ref = sa.Column(sa.String(255), nullable=True)
+    created_by_name = sa.Column(sa.String(120), nullable=True)
+    user_role = sa.Column(sa.String(40), nullable=True)
+    comments_text = sa.Column(sa.Text, nullable=True)
+    is_archive_ta = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    is_archive_rmg = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    is_archive_sales = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    is_archive_hr = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+
     __table_args__ = (sa.UniqueConstraint("candidate_id", "opportunity_id", name="uq_profile_candidate_opp"),)
 
     candidate = relationship("Candidate", back_populates="profiles")

@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params
+from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params, role_required
 from models import (
     Customer,
     Invoice,
@@ -29,6 +29,7 @@ from models import (
 )
 from schemas.common import envelope
 from schemas.finance import (
+    AddressSnapshotIn,
     AllocationHsnUpdate,
     AllocationIn,
     InvoiceCreate,
@@ -44,18 +45,23 @@ from services import tax
 from services.crm_common import next_sequence_number, paginate, save_upload
 from services.finance import (
     apply_gst_split,
+    apply_invoice_gst_totals,
     assert_po_allows_new_drawdown,
+    compute_karnex_gst,
     ensure_unique_invoice_number,
     ensure_unique_po_number,
     fetch_po_activity_log,
     get_invoice_or_404,
     get_po_or_404,
     get_project_or_404,
+    karnex_gst_tax_and_grand,
     log_invoice_created_on_po,
     log_po_activity,
+    normalize_buyer_state_code_input,
     po_invoice_rows,
     primary_branch,
     primary_contact,
+    resolve_billing_branch,
     serialize_allocation,
     serialize_invoice,
     serialize_payment,
@@ -71,9 +77,17 @@ from services.invoice_pdf import generate_invoice_pdf
 router = APIRouter(prefix="/api", tags=["CRM: Finance"])
 
 PO_WRITE = gated_write("pos", "Finance")
-PO_READ = gated_read("pos", "Finance", "Sales_Head")
+# Read floor includes Sales & Sales Head so the Access Template can grant them the
+# PO tab (Admin/CEO/Finance always allowed). Without Sales here the role check
+# rejects the tab before the template is ever consulted. Writes stay Finance-only.
+PO_READ = gated_read("pos", "Finance", "Sales_Head", "Sales")
+# PO expiry is a dashboard heads-up card (not the PO tab): role-only so Sales &
+# Sales Head see it even without "pos" tab access. Admin/CEO included by default.
+PO_EXPIRY_READ = role_required("Finance", "Sales_Head", "Sales")
 INV_WRITE = gated_write("invoices", "Finance")
-INV_READ = gated_read("invoices", "Finance", "Sales_Head")
+# Same as PO_READ: Sales & Sales Head can be granted the Invoices tab via the
+# Access Template; writes remain Finance-only.
+INV_READ = gated_read("invoices", "Finance", "Sales_Head", "Sales")
 TDS_READ = gated_read("tds", "Finance")
 
 
@@ -87,6 +101,16 @@ def _enum_or_400(enum_cls, value: str, field: str):
 
 def _status_value(status) -> str:
     return status.value if hasattr(status, "value") else str(status)
+
+
+def _address_snapshot_dict(addr: AddressSnapshotIn | dict | None) -> dict | None:
+    if addr is None:
+        return None
+    raw = addr.model_dump() if hasattr(addr, "model_dump") else dict(addr)
+    cleaned = {k: (v.strip() if isinstance(v, str) else v) for k, v in raw.items()}
+    if not any(cleaned.values()):
+        return None
+    return cleaned
 
 
 # ===========================================================================
@@ -122,6 +146,8 @@ def create_purchase_order(body: PurchaseOrderCreate, db: Session = Depends(get_c
         consumed_value=Decimal("0"),
         balance_value=body.total_value,  # total - consumed(0)
         status=POStatus.ACTIVE,
+        billing_address_snapshot=_address_snapshot_dict(body.billing_address),
+        delivery_address_snapshot=_address_snapshot_dict(body.delivery_address),
     )
     apply_gst_split(po, body.inter_state)
     db.add(po)
@@ -153,13 +179,15 @@ def list_purchase_orders(status: str | None = None, customer_id: int | None = No
 # NOTE: this static route MUST be declared before GET /purchase-orders/{po_id}
 # below, otherwise FastAPI would try to match "reports" as po_id (422).
 @router.get("/purchase-orders/reports/expiry")
-def po_expiry_report(db: Session = Depends(get_crm_db), user: CurrentUser = Depends(PO_READ)):
-    """Active POs past (expired) or within 30 days of (expiring_soon) their end_date.
+def po_expiry_report(days: int = 45, db: Session = Depends(get_crm_db),
+                     user: CurrentUser = Depends(PO_EXPIRY_READ)):
+    """Active POs past (expired) or within `days` (default 45) of their end_date.
 
     Reporting-only: PO status is never auto-flipped (POStatus enum unchanged).
+    Feeds the dashboard's PO-expiry warning card.
     """
     today = date.today()
-    horizon = today + timedelta(days=30)
+    horizon = today + timedelta(days=max(1, min(days, 365)))
     rows = db.execute(
         select(PurchaseOrder, Customer.name)
         .join(Customer, Customer.id == PurchaseOrder.customer_id)
@@ -241,6 +269,11 @@ def update_purchase_order(po_id: int, body: PurchaseOrderUpdate,
         if inter_state is None:
             inter_state = bool(po.igst and Decimal(str(po.igst)) > 0)
         apply_gst_split(po, inter_state)
+
+    if "billing_address" in data:
+        po.billing_address_snapshot = _address_snapshot_dict(data["billing_address"])
+    if "delivery_address" in data:
+        po.delivery_address_snapshot = _address_snapshot_dict(data["delivery_address"])
 
     changed = ", ".join(sorted(data.keys())) or "nothing"
     log_po_activity(db, po.id, user.id, "PO_UPDATED",
@@ -472,13 +505,9 @@ def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
     if sub_total <= 0:
         raise HTTPException(status_code=400, detail="sub_total must be positive")
 
-    if body.tax_amount is not None:
-        tax_amount = body.tax_amount
-    elif po is not None and po.tax_slab is not None:
-        tax_amount = tax.gst_amount(sub_total, po.tax_slab)
-    else:
-        tax_amount = Decimal("0")
-    grand_total = sub_total + tax_amount
+    tax_amount, grand_total, _gst = karnex_gst_tax_and_grand(
+        db, po=po, project_id=body.project_id, lines=line_rows, sub_total=sub_total,
+    )
 
     if po is not None and Decimal(str(po.balance_value)) < grand_total:
         raise HTTPException(status_code=400, detail="PO balance insufficient")
@@ -543,7 +572,7 @@ def get_invoice(invoice_id: int, db: Session = Depends(get_crm_db),
     return envelope(serialize_invoice(invoice, detail=True, db=db))
 
 
-@router.put("/invoices/{invoice_id}")
+@router.api_route("/invoices/{invoice_id}", methods=["PUT", "PATCH"])
 def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(INV_WRITE)):
     invoice = get_invoice_or_404(db, invoice_id)
@@ -551,6 +580,23 @@ def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(g
     for field in ("invoice_date", "due_date"):
         if field in data:
             setattr(invoice, field, data[field])
+    # Prefer model_fields_set so an explicit null/blank clear is never dropped.
+    if "buyer_state_code" in body.model_fields_set or "buyer_state_code" in data:
+        invoice.buyer_state_code = normalize_buyer_state_code_input(
+            data["buyer_state_code"] if "buyer_state_code" in data else body.buyer_state_code
+        )
+        po = invoice.po or (db.get(PurchaseOrder, invoice.po_id) if invoice.po_id else None)
+        project = invoice.project or db.get(Project, invoice.project_id)
+        branch = resolve_billing_branch(db, po=po, project=project)
+        gst = compute_karnex_gst(
+            branch=branch,
+            state_code_override=invoice.buyer_state_code,
+            items=[{"billing_hours": float(l.qty or 0), "rate_per_hour": float(l.rate or 0)}
+                   for l in invoice.lines],
+            subtotal=float(invoice.sub_total or 0),
+        )
+        apply_invoice_gst_totals(invoice, gst)
+        db.add(invoice)
     db.commit()
     db.refresh(invoice)
     return envelope(serialize_invoice(invoice, detail=True, db=db), "Invoice updated")
@@ -578,29 +624,22 @@ def generate_invoice_pdf_endpoint(invoice_id: int, db: Session = Depends(get_crm
     customer_id = po.customer_id if po else (project.customer_id if project else None)
     customer = db.get(Customer, customer_id) if customer_id else None
 
-    branch = None
-    if po is not None and po.billing_branch_id:
-        from models import CustomerBranch
-        branch = db.get(CustomerBranch, po.billing_branch_id)
-    if branch is None and customer_id:
-        branch = primary_branch(db, customer_id)
+    branch = resolve_billing_branch(db, po=po, project=project, customer_id=customer_id)
 
-    # Tax breakdown: SGST/CGST/IGST from the PO slab via tax.split_gst,
-    # otherwise the invoice tax_amount as a lump line.
+    # Same shared GST resolver + engine as invoice detail / Tax Invoice PDF.
+    gst = compute_karnex_gst(
+        branch=branch,
+        state_code_override=invoice.buyer_state_code,
+        items=[{"billing_hours": float(l.qty or 0), "rate_per_hour": float(l.rate or 0)}
+               for l in invoice.lines],
+        subtotal=float(invoice.sub_total or 0),
+    )
     tax_lines: list = []
-    if po is not None and po.tax_slab is not None:
-        inter_state = bool(po.igst and Decimal(str(po.igst)) > 0)
-        parts = tax.split_gst(po.tax_slab, inter_state=inter_state)
-        if inter_state:
-            tax_lines.append((f"IGST @ {parts['igst']}%",
-                              tax.gst_amount(invoice.sub_total, parts["igst"])))
-        else:
-            tax_lines.append((f"SGST @ {parts['sgst']}%",
-                              tax.gst_amount(invoice.sub_total, parts["sgst"])))
-            tax_lines.append((f"CGST @ {parts['cgst']}%",
-                              tax.gst_amount(invoice.sub_total, parts["cgst"])))
-    elif invoice.tax_amount and Decimal(str(invoice.tax_amount)) > 0:
-        tax_lines.append(("Tax", invoice.tax_amount))
+    if gst.get("intra"):
+        tax_lines.append(("CGST @ 9%", gst["cgst"]))
+        tax_lines.append(("SGST @ 9%", gst["sgst"]))
+    elif float(gst.get("total_gst") or 0) > 0:
+        tax_lines.append(("IGST @ 18%", gst["igst"]))
 
     customer_name = None
     if customer is not None:
@@ -623,7 +662,7 @@ def generate_invoice_pdf_endpoint(invoice_id: int, db: Session = Depends(get_crm
             for l in invoice.lines
         ],
         "sub_total": invoice.sub_total,
-        "grand_total": invoice.grand_total,
+        "grand_total": gst["grand_total"],
     })
     invoice.invoice_pdf_url = url
     db.commit()

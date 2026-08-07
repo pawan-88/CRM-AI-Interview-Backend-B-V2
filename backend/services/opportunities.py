@@ -1,19 +1,26 @@
 """Opportunity service helpers: pipeline stage machine, FK validation, skills, serialization."""
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal, InvalidOperation
+
 import sqlalchemy as sa
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from models import (
     ContactPerson,
     Customer,
     CustomerBranch,
+    Location,
     Opportunity,
+    OpportunityCtcSlab,
     OpportunitySkill,
     PipelineStage,
+    Requirement,
     Skill,
+    WorkMode,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,9 +172,13 @@ def serialize_opportunity(db: Session, opp: Opportunity, detail: bool = False) -
     }
     if detail:
         branch = db.get(CustomerBranch, opp.branch_id) if opp.branch_id else None
+        # Never show another customer's branch name on this opportunity.
+        if branch is not None and branch.customer_id != opp.customer_id:
+            branch = None
         contact = db.get(ContactPerson, opp.contact_person_id) if opp.contact_person_id else None
         hiring_mgr = db.get(ContactPerson, opp.hiring_manager_id) if opp.hiring_manager_id else None
         data["branch_name"] = branch.branch_name if branch else None
+        data["branch_unlinked"] = bool(opp.branch_id and branch is None)
         data["contact_person_name"] = contact.name if contact else None
         data["hiring_manager_name"] = hiring_mgr.name if hiring_mgr else None
         data["skills"] = serialize_skills(db, opp)
@@ -215,3 +226,165 @@ def fetch_activity_log(db: Session, opportunity_id: int) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Opportunity → Requirement field carry-over
+# ---------------------------------------------------------------------------
+
+# Requirement fields backfilled from the opportunity (null → filled).
+_REQ_CARRY_KEYS = (
+    "experience_min", "experience_max", "budget_ctc_min", "budget_ctc_max",
+    "work_mode", "location_id", "target_closure_date", "description",
+)
+
+
+def requirement_fields_from_opportunity(db: Session, opp: Opportunity) -> dict:
+    """Requirement field values carried from an opportunity's T&M details +
+    Candidate CTC Slab, so RMG (Engineering Review) and TA see Experience /
+    Budget / Work mode / Location / Target closure without re-keying.
+    Non-T&M opportunities simply yield Nones for the missing keys."""
+    details = opp.details or {}
+
+    def _dec(key):
+        v = details.get(key)
+        if v in (None, ""):
+            return None
+        try:
+            return Decimal(str(v))
+        except (InvalidOperation, ValueError):
+            return None
+
+    target_closure = None
+    tv = details.get("tm_closing_date")
+    if tv:
+        try:
+            target_closure = date.fromisoformat(str(tv)[:10])
+        except ValueError:
+            target_closure = None
+
+    positions = None
+    try:
+        pc = int(float(details.get("tm_positions_count")))
+        if pc >= 1:
+            positions = pc
+    except (TypeError, ValueError):
+        positions = None
+
+    work_mode = None
+    wm = details.get("tm_wfo_remote")
+    if wm:
+        try:
+            work_mode = WorkMode(str(wm))
+        except ValueError:
+            work_mode = None
+
+    # Opportunity stores the Work Location as a CITY NAME. Resolve to a Location
+    # row; create one (country defaults to India) when the master lacks it so the
+    # requirement can always show the location the sales team selected.
+    location_id = None
+    city = details.get("tm_work_location")
+    if city:
+        city = str(city).strip()
+        location_id = db.execute(
+            select(Location.id).where(func.lower(Location.city) == city.lower())
+        ).scalar_one_or_none()
+        if location_id is None:
+            loc = Location(city=city)
+            db.add(loc)
+            db.flush()
+            location_id = loc.id
+
+    # Budget CTC ← Candidate CTC Slab "Approved CTC" (min/max). The stored value
+    # is already a rupee amount (the derived revenue chain), NOT lakhs — no scaling.
+    ctc_vals = [
+        Decimal(str(s.approved_ctc_lac))
+        for s in db.execute(
+            select(OpportunityCtcSlab).where(OpportunityCtcSlab.opportunity_id == opp.id)
+        ).scalars().all()
+        if s.approved_ctc_lac is not None
+    ]
+
+    return {
+        "experience_min": _dec("tm_exp_min"),
+        "experience_max": _dec("tm_exp_max"),
+        "budget_ctc_min": (min(ctc_vals) if ctc_vals else None),
+        "budget_ctc_max": (max(ctc_vals) if ctc_vals else None),
+        "work_mode": work_mode,
+        "location_id": location_id,
+        "target_closure_date": target_closure,
+        "no_of_positions": positions,
+        "description": (details.get("tm_position_title") or None),
+    }
+
+
+# A budget above this (₹100 crore/yr) can only be the old ×100000 scaling bug.
+_IMPLAUSIBLE_BUDGET = Decimal("1000000000")
+
+
+def backfill_requirement_from_opportunity(db: Session, req) -> bool:
+    """Keep the requirement in sync with its opportunity on read: always mirror
+    the (opportunity-owned) title, fill still-empty carried fields, and correct a
+    budget corrupted by the earlier ×100000 scaling bug. Idempotent; returns True
+    when something changed (caller commits)."""
+    if getattr(req, "opportunity_id", None) is None:
+        return False
+    opp = db.get(Opportunity, req.opportunity_id)
+    if opp is None:
+        return False
+    changed = False
+    # Title is opportunity-owned — always keep the requirement's copy current so
+    # Sales' edits show for Sales Head / RMG / TA.
+    if opp.title and req.title != opp.title:
+        req.title = opp.title
+        changed = True
+    corrupt_budget = (
+        (req.budget_ctc_min is not None and req.budget_ctc_min > _IMPLAUSIBLE_BUDGET)
+        or (req.budget_ctc_max is not None and req.budget_ctc_max > _IMPLAUSIBLE_BUDGET)
+    )
+    if not corrupt_budget and all(getattr(req, k) is not None for k in _REQ_CARRY_KEYS):
+        return changed  # carried fields already set & sane; title handled above
+    vals = requirement_fields_from_opportunity(db, opp)
+    for k in _REQ_CARRY_KEYS:
+        new = vals.get(k)
+        if new is None:
+            continue
+        cur = getattr(req, k)
+        fix_budget = (
+            k in ("budget_ctc_min", "budget_ctc_max")
+            and cur is not None and cur > _IMPLAUSIBLE_BUDGET
+        )
+        if cur is None or fix_budget:
+            setattr(req, k, new)
+            changed = True
+    # positions: only override the default 1 when the opportunity has a real count.
+    pc = vals.get("no_of_positions")
+    if pc and req.no_of_positions in (None, 1) and req.no_of_positions != pc:
+        req.no_of_positions = pc
+        changed = True
+    return changed
+
+
+def sync_requirement_from_opportunity(db: Session, opp: Opportunity) -> None:
+    """Push opportunity edits (title, customer, and the carried details) onto the
+    linked requirement so Sales Head / RMG / TA always see what Sales edited — the
+    requirement stores denormalized copies that would otherwise go stale. The
+    requirement's own fields (rmg_jd_text, skills, status, priority) are untouched.
+    Call inside the opportunity-update transaction (before commit)."""
+    req = db.execute(
+        select(Requirement).where(Requirement.opportunity_id == opp.id)
+    ).scalar_one_or_none()
+    if req is None:
+        return
+    if opp.title:
+        req.title = opp.title
+    if opp.customer_id:
+        req.customer_id = opp.customer_id
+    vals = requirement_fields_from_opportunity(db, opp)
+    for k in _REQ_CARRY_KEYS:
+        new = vals.get(k)
+        if new is not None:
+            setattr(req, k, new)
+    pc = vals.get("no_of_positions")
+    if pc:
+        req.no_of_positions = pc

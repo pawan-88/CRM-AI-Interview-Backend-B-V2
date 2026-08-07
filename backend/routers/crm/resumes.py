@@ -15,6 +15,8 @@ from crm_deps import CurrentUser, PageParams, get_crm_db, page_params, role_requ
 from models import (
     AiInterviewStatus, AtsStatus, RequirementActivityLog, RequirementStatus, Resume,
 )
+from pydantic import BaseModel, Field
+
 from routers.crm.apply import _base_url
 from schemas.common import envelope
 from schemas.resumes import AI_INTERVIEW_STATUS_VALUES, ATS_STATUS_VALUES, ResumeScanResult
@@ -57,6 +59,16 @@ def upload_resume(
     email: str | None = Form(None),
     phone: str | None = Form(None),
     source_portal: str | None = Form(None),
+    # Same applicant details as the public apply-link form, so TA-entered
+    # uploads carry identical data onto the Resume + Candidate.
+    experience: str = Form("", max_length=64),
+    education: str = Form("", max_length=120),
+    technical_domain: str = Form("", max_length=120),
+    skills: str = Form("", max_length=500),
+    notice_period: str = Form("", max_length=60),
+    current_ctc: str = Form("", max_length=40),
+    expected_ctc: str = Form("", max_length=40),
+    preferred_location: str = Form("", max_length=120),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(role_required("TA")),
 ):
@@ -80,19 +92,49 @@ def upload_resume(
         select(Resume).where(Resume.requirement_id == req.id, Resume.file_sha256 == file_sha256)
     ).scalars().first()
     if dup is not None:
+        # Same file re-uploaded: still make sure a Candidate exists for it (the
+        # original upload may predate immediate candidate creation).
+        if dup.candidate_id is None:
+            try:
+                cand = find_or_create_candidate_from_resume(db, dup)
+                dup.candidate_id = cand.id
+                db.commit()
+            except Exception:
+                db.rollback()
         return envelope(serialize_resume(dup), message="Duplicate resume — already on this requirement")
 
+    details = {
+        "education": (education or "").strip() or None,
+        "technical_domain": (technical_domain or "").strip() or None,
+        "skills": (skills or "").strip() or None,
+        "notice_period": (notice_period or "").strip() or None,
+        "current_ctc": (current_ctc or "").strip() or None,
+        "expected_ctc": (expected_ctc or "").strip() or None,
+        "preferred_location": (preferred_location or "").strip() or None,
+    }
+    details = {k: v for k, v in details.items() if v}
     resume = Resume(
         requirement_id=req.id,
         candidate_name=candidate_name.strip(),
         email=(email or "").strip() or None,
         phone=(phone or "").strip() or None,
         source_portal=(source_portal or "").strip() or None,
+        applicant_experience=(experience or "").strip() or None,
+        application_details=details or None,
         resume_file_url=file_url,
         file_sha256=file_sha256,
         file_size=file_size,
     )
     db.add(resume)
+    db.flush()  # assign resume.id before deriving the candidate
+    # Create/enrich the Candidate now so the applicant appears in the Candidate
+    # tab immediately (name/email/phone/CV; apply-form details when present).
+    try:
+        from services.slot_booking import find_or_create_candidate_from_resume
+        cand = find_or_create_candidate_from_resume(db, resume)
+        resume.candidate_id = cand.id
+    except Exception:
+        pass
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "RESUME_UPLOADED", f"Resume uploaded for {resume.candidate_name}")
     if req.status == RequirementStatus.POSTED_ON_PORTALS and existing == 0:
@@ -131,6 +173,95 @@ def list_resumes(
     stmt = stmt.order_by(Resume.created_at.desc(), Resume.id.desc())
     items, meta = paginate(db, stmt, p.page, p.limit)
     return envelope(enrich_resumes_with_ai(db, items), meta=meta)
+
+
+# --------------------------------------------------------------- edit + delete
+
+class ResumeUpdateIn(BaseModel):
+    """Editable applicant details on a resume row (all optional; None = untouched)."""
+    candidate_name: str | None = Field(default=None, min_length=1, max_length=255)
+    email: str | None = Field(default=None, max_length=255)
+    phone: str | None = Field(default=None, max_length=32)
+    source_portal: str | None = Field(default=None, max_length=64)
+    experience: str | None = Field(default=None, max_length=64)
+    education: str | None = Field(default=None, max_length=120)
+    technical_domain: str | None = Field(default=None, max_length=120)
+    skills: str | None = Field(default=None, max_length=500)
+    notice_period: str | None = Field(default=None, max_length=60)
+    current_ctc: str | None = Field(default=None, max_length=40)
+    expected_ctc: str | None = Field(default=None, max_length=40)
+    preferred_location: str | None = Field(default=None, max_length=120)
+
+_DETAIL_KEYS = ("education", "technical_domain", "skills", "notice_period",
+                "current_ctc", "expected_ctc", "preferred_location")
+
+
+@router.put("/api/resumes/{resume_id}")
+def update_resume(
+    resume_id: int,
+    payload: ResumeUpdateIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(role_required("TA")),
+):
+    resume = _get_resume_or_404(db, resume_id)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    if "candidate_name" in changes and changes["candidate_name"]:
+        resume.candidate_name = changes["candidate_name"].strip()
+    if "email" in changes:
+        resume.email = (changes["email"] or "").strip() or None
+    if "phone" in changes:
+        resume.phone = (changes["phone"] or "").strip() or None
+    if "source_portal" in changes:
+        resume.source_portal = (changes["source_portal"] or "").strip() or None
+    if "experience" in changes:
+        resume.applicant_experience = (changes["experience"] or "").strip() or None
+    details = dict(resume.application_details or {})
+    detail_changed = False
+    for k in _DETAIL_KEYS:
+        if k in changes:
+            v = (changes[k] or "").strip()
+            if v:
+                details[k] = v
+            else:
+                details.pop(k, None)
+            detail_changed = True
+    if detail_changed:
+        resume.application_details = details or None
+    log_activity(db, RequirementActivityLog, "requirement_id", resume.requirement_id, user.id,
+                 "RESUME_UPDATED", f"Resume details updated for {resume.candidate_name}")
+    db.commit()
+    db.refresh(resume)
+    return envelope(serialize_resume(resume), message="Resume updated")
+
+
+@router.delete("/api/resumes/{resume_id}")
+def delete_resume(
+    resume_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(role_required("TA")),
+):
+    """Delete a resume/application. Unlinks AI-interview rows and removes slot
+    bookings for this resume; the Candidate record (if created) is kept."""
+    from models import AiInterviewLink, SlotBooking
+
+    resume = _get_resume_or_404(db, resume_id)
+    name = resume.candidate_name
+    req_id = resume.requirement_id
+    for link in db.execute(
+        select(AiInterviewLink).where(AiInterviewLink.resume_id == resume.id)
+    ).scalars().all():
+        link.resume_id = None
+    for booking in db.execute(
+        select(SlotBooking).where(SlotBooking.resume_id == resume.id)
+    ).scalars().all():
+        db.delete(booking)
+    db.delete(resume)
+    log_activity(db, RequirementActivityLog, "requirement_id", req_id, user.id,
+                 "RESUME_DELETED", f"Resume deleted for {name}")
+    db.commit()
+    return envelope(data={"id": resume_id}, message="Resume deleted")
 
 
 # ---------------------------------------------------------------- ATS scanning

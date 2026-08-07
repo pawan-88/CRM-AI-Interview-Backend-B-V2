@@ -22,6 +22,7 @@ from models import (
     CustomerLeavePolicy,
     Employee,
     Holiday,
+    InterviewEvent,
     InterviewSlot,
     Invoice,
     LeaveApplication,
@@ -181,6 +182,21 @@ def purge_requirement_owned(db: Session, requirement_id: int) -> None:
         db.delete(tr)
 
 
+def purge_profile_interviews(db: Session, profile_id: int) -> None:
+    """Delete interview rounds owned by a candidate profile.
+
+    ``interview_events.profile_id`` is NOT NULL with no DB-level cascade, so a
+    profile that ever had an L2 face-to-face (or an imported interview round)
+    cannot be deleted until these rows go — otherwise the delete fails with an
+    IntegrityError and the API returns a misleading 409.
+    """
+    for ev in db.execute(
+        select(InterviewEvent).where(InterviewEvent.profile_id == profile_id)
+    ).scalars().all():
+        db.delete(ev)
+    db.flush()
+
+
 def cascade_opportunity_children(db: Session, opportunity_id: int) -> None:
     """Cascade opp-owned recruiting children. Caller must block if projects exist."""
     for link in db.execute(
@@ -195,6 +211,7 @@ def cascade_opportunity_children(db: Session, opportunity_id: int) -> None:
             select(Employee).where(Employee.candidate_profile_id == profile.id)
         ).scalars().all():
             emp.candidate_profile_id = None
+        purge_profile_interviews(db, profile.id)
         db.delete(profile)
     db.flush()
     for req in db.execute(
@@ -226,7 +243,13 @@ def cascade_candidate_children(db: Session, candidate_id: int) -> None:
             select(Employee).where(Employee.candidate_profile_id == profile.id)
         ).scalars().all():
             emp.candidate_profile_id = None
+        purge_profile_interviews(db, profile.id)
         db.delete(profile)
+    db.flush()
+    for ev in db.execute(
+        select(InterviewEvent).where(InterviewEvent.candidate_id == candidate_id)
+    ).scalars().all():
+        db.delete(ev)
     db.flush()
     for book in db.execute(
         select(SlotBooking).where(SlotBooking.candidate_id == candidate_id)

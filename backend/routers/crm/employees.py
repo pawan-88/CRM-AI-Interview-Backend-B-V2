@@ -62,7 +62,11 @@ router = APIRouter(prefix="/api/employees", tags=["CRM: Employees"])
 subform_router = APIRouter(prefix="/api", tags=["CRM: Employees"])
 
 EMP_WRITE = gated_write("employees", "HR")
-EMP_READ = gated_read("employees", "HR", "Finance", "Sales_Head")
+# Read floor includes Sales & RMG so the Access Template can grant them the
+# Employees tab (Admin/CEO always pass). Without them here the role check
+# rejects the tab before the template is consulted (sidebar shows, data 403s).
+# Writes stay HR-only.
+EMP_READ = gated_read("employees", "HR", "Finance", "Sales_Head", "Sales", "RMG")
 
 
 # ===========================================================================

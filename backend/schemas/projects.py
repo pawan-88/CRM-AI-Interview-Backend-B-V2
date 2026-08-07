@@ -7,23 +7,27 @@ from decimal import Decimal
 from pydantic import BaseModel, Field, field_validator
 
 from models import BillingFrequency, BillingUnit, CommEntryType, ProjectStatus, WorkMode
+from schemas.leave import LEAVE_CREDIT_TIMINGS
 
 # Edit Project §2 — Leave Billing Policy option lists (SOURCE system).
 PROJECT_LEAVE_CREDIT_TYPES = (
-    "Monthly", "Quarterly", "Annually", "Credit Week-Off/Holiday",
+    "Monthly", "Quarterly", "Yearly", "Annually", "Credit Week-Off/Holiday",
 )
 PROJECT_LEAVE_EXPIRE_TYPES = (
-    "Monthly", "Quarterly", "Annually", "Carry Forward",
+    "Monthly", "Quarterly", "Yearly", "Annually", "Carry Forward",
 )
 # Branch / customer leave-policy labels → project canonical values (wizard prefills).
 PROJECT_LEAVE_CREDIT_ALIASES = {
     "Credit Balance Every Month": "Monthly",
     "Carry Forward Every Month": "Monthly",
-    "Yearly": "Annually",
-    "One_Time": "Annually",
+    "Yearly": "Yearly",
+    "One_Time": "Yearly",
+    "Annually": "Yearly",
 }
 PROJECT_LEAVE_EXPIRE_ALIASES = {
-    "Days": "Annually",
+    "Days": "Monthly",
+    "Annually": "Yearly",
+    "Carry Forward": "Yearly",
 }
 # UI "Initial No Billing QTY" → stored in initial_no_billing_period
 INITIAL_NO_BILLING_UNITS = ("Hours", "Days", "Week", "Month", "Year")
@@ -198,24 +202,32 @@ class ProjectLeavePolicyCreate(BaseModel):
     name: str | None = Field(default=None, max_length=255)
     # Required — omit / empty → 422
     leave_credit_type: str
+    leave_credit_timing: str | None = None  # Start_Of_Period|End_Of_Period
     leave_credit_balance: Decimal = Field(default=Decimal("0"), ge=0)
     initial_credit_balance: Decimal = Field(default=Decimal("0"), ge=0)
     leave_expire: str
+    leave_expire_timing: str | None = None  # Start_Of_Period|End_Of_Period
     is_max_limit: bool = False
     maximum_carry_forward: int = Field(default=0, ge=0)
     effective_date: date | None = None
 
     _credit = field_validator("leave_credit_type")(_project_leave_credit)
     _expire = field_validator("leave_expire")(_project_leave_expire)
+    _timing = field_validator("leave_credit_timing")(
+        _one_of(LEAVE_CREDIT_TIMINGS, "leave_credit_timing"))
+    _expire_timing = field_validator("leave_expire_timing")(
+        _one_of(LEAVE_CREDIT_TIMINGS, "leave_expire_timing"))
 
 
 class ProjectLeavePolicyUpdate(BaseModel):
     leave_type_id: int | None = None
     name: str | None = Field(default=None, max_length=255)
     leave_credit_type: str | None = None
+    leave_credit_timing: str | None = None  # Start_Of_Period|End_Of_Period
     leave_credit_balance: Decimal | None = Field(default=None, ge=0)
     initial_credit_balance: Decimal | None = Field(default=None, ge=0)
     leave_expire: str | None = None
+    leave_expire_timing: str | None = None  # Start_Of_Period|End_Of_Period
     is_max_limit: bool | None = None
     maximum_carry_forward: int | None = Field(default=None, ge=0)
     effective_date: date | None = None
@@ -223,3 +235,7 @@ class ProjectLeavePolicyUpdate(BaseModel):
 
     _credit = field_validator("leave_credit_type")(_project_leave_credit)
     _expire = field_validator("leave_expire")(_project_leave_expire)
+    _timing = field_validator("leave_credit_timing")(
+        _one_of(LEAVE_CREDIT_TIMINGS, "leave_credit_timing"))
+    _expire_timing = field_validator("leave_expire_timing")(
+        _one_of(LEAVE_CREDIT_TIMINGS, "leave_expire_timing"))

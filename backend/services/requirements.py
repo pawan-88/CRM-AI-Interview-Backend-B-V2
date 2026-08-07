@@ -124,6 +124,7 @@ def serialize_requirement(req: Requirement, skills: list[dict] | None = None) ->
         "title": req.title,
         "description": req.description,
         "rmg_jd_text": req.rmg_jd_text,
+        "ats_weights": req.ats_weights,
         "no_of_positions": req.no_of_positions,
         "experience_min": _num(req.experience_min),
         "experience_max": _num(req.experience_max),

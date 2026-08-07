@@ -120,16 +120,21 @@ class BranchBillingPolicyIn(BaseModel):
 
 
 class BillingPolicyIn(BaseModel):
-    """Upsert payload — one billing policy row per customer."""
+    """Upsert payload — one billing policy row per customer.
 
-    week_off_billable: bool = False
-    leave_billable: bool = False
-    holidays_billable: bool = False
+    Week/leave/holiday billable flags are optional so the customer Default
+    Billing Policy tab can save min-hours without wiping those columns
+    (billability is edited at branch/project level).
+    """
+
+    week_off_billable: bool | None = None
+    leave_billable: bool | None = None
+    holidays_billable: bool | None = None
     min_hours_full_day: float = Field(default=8.0, ge=0, le=24)
     min_hours_half_day: float = Field(default=4.0, ge=0, le=24)
     billing_type: BillingType | None = None
     # comp-off section
-    comp_off_billable: bool = False
+    comp_off_billable: bool | None = None
     comp_off_balance: float | None = None
     comp_off_balance_initial: float | None = None
     comp_off_max_limit: float | None = None
@@ -147,6 +152,8 @@ class ContactCreate(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     designation: str | None = Field(default=None, max_length=120)
     role: str | None = Field(default=None, max_length=40)  # Finance|Operational|Procurement|HR
+    contact_priority: str | None = Field(default=None, max_length=40)  # Primary|Secondary
+    notification: str | None = Field(default=None, max_length=40)  # Email|SMS|Both|None
     is_hiring_manager: bool = False
     is_active: bool = True
 
@@ -158,5 +165,7 @@ class ContactUpdate(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     designation: str | None = Field(default=None, max_length=120)
     role: str | None = Field(default=None, max_length=40)
+    contact_priority: str | None = Field(default=None, max_length=40)
+    notification: str | None = Field(default=None, max_length=40)
     is_hiring_manager: bool | None = None
     is_active: bool | None = None

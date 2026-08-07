@@ -36,6 +36,9 @@ class CandidateCreate(BaseModel):
     current_ctc: float | None = None
     expected_ctc: float | None = None
     preferred_location_id: int | None = None
+    city: str | None = None
+    preferred_locations: str | None = None
+    recruiter_email: str | None = None
 
     @field_validator("first_name")
     @classmethod
@@ -74,6 +77,9 @@ class CandidateUpdate(BaseModel):
     current_ctc: float | None = None
     expected_ctc: float | None = None
     preferred_location_id: int | None = None
+    city: str | None = None
+    preferred_locations: str | None = None
+    recruiter_email: str | None = None
 
     @field_validator("email")
     @classmethod
