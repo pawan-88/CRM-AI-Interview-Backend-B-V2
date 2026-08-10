@@ -66,8 +66,21 @@ def setup_rate_limit(app) -> bool:
 
 
 def limit(spec: str) -> Callable:
-    """Decorator factory; returns slowapi limiter when active, no-op otherwise."""
+    """Decorator factory; returns slowapi limiter when active, no-op otherwise.
+
+    IMPORTANT: this reads ``_limiter`` at *decoration* time, so
+    ``setup_rate_limit(app)`` must run before any decorated route is defined.
+    main.py calls it immediately after ``app = FastAPI(...)`` for that reason.
+    A silent no-op here previously left every per-route limit inert in
+    production, so the miss is now logged loudly instead of passing quietly.
+    """
     if _limiter is None:
+        if _enabled():
+            logger.error(
+                "rate-limit: @limit(%r) evaluated before setup_rate_limit(app) "
+                "(or slowapi missing) - this route is NOT rate limited.",
+                spec,
+            )
         def _noop(fn: Callable) -> Callable:
             return fn
         return _noop

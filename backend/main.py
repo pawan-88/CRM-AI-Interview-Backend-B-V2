@@ -187,6 +187,7 @@ from prompt_logger import (
 import response_cache
 import password_hashing as pwh
 import rate_limit as _rl
+from openai_client import openai_key_configured
 from auth_secret import auth_secret as _shared_auth_secret
 from template_prompt import (
     build_default_template_prompt,
@@ -1417,8 +1418,7 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             form_skills=selected_skills,
         )
 
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    has_ai = bool(api_key and api_key != "your_key_here")
+    has_ai = openai_key_configured("question")
     selected_model = str(invite_cfg.get("model") or (os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini")).strip()
     safe_mode_on = str(os.getenv("INTERVIEW_SAFE_MODE", "false")).lower() in {"1", "true", "yes", "on"}
     followup_mode_on = _adaptive_followup_enabled() and bool(invite_cfg.get("followup_mode", False))
@@ -1824,7 +1824,10 @@ def _runtime_config_checks() -> dict:
         "cors_restricted": "*" not in cors_origins,
         "report_code_configured": bool(report_code),
         "report_code_non_default": bool(report_code and report_code != REPORT_CODE),
-        "openai_key_configured": bool((os.getenv("OPENAI_API_KEY") or "").strip()),
+        "openai_key_configured": any(
+            openai_key_configured(p)
+            for p in ("default", "question", "eval", "tts", "transcribe", "ats")
+        ),
         "openai_keys": _openai_keys_status(),
     }
 
@@ -1898,7 +1901,7 @@ def _evaluate_and_store_report(session: dict) -> tuple[dict, dict, dict]:
     model = session.get("meta", {}).get("model", "gpt-4o-mini")
     meta = session.get("meta", {}) or {}
     jd_skills = meta.get("jd_skills", [])
-    has_ai_key = bool((os.getenv("OPENAI_API_KEY") or "").strip())
+    has_ai_key = openai_key_configured("eval")
     raw_q = list(session.get("questions") or [])
     raw_a = list(session.get("answers") or [])
     # Issue 2 (May 2026): drop the non-evaluated warmup turn from every
@@ -2347,6 +2350,11 @@ def _recovery_worker_loop() -> None:
 
 app = FastAPI(title=APP_TITLE)
 
+# Rate limiting must be wired up BEFORE any @_rl.limit(...) decorator below is
+# evaluated: limit() resolves the limiter at decoration time, so calling this
+# at the bottom of the module (as it used to be) left all per-route limits inert.
+_rl.setup_rate_limit(app)
+
 
 @app.on_event("startup")
 def _start_interview_recovery_worker() -> None:
@@ -2680,8 +2688,7 @@ async def setup(
     if auth_err:
         return auth_err
     setup_session_key = _session_key_from_payload(payload)
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    has_ai = bool(api_key and api_key != "your_key_here")
+    has_ai = openai_key_configured("question")
 
     selected_model = (custom_model or model).strip() or "gpt-4o-mini"
     safe_mode_on = str(safe_mode).strip().lower() in {"1", "true", "yes", "on"}
@@ -3369,8 +3376,7 @@ def _apply_turn_evaluation(session: dict, previous_question: str, answer_text: s
         meta = session.get("meta", {})
         if meta.get("safe_mode", True):
             return
-        key = (os.getenv("OPENAI_API_KEY") or "").strip()
-        if not key or key == "your_key_here":
+        if not openai_key_configured("eval"):
             return
         jd_skills = meta.get("jd_skills", []) or []
         focus = detect_skill_from_question(previous_question, jd_skills) or (jd_skills[0] if jd_skills else "technical")
@@ -3404,8 +3410,7 @@ def _expand_time_mode_pool(session: dict) -> None:
         return
     if str(meta.get("timing_mode") or "") != "time":
         return
-    key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not key or key == "your_key_here" or meta.get("safe_mode", True):
+    if not openai_key_configured("question") or meta.get("safe_mode", True):
         return
     qs = list(session.get("questions") or [])
     cur = int(session.get("current", 0))
@@ -5794,8 +5799,7 @@ async def template_sample_questions(
         form_skills=skills,
     )
 
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    has_ai = bool(api_key and api_key != "your_key_here")
+    has_ai = openai_key_configured("question")
     coach_hints_text()
     model = str(os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
     safe_mode_on = str(os.getenv("INTERVIEW_SAFE_MODE", "false")).lower() in {"1", "true", "yes", "on"}
@@ -6019,8 +6023,7 @@ async def template_test_prompt(
     )
     model = str(os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
     safe_mode_on = str(os.getenv("INTERVIEW_SAFE_MODE", "false")).lower() in {"1", "true", "yes", "on"}
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    has_ai = bool(api_key and api_key != "your_key_here")
+    has_ai = openai_key_configured("question")
     # Review-step preview: generate 15–20 questions so HR can sanity-check the prompt.
     test_n = max(15, min(20, int(numQ or 15)))
     if has_ai and not safe_mode_on:
@@ -6861,10 +6864,17 @@ def auth_forgot_password(
             mail_res = send_password_reset_email(email_clean, str(user.get("full_name") or ""), reset_url)
             if not mail_res.get("ok"):
                 logger.warning("Password reset email send failed for %s: %s", email_clean, mail_res.get("error"))
-                # Still surface the link to the server log so an admin can hand it over.
-                logger.info("PASSWORD RESET LINK (SMTP send failed) for %s: %s", email_clean, reset_url)
+                # NEVER log the token or the assembled reset URL: anyone with read
+                # access to the log stream could take over the account with it.
+                logger.error(
+                    "auth.forgot_password.undelivered user_id=%s - reset token issued but not sent",
+                    int(user["id"]),
+                )
         else:
-            logger.info("PASSWORD RESET LINK (SMTP disabled) for %s: %s", email_clean, reset_url)
+            logger.error(
+                "auth.forgot_password.smtp_disabled user_id=%s - reset token issued but SMTP is off",
+                int(user["id"]),
+            )
         logger.info(
             "auth.forgot_password.issued",
             extra={"event": "auth.forgot_password.issued", "candidate_name": str(user.get("full_name") or "")},
@@ -7740,8 +7750,8 @@ try:
 except Exception as _crm_exc:  # pragma: no cover — never block interview platform boot
     logger.error("Karnex CRM routers failed to register: %s", _crm_exc)
 
-# Optional slowapi-based rate limiting. No-op unless RATE_LIMIT_ENABLED=true.
-_rl.setup_rate_limit(app)
+# Rate limiting is wired up right after `app = FastAPI(...)` above, because the
+# @_rl.limit(...) decorators resolve the limiter at decoration time.
 
 
 # Serve frontend from same backend server so one command runs all.

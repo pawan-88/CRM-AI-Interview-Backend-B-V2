@@ -8,14 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from openai_client import get_openai_client
+from openai_client import get_openai_client, openai_key_configured
 from prompt_logger import tracked_chat_completion, log_openai_call
 
 from paths import DATA_DIR
 
 
 def _client():
-    return get_openai_client()
+    # ATS has its own purpose key (falls back to eval, then to the master key)
+    # so a scan-all burst cannot exhaust the quota a live interview depends on.
+    return get_openai_client("ats")
 
 
 def _db_target() -> str:
@@ -494,9 +496,11 @@ def ats_score_llm(*, jd_text: str, resume_text: str, model: str = "gpt-4o-mini")
     LLM-assisted ATS scoring (best-effort).
     Returns the same top-level keys as ats_score().
     """
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
+    if not openai_key_configured("ats"):
+        raise RuntimeError(
+            "No OpenAI key configured for ATS. Set OPENAI_API_KEY_ATS, "
+            "OPENAI_API_KEY_EVALUATION or OPENAI_API_KEY."
+        )
     jd = (jd_text or "").strip()
     cv = (resume_text or "").strip()
     if not jd or not cv:

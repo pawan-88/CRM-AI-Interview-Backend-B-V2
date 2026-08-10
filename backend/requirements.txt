@@ -21,3 +21,4 @@ weasyprint
 # WeasyPrint on Windows needs the GTK3 runtime:
 #   https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#windows
 # Without GTK the Tax Invoice PDF falls back to ReportLab (same API contract).
+slowapi>=0.1.9

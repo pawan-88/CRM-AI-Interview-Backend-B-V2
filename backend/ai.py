@@ -8,7 +8,7 @@ import difflib
 from io import BytesIO
 from typing import Dict, List, Optional, Sequence
 
-from openai_client import get_openai_client
+from openai_client import get_openai_client, openai_key_configured
 from prompt_logger import tracked_chat_completion, log_openai_call
 from prompt_builder import (
     build_system_prompt,
@@ -1536,10 +1536,9 @@ def merge_per_question_eval_into_report(
             out["recommendation"] = "Consider"
         out["overall_fitment"] = out.get("overall_fitment") or "Moderate Fit"
 
-    out["per_question_eval_mode"] = "openai" if (os.getenv("OPENAI_API_KEY") or "").strip() not in (
-        "",
-        "your_key_here",
-    ) else "deterministic_fallback"
+    out["per_question_eval_mode"] = (
+        "openai" if openai_key_configured("eval") else "deterministic_fallback"
+    )
 
     semantic = _semantic_answer_dimensions(questions, answers, [str((r or {}).get("skill") or "") for r in (out.get("skill_scores") or []) if isinstance(r, dict)])
     out.setdefault("scoring_dimensions", {})
