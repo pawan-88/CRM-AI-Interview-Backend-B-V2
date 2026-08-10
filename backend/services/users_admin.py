@@ -192,11 +192,14 @@ def set_tab_access(db: Session, user_id: int, tabs: list[str] | None,
 
 
 def list_users(db: Session, p: PageParams) -> tuple[list[dict], dict]:
-    where = ""
+    # Users tab manages application login accounts only (legacy role = hr).
+    # Candidate interview accounts stay out of Admin/CEO user management.
+    clauses = ["LOWER(role) = 'hr'"]
     params: dict = {}
     if p.search:
-        where = "WHERE LOWER(username) LIKE :like OR LOWER(email) LIKE :like"
+        clauses.append("(LOWER(username) LIKE :like OR LOWER(email) LIKE :like)")
         params["like"] = f"%{p.search.lower()}%"
+    where = "WHERE " + " AND ".join(clauses)
     total = db.execute(
         sa.text(f"SELECT COUNT(*) FROM registration_data {where}"), params
     ).scalar() or 0
@@ -224,6 +227,11 @@ def create_user(db: Session, full_name: str, email: str, username: str,
                 password: str, legacy_role: str, role_names: list[str]) -> dict:
     # Validate CRM roles BEFORE touching the legacy table.
     members = [_role_member(n) for n in dict.fromkeys(role_names or [])]
+    if not members:
+        raise HTTPException(
+            status_code=400,
+            detail="Assign at least one CRM role so the user can access the application.",
+        )
     try:
         created = register_user(
             _legacy_db_target(),
@@ -263,14 +271,79 @@ def set_user_active(db: Session, user_id: int, active: bool) -> dict:
     return _user_out(row, _roles_map(db, [user_id]).get(user_id, []))
 
 
+def _table_has_column(db: Session, table: str, column: str) -> bool:
+    return bool(
+        db.execute(
+            sa.text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = :t AND column_name = :c"
+            ),
+            {"t": table, "c": column},
+        ).scalar()
+    )
+
+
+def _detach_user_refs(db: Session, user_id: int, reassign_to: int) -> None:
+    """Clear/reassign FK refs so Admin/CEO can hard-delete login accounts."""
+    nullable = [
+        ("candidate_profiles", "ta_owner_id"),
+        ("timesheets", "approved_by"),
+        ("timesheet_uploads", "uploaded_by"),
+        ("interview_events", "created_by"),
+        ("leave_applications", "decided_by"),
+        ("requirements", "sales_head_approved_by"),
+        ("requirements", "engineering_reviewed_by"),
+        ("requirement_documents", "uploaded_by"),
+        ("resumes", "screened_by"),
+        ("ai_interview_links", "scheduled_by"),
+        ("invoices", "approved_by"),
+        ("opportunity_documents", "uploaded_by"),
+        ("opportunities", "sales_head_approved_by"),
+        ("template_requests", "fulfilled_by"),
+        ("template_requests", "prepared_by"),
+        ("employees", "user_id"),
+    ]
+    owned = [
+        ("user_roles", "user_id"),
+        ("user_profiles", "user_id"),
+        ("notifications", "user_id"),
+        ("user_table_preferences", "user_id"),
+        ("timesheet_drafts", "user_id"),
+        ("requirement_watchers", "user_id"),
+        ("opportunity_watchers", "user_id"),
+        ("invoice_watchers", "user_id"),
+        ("login_history", "user_id"),
+    ]
+    reassign = [
+        ("requirements", "created_by"),
+        ("requirement_comments", "posted_by"),
+        ("opportunities", "created_by"),
+        ("invoices", "created_by"),
+        ("template_requests", "requested_by"),
+    ]
+    for table, col in nullable:
+        if _table_has_column(db, table, col):
+            db.execute(
+                sa.text(f"UPDATE {table} SET {col} = NULL WHERE {col} = :i"),
+                {"i": user_id},
+            )
+    for table, col in owned:
+        if _table_has_column(db, table, col):
+            db.execute(sa.text(f"DELETE FROM {table} WHERE {col} = :i"), {"i": user_id})
+    for table, col in reassign:
+        if _table_has_column(db, table, col):
+            db.execute(
+                sa.text(f"UPDATE {table} SET {col} = :new WHERE {col} = :old"),
+                {"new": reassign_to, "old": user_id},
+            )
+
+
 def delete_user(db: Session, user_id: int, actor_id: int) -> dict:
-    """Hard-delete a user. Refuses self-deletion and surfaces FK references clearly."""
+    """Hard-delete a login account. Admin/CEO: detach/reassign FKs first."""
     row = _require_user_row(db, user_id)
     if user_id == actor_id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account.")
-    # Remove owned RBAC/profile rows first (no ON DELETE CASCADE on these).
-    db.execute(delete(UserRole).where(UserRole.user_id == user_id))
-    db.execute(sa.text("DELETE FROM user_profiles WHERE user_id = :i"), {"i": user_id})
+    _detach_user_refs(db, user_id, reassign_to=actor_id)
     try:
         db.execute(sa.text("DELETE FROM registration_data WHERE id = :i"), {"i": user_id})
         db.commit()
@@ -279,8 +352,8 @@ def delete_user(db: Session, user_id: int, actor_id: int) -> dict:
         raise HTTPException(
             status_code=409,
             detail=(
-                "This user is referenced by other records (e.g. opportunities they created) "
-                "and cannot be deleted. Deactivate the user instead."
+                "This user is still referenced by other records and cannot be deleted. "
+                "Deactivate the user instead — deactivated accounts cannot log in."
             ),
         )
     return {"id": user_id, "username": row["username"]}

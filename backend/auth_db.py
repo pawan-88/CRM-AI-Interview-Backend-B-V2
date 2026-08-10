@@ -3031,7 +3031,8 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT id, full_name, email, username, role, password_hash, password_salt
+                    SELECT id, full_name, email, username, role, password_hash, password_salt,
+                           COALESCE(is_active, TRUE) AS is_active
                     FROM registration_data
                     WHERE username = %s OR email = %s
                     """,
@@ -3042,7 +3043,8 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
         with _connect_sqlite(Path(db_target)) as conn:
             row = conn.execute(
                 """
-                SELECT id, full_name, email, username, role, password_hash, password_salt
+                SELECT id, full_name, email, username, role, password_hash, password_salt,
+                       COALESCE(is_active, 1) AS is_active
                 FROM registration_data
                 WHERE username = ? OR email = ?
                 """,
@@ -3051,6 +3053,10 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
     if not row:
         _insert_login(db_target, None, uname, None, 0, "User not found", now, client_ip)
         return {"success": False, "message": "Invalid username or password."}
+
+    if not bool(row["is_active"]):
+        _insert_login(db_target, row["id"], uname, row["role"], 0, "Account deactivated", now, client_ip)
+        return {"success": False, "message": "This account has been deactivated. Contact an Admin."}
 
     expected_hash = row["password_hash"]
     salt_hex = row["password_salt"]
