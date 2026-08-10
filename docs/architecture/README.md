@@ -67,4 +67,4 @@ browser (offline/locked-down env), the Markdown diagrams still render everywhere
 - Role names match `models/rbac.py::RoleName` exactly.
 - Endpoint paths and table/column names match the code exactly so diagrams are greppable.
 
-_Last synced: 2026-07-31 — CRM notifications dropdown portaled outside glass header (fixes white compositing patch)._
+_Last synced: 2026-08-10 — Users tab Admin/CEO login control: create email/password accounts, inactive blocked at login, list HR-only, hard-delete detaches FKs; keep-list purge script._

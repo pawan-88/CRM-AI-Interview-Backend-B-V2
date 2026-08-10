@@ -158,20 +158,22 @@ journey
       View finance dashboard: 5: Finance
 ```
 
-## 5.8 Admin journey (governance)
+## 5.8 Admin / CEO journey (governance)
 
 ```mermaid
 journey
-    title Admin — governance & configuration
+    title Admin/CEO — who can access the application
     section Users
-      Create users: 4: Admin
-      Assign/replace CRM roles: 4: Admin
-      Set per-user tab access (all tabs listed): 5: Admin
-      Activate/deactivate + portal access: 3: Admin
+      Create account (email + password + CRM roles): 5: Admin/CEO
+      Assign/replace CRM roles + tab access: 5: Admin/CEO
+      Activate/deactivate or delete login access: 5: Admin/CEO
+      Full CRM deletes (customers, projects, invoices, …): 5: Admin/CEO
+    section Self-service (any user)
+      Login with email or username: 5: User
+      Update own profile + password: 5: User
     section Configuration
-      Manage master data: 4: Admin
-      Manage app settings (pass threshold): 4: Admin
-      Access all CRM views + AI usage logs: 5: Admin
+      Manage master data + access templates: 4: Admin/CEO
+      Access all CRM views + AI usage logs: 5: Admin/CEO
 ```
 
 ## 5.9 CRM lifecycle swimlane (cross-role, end to end)

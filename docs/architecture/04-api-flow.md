@@ -141,9 +141,21 @@ flowchart LR
 
 ## 4.5 Per-user tab access (Admin/CEO)
 
-Admin/CEO assigns an explicit allow-list of UI tab keys per user via
+Admin/CEO manage application login accounts on the Users page (`#/crm/users`):
+create with email + password + CRM roles (`POST /api/users`), replace roles,
+activate/deactivate, and delete. `GET /api/users` lists legacy `role='hr'`
+accounts only (candidate interview logins are excluded). Deactivated users are
+rejected at `POST /auth/login` as well as on CRM `/api/me`. Hard delete
+(`DELETE /api/users/{id}`) detaches/reassigns FK refs to the acting Admin/CEO
+when possible.
+
+Admin/CEO also assign an explicit allow-list of UI tab keys per user via
 `POST /api/users/{id}/tab-access`. Stored in `user_profiles.tab_access` (JSON text).
 `NULL` → role-based sidebar defaults; non-null → only listed keys appear in the shell.
+
+Users update their own profile (name, phone, password, avatar) via
+`GET/PATCH /api/me/profile` and `POST /api/me/change-password` — Admin does not
+edit another user’s password from the Users page.
 
 ```mermaid
 sequenceDiagram
