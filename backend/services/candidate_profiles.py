@@ -6,6 +6,7 @@ renders what GET /api/candidate-profiles/{id} returns in allowed_next_statuses.
 from __future__ import annotations
 
 import logging
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import HTTPException
@@ -37,7 +38,13 @@ _FORWARD: dict[str, list[str]] = {
     PS.RMG_REVIEW.value: [PS.SALES_SCREENING.value],
     PS.SALES_SCREENING.value: [PS.CUSTOMER_SCREENING.value],
     PS.CUSTOMER_SCREENING.value: [PS.CUSTOMER_INTERVIEW.value],
-    PS.CUSTOMER_INTERVIEW.value: [PS.SHORTLISTED.value],
+    # The customer's own ladder: interview happens, then its first round's
+    # feedback lands, then its second's, then they shortlist.
+    PS.CUSTOMER_INTERVIEW.value: [PS.L1_FEEDBACK.value],
+    # Not every customer runs two rounds, so L1 feedback may go straight to a
+    # shortlist. Forcing a fictional L2 stage would make the pipeline lie.
+    PS.L1_FEEDBACK.value: [PS.L2_FEEDBACK.value, PS.SHORTLISTED.value],
+    PS.L2_FEEDBACK.value: [PS.SHORTLISTED.value],
     PS.SHORTLISTED.value: [PS.CUSTOMER_APPROVAL.value],
     PS.CUSTOMER_APPROVAL.value: [PS.PREBOARDING.value],
     PS.PREBOARDING.value: [PS.JOINED.value],
@@ -50,6 +57,10 @@ _BACKWARD: dict[str, list[str]] = {
     # Customer Interviewing can send the profile back to Customer Screening
     # (e.g. interview postponed / another shortlist round needed).
     PS.CUSTOMER_INTERVIEW.value: [PS.CUSTOMER_SCREENING.value],
+    # A customer round can be re-run — bounce back to the interview stage
+    # rather than stranding the profile on a feedback it has superseded.
+    PS.L1_FEEDBACK.value: [PS.CUSTOMER_INTERVIEW.value],
+    PS.L2_FEEDBACK.value: [PS.L1_FEEDBACK.value],
 }
 
 #: Stage-specific rejection moves.
@@ -60,6 +71,10 @@ _STAGE_REJECTIONS: dict[str, list[str]] = {
     # (Customer_Rejected) or Sales pulls the submission (Sales_Rejected).
     PS.CUSTOMER_SCREENING.value: [PS.CUSTOMER_REJECTED.value, PS.SALES_REJECTED.value],
     PS.CUSTOMER_INTERVIEW.value: [PS.CUSTOMER_REJECTED.value],
+    # Most customer rejections land here — a candidate is usually dropped
+    # because of what a round's feedback said.
+    PS.L1_FEEDBACK.value: [PS.CUSTOMER_REJECTED.value],
+    PS.L2_FEEDBACK.value: [PS.CUSTOMER_REJECTED.value],
     PS.SHORTLISTED.value: [PS.CUSTOMER_REJECTED.value],
     PS.CUSTOMER_APPROVAL.value: [PS.CUSTOMER_REJECTED.value],
 }
@@ -86,6 +101,10 @@ STAGE_AUTHORITY: dict[str, set[str]] = {
     PS.SALES_SCREENING.value: {"Sales"},
     PS.CUSTOMER_SCREENING.value: {"Sales"},
     PS.CUSTOMER_INTERVIEW.value: {"Sales", "Sales_Head"},
+    # Sales owns the customer relationship, so Sales records what the customer
+    # said at each of its rounds.
+    PS.L1_FEEDBACK.value: {"Sales", "Sales_Head"},
+    PS.L2_FEEDBACK.value: {"Sales", "Sales_Head"},
     PS.SHORTLISTED.value: {"Sales", "Sales_Head"},
     # Sales Head ONLY. Sales puts a candidate into Customer Approval by
     # attaching the offer (rate, joining date); the person who proposes terms
@@ -131,6 +150,8 @@ _SALES_VISIBLE: set[str] = {
     PS.SALES_SCREENING.value,
     PS.CUSTOMER_SCREENING.value,
     PS.CUSTOMER_INTERVIEW.value,
+    PS.L1_FEEDBACK.value,
+    PS.L2_FEEDBACK.value,
     PS.SHORTLISTED.value,
     PS.CUSTOMER_APPROVAL.value,
     PS.PREBOARDING.value,
@@ -292,6 +313,8 @@ _ARRIVAL_NOTIFY_ROLE: dict[str, str] = {
     PS.SALES_SCREENING.value: "Sales",
     PS.CUSTOMER_SCREENING.value: "Sales",
     PS.CUSTOMER_INTERVIEW.value: "Sales",
+    PS.L1_FEEDBACK.value: "Sales",
+    PS.L2_FEEDBACK.value: "Sales",
     # Customer Approval is now Sales Head's decision, so it is Sales Head who
     # needs telling that an offer is waiting on them.
     PS.CUSTOMER_APPROVAL.value: "Sales_Head",
@@ -306,6 +329,10 @@ _ARRIVAL_ACTION: dict[str, str] = {
     PS.SALES_SCREENING.value: "RMG has cleared this candidate. Review and submit to the customer.",
     PS.CUSTOMER_SCREENING.value: "Submitted to the customer — track the response.",
     PS.CUSTOMER_INTERVIEW.value: "A customer interview is due for this candidate.",
+    PS.L1_FEEDBACK.value: "The customer's first-round feedback is in. Record it, then move "
+                          "to their second round or straight to a shortlist.",
+    PS.L2_FEEDBACK.value: "The customer's second-round feedback is in. Record it, then "
+                          "shortlist or reject.",
     PS.CUSTOMER_APPROVAL.value: "Offer terms are ready for your approval. Review the rate "
                                 "and joining date, edit if needed, then approve to move "
                                 "this candidate into preboarding.",
@@ -368,78 +395,203 @@ def _check_entry_requirement(db: Session, profile: CandidateProfile, new_status:
 
 
 #: Destination status -> the customer's verdict, in the Interview_Result
-#: vocabulary. Only outcomes that genuinely express a customer decision map;
-#: a bounce back to Customer Screening is a reschedule, not a verdict.
+#: vocabulary. Only outcomes that genuinely express a decision map; a bounce
+#: back to an earlier stage is a reschedule, not a verdict.
 _CUSTOMER_VERDICT: dict[str, str] = {
     PS.SHORTLISTED.value: "Hire",
     PS.CUSTOMER_APPROVAL.value: "Hire",
     PS.CUSTOMER_REJECTED.value: "No Hire",
 }
 
+#: Arriving at one of these means that customer round's feedback is in, so the
+#: text typed on the transition IS that round's feedback. Stored on the round's
+#: `stage` column so the customer's first and second rounds stay distinct
+#: without inventing new interview kinds.
+_FEEDBACK_STAGE_ROUND: dict[str, str] = {
+    PS.L1_FEEDBACK.value: "L1",
+    PS.L2_FEEDBACK.value: "L2",
+}
+
 
 def _record_customer_round_from_transition(db: Session, profile: CandidateProfile,
                                            previous: str, new_status: str,
                                            feedback: str, user: CurrentUser) -> None:
-    """Persist a customer decision as a Customer_Interview round.
+    """Persist customer feedback typed on a transition as an interview round.
 
-    When Sales shortlists or rejects a candidate after the client has seen
-    them, what they type IS the customer's feedback. Previously it went only
-    into the activity log, so the Interviews tab — the place you look for
-    interview feedback — showed the L1 and L2 rounds and then simply stopped.
+    Two shapes of the same idea:
 
-    Updates the existing customer round when one is already there (Sales may
-    have recorded it explicitly first), rather than creating a duplicate.
+      * ARRIVING at L1/L2 Feedback — that round's verdict is in, and the text
+        is its feedback. Recorded against `stage` L1 or L2.
+      * LEAVING the customer's ladder with a decision (shortlist / approve /
+        reject) — the text is the closing verdict, applied to the most recent
+        customer round.
 
-    Best-effort: a bookkeeping failure must never roll back a legitimate
-    status change.
+    Without this the Interviews tab showed RMG's technical rounds and then
+    stopped, while the customer's actual words lived only in the activity log.
+
+    Best-effort: bookkeeping must never roll back a legitimate status change.
     """
-    if previous != PS.CUSTOMER_INTERVIEW.value:
-        return
-    verdict = _CUSTOMER_VERDICT.get(new_status)
-    if not verdict:
-        return
     try:
-        existing = db.execute(
-            select(InterviewEvent)
-            .where(InterviewEvent.profile_id == profile.id,
-                   InterviewEvent.kind == "Customer_Interview")
-            .order_by(InterviewEvent.id.desc())
-            .limit(1)
-        ).scalar_one_or_none()
-
-        if existing is not None:
-            # Sales already logged the round; fill in the verdict and append
-            # the decision note without discarding what they wrote.
-            existing.result = existing.result or verdict
-            existing.status = existing.status or "Completed"
-            if feedback and feedback not in (existing.feedback or ""):
-                existing.feedback = f"{existing.feedback}\n\n{feedback}".strip() if existing.feedback else feedback
+        arriving_round = _FEEDBACK_STAGE_ROUND.get(new_status)
+        if arriving_round:
+            _upsert_customer_round(db, profile, user, stage=arriving_round,
+                                   feedback=feedback, verdict=None)
             return
 
-        db.add(InterviewEvent(
-            profile_id=profile.id,
-            candidate_id=profile.candidate_id,
-            created_by=user.id,
-            kind="Customer_Interview",
-            interview_category="External",
-            status="Completed",
-            result=verdict,
-            feedback=feedback,
-            user_role="Customer",
-        ))
+        # Closing decision — only meaningful if the customer actually saw them.
+        if previous not in _CUSTOMER_LADDER:
+            return
+        verdict = _CUSTOMER_VERDICT.get(new_status)
+        if not verdict:
+            return
+        _upsert_customer_round(db, profile, user,
+                               stage=_FEEDBACK_STAGE_ROUND.get(previous),
+                               feedback=feedback, verdict=verdict)
     except Exception:  # pragma: no cover — never break a transition
         logger.warning("Could not record customer round for profile %s", profile.id, exc_info=True)
+
+
+#: Stages at which the customer has the candidate in front of them.
+_CUSTOMER_LADDER = {
+    PS.CUSTOMER_INTERVIEW.value,
+    PS.L1_FEEDBACK.value,
+    PS.L2_FEEDBACK.value,
+}
+
+
+def _upsert_customer_round(db: Session, profile: CandidateProfile, user: CurrentUser, *,
+                           stage: str | None, feedback: str, verdict: str | None) -> None:
+    """Create or update the customer round for this stage.
+
+    Matched on (profile, kind, stage) so the customer's L1 and L2 are separate
+    rows, and so recording a verdict after the feedback updates the same round
+    rather than creating a second one.
+    """
+    query = (
+        select(InterviewEvent)
+        .where(InterviewEvent.profile_id == profile.id,
+               InterviewEvent.kind == "Customer_Interview")
+        .order_by(InterviewEvent.id.desc())
+        .limit(1)
+    )
+    if stage:
+        query = (
+            select(InterviewEvent)
+            .where(InterviewEvent.profile_id == profile.id,
+                   InterviewEvent.kind == "Customer_Interview",
+                   InterviewEvent.stage == stage)
+            .order_by(InterviewEvent.id.desc())
+            .limit(1)
+        )
+    existing = db.execute(query).scalar_one_or_none()
+
+    if existing is not None:
+        if verdict:
+            existing.result = existing.result or verdict
+        existing.status = existing.status or "Completed"
+        # Append rather than overwrite — Sales may have written the round up
+        # in detail already, and a one-line decision note should not replace it.
+        if feedback and feedback not in (existing.feedback or ""):
+            existing.feedback = (
+                f"{existing.feedback}\n\n{feedback}".strip() if existing.feedback else feedback
+            )
+        return
+
+    db.add(InterviewEvent(
+        profile_id=profile.id,
+        candidate_id=profile.candidate_id,
+        created_by=user.id,
+        kind="Customer_Interview",
+        stage=stage,
+        interview_category="External",
+        status="Completed",
+        result=verdict,
+        feedback=feedback,
+        user_role="Customer",
+    ))
+
+
+#: Minimum length when a note IS required.
+MIN_COMMENT_LENGTH = 5
+
+
+def comment_required_for(current: str, new_status: str) -> bool:
+    """Does this transition need a written note?
+
+    Requiring one on EVERY move made the field noise on routine progress —
+    "moving to Customer Screening" adds nothing the status change does not
+    already say, so people type "ok" to get past it, and the habit devalues
+    the notes that matter.
+
+    A note is required where it carries information nothing else records:
+
+      * rejections and withdrawals — why someone was dropped is not
+        recoverable from the status alone
+      * backward moves — going back is an exception and needs explaining
+      * the customer's feedback stages — the note IS the feedback, and it is
+        saved as that round's interview record
+    """
+    if new_status in REJECTED_BUCKET:
+        return True
+    if new_status in _FEEDBACK_STAGE_ROUND:
+        return True
+    if new_status in _BACKWARD.get(current, []):
+        return True
+    # Closing the customer's ladder: the note is the customer's verdict.
+    if current in _CUSTOMER_LADDER and new_status in _CUSTOMER_VERDICT:
+        return True
+    return False
+
+
+#: Workflow dates the pipeline already knows and should stamp for itself.
+#: Each is "the day this profile was handed to that team", so the day of the
+#: move is the correct value — asking a human to retype it invites drift.
+_STAGE_DATE_STAMPS: dict[str, str] = {
+    PS.TECHNICAL_SCREENING.value: "technical_submission_date",
+    PS.SALES_SCREENING.value: "sales_submission_date",
+    PS.CUSTOMER_SCREENING.value: "customer_submission_date",
+}
+
+
+def _stamp_workflow_dates(db: Session, profile: CandidateProfile, new_status: str) -> None:
+    """Fill the workflow dates this transition establishes.
+
+    Only ever fills a blank. Stepping back and forward again must not overwrite
+    the first submission date — that original is what turnaround time is
+    measured from, and silently resetting it would flatter the numbers.
+    """
+    field = _STAGE_DATE_STAMPS.get(new_status)
+    if field and getattr(profile, field, None) is None:
+        setattr(profile, field, date.today())
+
+    # Onboarding is a planned future date, not the date of this move, so it is
+    # taken from the offer rather than stamped as today.
+    if new_status == PS.PREBOARDING.value and profile.customer_onboarding_date is None:
+        joining = db.execute(
+            select(OfferHistory.joining_date)
+            .where(OfferHistory.profile_id == profile.id,
+                   OfferHistory.joining_date.isnot(None))
+            .order_by(OfferHistory.offer_date.desc(), OfferHistory.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if joining is not None:
+            profile.customer_onboarding_date = joining
 
 
 def perform_transition(db: Session, profile: CandidateProfile, new_status: str,
                        comment: str | None, user: CurrentUser) -> str:
     """Validate + apply one pipeline transition. Caller commits. Returns the old status."""
     clean_comment = (comment or "").strip()
-    if len(clean_comment) < 5:
-        raise HTTPException(status_code=400,
-                            detail="A comment is mandatory for every status transition (minimum 5 characters)")
-
     current = _status_value(profile.pipeline_status)
+
+    if comment_required_for(current, new_status) and len(clean_comment) < MIN_COMMENT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This move needs a note of at least {MIN_COMMENT_LENGTH} characters — "
+                "it is the only record of why."
+            ),
+        )
     valid_values = {m.value for m in PS}
     if new_status not in valid_values:
         raise HTTPException(status_code=400,
@@ -465,6 +617,7 @@ def perform_transition(db: Session, profile: CandidateProfile, new_status: str,
     _check_entry_requirement(db, profile, new_status)
 
     profile.pipeline_status = PS(new_status)
+    _stamp_workflow_dates(db, profile, new_status)
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "STATUS_CHANGE", f"{current} -> {new_status}: {clean_comment}")
 

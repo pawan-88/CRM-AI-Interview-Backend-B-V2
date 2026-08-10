@@ -20,9 +20,10 @@ from models import (
 from pydantic import BaseModel, Field
 
 from schemas.candidate_profiles import (
-    OfferCreate, OfferUpdate, ProfileCreate, ProfileUpdate, SkillEvaluationItem,
+    OfferCreate, OfferUpdate, ProfileCreate, ProfileStatusTransitionIn, ProfileUpdate,
+    SkillEvaluationItem,
 )
-from schemas.common import StatusTransitionIn, envelope
+from schemas.common import envelope
 from services.candidate_profiles import (
     REJECTED_BUCKET, user_may_transition_from, backfill_profile_commercials, compute_hike_percent, enrich_profiles_list,
     get_profile_or_404, interview_event_to_dict, interview_events_for_profile,
@@ -40,7 +41,10 @@ router = APIRouter(prefix="/api/candidate-profiles", tags=["CRM: Candidate Profi
 
 create_roles = role_required("TA", "Sales", "RMG")
 evaluation_roles = role_required("RMG", "TA", "Sales")
-offer_roles = role_required("Sales", "Sales_Head", "HR")
+#: Roles that may record an offer — on the Offers tab or alongside the status
+#: change that requires one.
+OFFER_WRITE_ROLES = ("Sales", "Sales_Head", "HR")
+offer_roles = role_required(*OFFER_WRITE_ROLES)
 rmg_roles = role_required("RMG")
 #: Interview feedback is recorded by RMG (Admin/CEO are implicit in role_required).
 interview_round_roles = role_required(*INTERVIEW_ROUND_WRITE_ROLES)
@@ -435,15 +439,51 @@ def delete_profile(profile_id: int,
 # ---------------------------------------------------------------------------
 
 @router.post("/{profile_id}/status-transition")
-def status_transition(profile_id: int, payload: StatusTransitionIn,
+def status_transition(profile_id: int, payload: ProfileStatusTransitionIn,
                       db: Session = Depends(get_crm_db),
                       user: CurrentUser = Depends(any_crm_role)):
     profile = get_profile_or_404(db, profile_id)
+
+    # Moving to Customer Approved requires an offer, so the offer can be
+    # supplied with the move. Doing it here rather than making the user visit
+    # the Offers tab first keeps both writes in ONE transaction: a rejected
+    # transition rolls the offer back, instead of leaving an orphaned offer
+    # attached to a profile that never advanced.
+    created_offer = None
+    if payload.offer is not None:
+        if payload.new_status != PipelineStatus.CUSTOMER_APPROVAL.value:
+            raise HTTPException(
+                status_code=400,
+                detail="An offer can only be attached when moving to Customer Approved.",
+            )
+        _require_offer_authority(user)
+        created_offer = OfferHistory(profile_id=profile.id, status=OfferStatus.PENDING,
+                                     **payload.offer.model_dump())
+        db.add(created_offer)
+        db.flush()  # so the entry-requirement check below sees it
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                     "OFFER_CREATED",
+                     f"Offer #{created_offer.id} created with the status change "
+                     f"(CTC {payload.offer.ctc}, offered {payload.offer.offer_date.isoformat()})")
+
     old_status = perform_transition(db, profile, payload.new_status, payload.comment, user)
     db.commit()
     db.refresh(profile)
-    return envelope(data=profile_to_dict(profile),
-                    message=f"Status changed: {old_status} -> {payload.new_status}")
+    message = f"Status changed: {old_status} -> {payload.new_status}"
+    if created_offer is not None:
+        message = "Offer recorded and sent to Sales Head for approval"
+    return envelope(data=profile_to_dict(profile), message=message)
+
+
+def _require_offer_authority(user: CurrentUser) -> None:
+    """Attaching an offer needs the same role as creating one on the Offers tab."""
+    if getattr(user, "is_admin", False):
+        return
+    if not (set(getattr(user, "roles", []) or []) & set(OFFER_WRITE_ROLES)):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Recording an offer requires one of: {', '.join(OFFER_WRITE_ROLES)}",
+        )
 
 
 # ---------------------------------------------------------------------------

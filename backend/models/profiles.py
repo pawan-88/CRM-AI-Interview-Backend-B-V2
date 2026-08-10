@@ -16,6 +16,13 @@ class PipelineStatus(str, enum.Enum):
     SALES_SCREENING = "Sales_Screening"
     CUSTOMER_SCREENING = "Customer_Screening"
     CUSTOMER_INTERVIEW = "Customer_Interview"
+    # The customer's OWN two rounds, recorded by Sales as each verdict lands.
+    # Distinct from L1_Interview / L2_F2F, which are RMG's technical rounds
+    # much earlier in the pipeline — the customer runs its own ladder after we
+    # submit, and the pipeline had no way to show which of those rounds a
+    # candidate was waiting on.
+    L1_FEEDBACK = "L1_Feedback"
+    L2_FEEDBACK = "L2_Feedback"
     SHORTLISTED = "Shortlisted"
     CUSTOMER_APPROVAL = "Customer_Approval"
     PREBOARDING = "Preboarding"

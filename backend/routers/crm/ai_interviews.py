@@ -31,7 +31,12 @@ from services.crm_common import log_activity, to_dict
 router = APIRouter(prefix="/api/candidate-profiles", tags=["CRM: AI Interviews"])
 
 VIEW_ROLES = ("TA", "RMG", "Sales", "Sales_Head", "HR")
-TRIGGER_ROLES = ("TA", "RMG", "Sales")
+#: AI L1 is TA's step in the pipeline — they source the candidate, run the ATS
+#: scan and trigger the interview; a pass then hands the candidate to RMG.
+#: Scheduling from a resume was already TA-only (routers/crm/resumes.py), but
+#: the profile page let RMG and Sales trigger one too, so the same action had
+#: two different answers depending on which screen you were looking at.
+TRIGGER_ROLES = ("TA",)
 
 
 class AiInterviewCreate(BaseModel):

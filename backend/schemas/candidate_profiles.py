@@ -20,6 +20,13 @@ class ProfileUpdate(BaseModel):
     expected_ctc: float | None = None
     commercial_approved: bool | None = None
     ctc_approval_amount: float | None = None
+    # Workflow references. No automated source exists for these — they are
+    # numbers issued outside the system — so they have to be typed in, and
+    # were previously display-only with nothing anywhere able to set them.
+    offer_letter_reference: str | None = None
+    employee_ref: str | None = None
+    #: Derived from the offer on reaching Pre Onboarding, but plans move.
+    customer_onboarding_date: date | None = None
 
 
 class SkillEvaluationItem(BaseModel):
@@ -37,6 +44,19 @@ class OfferCreate(BaseModel):
     joining_date: date | None = None
     expiry_date: date | None = None
     offer_letter_url: str | None = None
+
+
+class ProfileStatusTransitionIn(BaseModel):
+    """Status change, optionally carrying the offer that the change requires.
+
+    Customer Approved cannot be entered without an offer on record. Rather than
+    sending the user to the Offers tab, creating one, and coming back, the
+    offer travels with the move and both are written in one transaction.
+    """
+    new_status: str
+    comment: str | None = None
+    #: Only valid when new_status is Customer_Approval.
+    offer: OfferCreate | None = None
 
 
 class OfferUpdate(BaseModel):
