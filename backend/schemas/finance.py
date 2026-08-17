@@ -57,6 +57,35 @@ class PurchaseOrderUpdate(BaseModel):
     delivery_address: AddressSnapshotIn | None = None
 
 
+class PurchaseOrderRenewIn(BaseModel):
+    """Raise the next PO in a series from an expiring one.
+
+    ``po_number`` is required and has no default: a purchase order number comes
+    from the customer, so generating one here would invent a reference that
+    does not exist on their side. Everything else defaults to the old PO's
+    terms and can be overridden per field.
+
+    Money never carries over. ``total_value`` is the new order's own value —
+    the old PO keeps its consumed and balance figures so its invoices still
+    reconcile.
+    """
+
+    po_number: str = Field(min_length=1, max_length=64)
+    total_value: Decimal = Field(gt=0)
+    start_date: date | None = None
+    end_date: date | None = None
+    received_date: date | None = None
+    #: Omit to inherit from the PO being renewed.
+    billing_branch_id: int | None = None
+    delivery_branch_id: int | None = None
+    contact_person_id: int | None = None
+    po_type: POType | None = None
+    payment_terms: str | None = None
+    terms_conditions: str | None = None
+    tax_slab: Decimal | None = Field(default=None, ge=0, le=100)
+    inter_state: bool | None = None
+
+
 class AllocationIn(BaseModel):
     project_id: int
     allocated_amount: Decimal = Field(gt=0)
@@ -68,13 +97,16 @@ class AllocationHsnUpdate(BaseModel):
 
 
 class ProjectCreatePOIn(BaseModel):
-    """One-click PO creation from a project."""
+    """PO creation from a project — full form minus customer/branch/contact,
+    which derive from the project. Regular PO is the house default."""
 
     total_value: Decimal = Field(gt=0)
     tax_slab: Decimal | None = Field(default=None, ge=0, le=100)
     inter_state: bool = False
-    po_type: POType = POType.STANDARD
+    po_type: POType = POType.REGULAR
     received_date: date | None = None
+    start_date: date | None = None
+    end_date: date | None = None
     payment_terms: str | None = None
 
 

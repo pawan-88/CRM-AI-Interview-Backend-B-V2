@@ -154,10 +154,30 @@ def _when_text(scheduled_at_local: str | None) -> str:
 
 def _send_invite(db: Session, profile: CandidateProfile, candidate: Candidate,
                  requirement: Requirement | None, *, to_email: str, to_name: str,
-                 invite_url: str, access_key: str, when_text: str) -> dict:
-    msg = interview_link_message(to_name, _role_title(db, profile, requirement),
-                                 when_text, invite_url, access_key)
-    return notify_candidate(to_email, candidate.phone, msg["subject"], msg["text"], msg["html"])
+                 invite_url: str, access_key: str, when_text: str,
+                 user=None, level: str = "L1", scheduled_at_raw: str = "") -> dict:
+    """Full invitation when we know who is sending it; the old short note otherwise.
+
+    `user` is the acting CurrentUser — its name, designation and phone become the
+    signature, so the candidate can see and reply to the person handling them.
+    """
+    position = _role_title(db, profile, requirement)
+    if user is not None:
+        from services.interview_invite_email import build_ai_interview_invite
+
+        msg = build_ai_interview_invite(
+            db, user,
+            candidate_name=to_name,
+            position=position,
+            level=level or "L1",
+            scheduled_at_raw=scheduled_at_raw,
+            invite_url=invite_url,
+            access_key=access_key,
+        )
+    else:
+        msg = interview_link_message(to_name, position, when_text, invite_url, access_key)
+    return notify_candidate(to_email, candidate.phone, msg["subject"], msg["text"], msg["html"],
+                            db=db, event="candidate.ai_invite", actor=user, to_name=to_name)
 
 
 @router.get("/{profile_id}/ai-interviews")
@@ -230,7 +250,7 @@ def trigger_ai_interview(profile_id: int, payload: AiInterviewCreate | None = No
         notified = _send_invite(
             db, profile, candidate, requirement, to_email=to_email, to_name=to_name,
             invite_url=bridge.get("invite_url", ""), access_key=bridge.get("access_key", ""),
-            when_text=_when_text(when),
+            when_text=_when_text(when), user=user, level="L1", scheduled_at_raw=when,
         )
         sent = bool((notified.get("email") or {}).get("sent"))
         log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,

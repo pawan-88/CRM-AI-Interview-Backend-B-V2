@@ -24,9 +24,16 @@ class ProjectStatus(str, enum.Enum):
 
 
 class BillingUnit(str, enum.Enum):
+    """The UI labels these Per Hour / Per Day / Per Month / Per Year.
+
+    YEARLY stores the ANNUAL price; invoicing bills its monthly equivalent
+    (rate / 12) — see timesheet_invoice_preview.
+    """
+
     HOURLY = "Hourly"
     DAILY = "Daily"
     MONTHLY = "Monthly"
+    YEARLY = "Yearly"
 
 
 class CommEntryType(str, enum.Enum):
@@ -37,7 +44,9 @@ class CommEntryType(str, enum.Enum):
 class Project(Base):
     __tablename__ = "projects"
     id = sa.Column(sa.Integer, primary_key=True)
-    opportunity_id = sa.Column(sa.Integer, sa.ForeignKey("opportunities.id"), nullable=False, index=True)
+    #: Optional since migration 0069 — projects can exist without a sales
+    #: opportunity (internal work, direct engagements, migrated data).
+    opportunity_id = sa.Column(sa.Integer, sa.ForeignKey("opportunities.id"), nullable=True, index=True)
     customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id"), nullable=False, index=True)
     # Explicit delivery branch (nullable for legacy rows until backfilled).
     # Prefer this over opportunity.branch_id for branch-policy / linked-projects scoping.
@@ -55,6 +64,8 @@ class Project(Base):
     # --- Branch-policy overrides (spec §6): NULL = inherit branch default ---
     holidays_billable = sa.Column(sa.Boolean, nullable=True)
     weekoff_billable = sa.Column(sa.Boolean, nullable=True)
+    #: NULL = inherit branch/customer week-off pattern. (0072)
+    week_off_days = sa.Column(sa.String(20), nullable=True)
     leave_billable = sa.Column(sa.Boolean, nullable=True)
     comp_off_billable = sa.Column(sa.Boolean, nullable=True)
     hours_required_half_day = sa.Column(sa.Numeric(4, 2), nullable=True)

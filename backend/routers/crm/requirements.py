@@ -16,7 +16,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, get_crm_db, get_current_user, page_params, role_required,
+    CurrentUser, PageParams, gated_create, get_crm_db, get_current_user, page_params,
+    role_required,
 )
 from models import (
     Opportunity, Priority, Requirement, RequirementActivityLog, RequirementAttachment,
@@ -36,6 +37,11 @@ from services.requirements import (
 )
 
 router = APIRouter(prefix="/api/requirements", tags=["CRM: Requirements"])
+
+# Requirements are opportunity-spawned records; the "requirements" registry
+# tab was removed (Aug 2026, unused in the UI), so creation is governed by the
+# OPPORTUNITIES grant — whoever may create opportunities may create these.
+create_requirements_gate = gated_create("opportunities", "Sales")
 
 _STATUS_VALUES = {s.value for s in RequirementStatus}
 _PRIORITY_VALUES = {p.value for p in Priority}
@@ -86,7 +92,7 @@ _REQ_ATT_READER = role_required("TA", "RMG", "Sales_Head", "Sales", "Admin")
 def create_requirement(
     payload: RequirementCreate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required("Sales")),
+    user: CurrentUser = Depends(create_requirements_gate),
 ):
     opp = db.get(Opportunity, payload.opportunity_id)
     if opp is None:
@@ -227,7 +233,8 @@ def submit_requirement(
     notify_role(db, "Sales_Head",
                 f"Requirement {req.req_number} submitted for approval",
                 f"'{req.title}' awaits your approval.",
-                f"/requirements/{req.id}", exclude_user_id=user.id)
+                f"/requirements/{req.id}", exclude_user_id=user.id,
+                event="requirement.submitted")
     db.commit()
     return envelope(_one(db, req), message="Submitted for Sales Head approval")
 
@@ -250,7 +257,8 @@ def sales_head_approve(
     notify_role(db, "RMG",
                 f"Requirement {req.req_number} pending engineering review",
                 f"'{req.title}' was approved by Sales Head and needs engineering review.",
-                f"/requirements/{req.id}", exclude_user_id=user.id)
+                f"/requirements/{req.id}", exclude_user_id=user.id,
+                event="requirement.sales_approved")
     if req.created_by != user.id:
         notify_user(db, req.created_by,
                     f"Requirement {req.req_number} approved by Sales Head",
@@ -330,7 +338,8 @@ def engineering_approve(
     notify_role(db, "TA",
                 "New requirement open for sourcing",
                 f"Requirement {req.req_number} '{req.title}' is open for sourcing.",
-                f"/requirements/{req.id}", exclude_user_id=user.id)
+                f"/requirements/{req.id}", exclude_user_id=user.id,
+                event="requirement.engineering_approved")
     if req.created_by != user.id:
         notify_user(db, req.created_by,
                     f"Requirement {req.req_number} approved by Engineering",

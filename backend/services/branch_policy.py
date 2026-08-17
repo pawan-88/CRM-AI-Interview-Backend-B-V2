@@ -195,6 +195,9 @@ def _freq(v):
 # "week_off_billable"; branch "hours_required_*" vs customer "min_hours_*";
 # branch "working_hours_per_day" vs customer "normal_hours_per_day".
 _EFFECTIVE_FIELDS: tuple[tuple[str, str, str | None, object], ...] = (
+    # Paid leaves/year the customer bills even when leave is not billable
+    # (the "APTIV rule", 0078) — the CTC slab adds these back to billing days.
+    ("billable_leaves_per_year", "billable_leaves_per_year", "billable_leaves_per_year", None),
     ("holidays_billable", "holidays_billable", "holidays_billable", False),
     ("weekoff_billable", "weekoff_billable", "week_off_billable", False),
     ("leave_billable", "leave_billable", "leave_billable", False),

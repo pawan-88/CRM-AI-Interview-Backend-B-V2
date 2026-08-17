@@ -276,12 +276,17 @@ Create wizard steps: Project Details (name/opportunity/customer) → Leave & Hol
 ```mermaid
 flowchart LR
     names["GET/POST /api/holiday-names<br/>HR write"] --> master["holiday_names table"]
-    global["GET/POST/PUT/DELETE /api/holidays<br/>HR write · global/customer scope"]
+    global["GET/POST/PUT/DELETE /api/holidays<br/>HR write · Customer type REQUIRES branch_id<br/>auto-upserts branch_holiday_years + holiday_calendar_id"]
     branch["GET/PUT /api/customers/branches/{id}/policy<br/>linked_projects: Project.branch_id OR Opportunity.branch_id<br/>GET/POST/PUT/DELETE …/leave-policies<br/>GET/POST/PUT/DELETE …/holiday-years/…/holidays<br/>read_branch_policy · write_branch_policy"]
     freeze["PATCH .../holiday-years/{year_id}<br/>is_freeze blocks branch date edits"]
-    master --> hol["holidays · holiday_name_id · observance Mandatory|Optional<br/>optional holiday_calendar_id → branch_holiday_years"]
+    master --> hol["holidays · holiday_name_id · observance Mandatory|Optional<br/>branch-scoped rows share holiday_calendar_id → branch_holiday_years"]
     branch --> hol
     global --> hol
     freeze --> bhy["branch_holiday_years"]
     hol --> ts["holidays_for_project_period<br/>Mandatory only → timesheet Holiday/0h"]
 ```
+
+Customer holidays are owned by a **branch**. The Holidays tab and the branch
+Holiday Billing Policy panel read/write the same `holidays` rows; creating or
+updating via `/api/holidays` with a `branch_id` upserts the year header so both
+UIs stay in sync.

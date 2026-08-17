@@ -197,7 +197,8 @@ def send_slot_invite(db: Session, resume: Resume, requirement: Requirement,
     booking = get_or_create_booking(db, resume)
     url = booking_url_for(base_url, booking)
     msg = slot_invite_message(resume.candidate_name, requirement.title, url)
-    results = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"])
+    results = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"],
+                               db=db, event="candidate.slot_invite", to_name=resume.candidate_name)
     return booking, results
 
 
@@ -265,7 +266,8 @@ def auto_pipeline_after_scan(db: Session, resume: Resume, requirement: Requireme
                         f"Auto-shortlisted, manual follow-up needed: {resume.candidate_name}",
                         f"ATS score {score:g}% cleared the auto threshold but the resume has "
                         f"no email/phone — send the slot invite manually.",
-                        f"/admin?view=crm&p=requirements/{requirement.id}")
+                        f"/admin?view=crm&p=requirements/{requirement.id}",
+                        event="slot.manual_followup")
     except Exception as exc:  # pragma: no cover — must never break the scan
         logger.error("ATS auto-pipeline hook failed for resume %s: %s", resume.id, exc)
         info["error"] = str(exc)

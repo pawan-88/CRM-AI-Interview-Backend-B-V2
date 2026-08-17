@@ -363,6 +363,7 @@ def _notify_stage_owner(db: Session, profile: CandidateProfile, previous: str,
             f"/admin?view=crm&p=profiles/{profile.id}",
             # Don't notify the person who just made the change.
             exclude_user_id=user.id,
+            event="candidate.stage_arrival",
         )
     except Exception:  # pragma: no cover — never break a transition
         logger.warning("Could not notify %s about profile %s", role, profile.id, exc_info=True)

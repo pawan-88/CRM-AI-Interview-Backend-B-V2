@@ -398,11 +398,13 @@ def confirm_booking(
     notify_role(db, "TA",
                 f"Slot confirmed: {resume.candidate_name}",
                 f"{resume.candidate_name} confirmed {when} for '{req.title}' — AI L1 scheduled.",
-                f"/admin?view=crm&p=requirements/{req.id}")
+                f"/admin?view=crm&p=requirements/{req.id}",
+                event="slot.confirmed")
 
     msg = interview_link_message(resume.candidate_name, req.title, when,
                                  bridge.get("invite_url", ""), bridge.get("access_key", ""))
-    notified = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"])
+    notified = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"],
+                                db=db, event="candidate.interview_link", to_name=resume.candidate_name)
 
     db.commit()
     return envelope(

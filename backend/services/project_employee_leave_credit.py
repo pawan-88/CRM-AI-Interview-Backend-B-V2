@@ -386,3 +386,126 @@ def run_pe_leave_credit(db: Session, as_of: date | None = None, *, pe_id: int | 
         "rows_credited": rows_touched,
         "total_credited": float(credited),
     }
+
+
+# --------------------------------------------------------------- gap repair
+#
+# This job used to be CLI-only, which made a missed month invisible: nobody
+# notices an under-credited balance until someone disputes it, and by then the
+# month it belonged to is closed. The helpers below let the scheduler answer
+# "which months never ran?" and replay them. Replay is safe because every
+# credit is keyed `pe_credit:{pe}:{type}:{YYYY-MM}` — a month that DID run
+# credits nothing the second time.
+
+
+def month_end(year: int, month: int) -> date:
+    """Last calendar day of the month — the as_of a replayed month must use.
+
+    Month end (not the 1st) matters twice: `_days_present_in_month` prorates
+    against it, and 31 December is the only date `apply_year_end_carry` acts
+    on, so replaying December this way also replays a missed carry-forward.
+    """
+    return date(year, month, _days_in_month(year, month))
+
+
+def _period_of(source: str | None) -> str | None:
+    """`pe_credit:12:3:2026-07` -> `2026-07`. Anything else -> None."""
+    if not source or not source.startswith("pe_credit:"):
+        return None
+    tail = source.rsplit(":", 1)[-1]
+    return tail if len(tail) == 7 and tail[4] == "-" else None
+
+
+def _iter_periods(start: date, end: date):
+    """Yield (year, month) from start's month through end's month inclusive."""
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        yield y, m
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+
+def earliest_accrual_start(db: Session) -> date | None:
+    """Earliest date any active PE could have started accruing. None = nothing to do."""
+    pes = db.execute(
+        select(ProjectEmployee).where(
+            ProjectEmployee.is_active.is_(True),
+            ProjectEmployee.is_exit.is_(False),
+        )
+    ).scalars().all()
+    starts: list[date] = []
+    for pe in pes:
+        rows = db.execute(
+            select(ProjectEmployeeLeaveDetail).where(
+                ProjectEmployeeLeaveDetail.project_employee_id == pe.id
+            )
+        ).scalars().all()
+        for row in rows:
+            start = accrual_start(_row_policy(db, row), pe)
+            if start is not None:
+                starts.append(start)
+    return min(starts) if starts else None
+
+
+def missing_credit_periods(
+    db: Session,
+    *,
+    as_of: date | None = None,
+    lookback_months: int = 12,
+) -> list[str]:
+    """Closed months (never the current one) with no PE credit ledger row at all.
+
+    Deliberately coarse: one `pe_credit` row anywhere in a month is taken as
+    proof the job ran. A finer per-PE check would flag every employee who
+    simply had nothing to accrue that month.
+    """
+    as_of = as_of or date.today()
+    start = earliest_accrual_start(db)
+    if start is None:
+        return []
+
+    # Never look further back than the window — a system that has been off for
+    # a year should be repaired deliberately, not by a background job.
+    floor_y, floor_m = as_of.year, as_of.month
+    for _ in range(max(0, lookback_months)):
+        floor_y, floor_m = (floor_y - 1, 12) if floor_m == 1 else (floor_y, floor_m - 1)
+    if (start.year, start.month) < (floor_y, floor_m):
+        start = date(floor_y, floor_m, 1)
+
+    seen: set[str] = set()
+    for (source,) in db.execute(
+        select(LeaveAccrualEvent.source).where(LeaveAccrualEvent.source.like("pe_credit:%"))
+    ).all():
+        period = _period_of(source)
+        if period:
+            seen.add(period)
+
+    missing: list[str] = []
+    for year, month in _iter_periods(start, as_of):
+        if (year, month) == (as_of.year, as_of.month):
+            continue  # the current month is this run's job, not a gap
+        period = f"{year:04d}-{month:02d}"
+        if period not in seen:
+            missing.append(period)
+    return missing
+
+
+def run_pe_leave_credit_backfill(
+    db: Session,
+    *,
+    periods: list[str],
+    pe_id: int | None = None,
+) -> dict:
+    """Replay `run_pe_leave_credit` at the month end of each `YYYY-MM` given."""
+    runs: list[dict] = []
+    for period in periods:
+        try:
+            year, month = int(period[:4]), int(period[5:7])
+        except (ValueError, IndexError):
+            continue
+        runs.append(run_pe_leave_credit(db, as_of=month_end(year, month), pe_id=pe_id))
+    return {
+        "periods": [r["as_of"][:7] for r in runs],
+        "rows_credited": sum(r["rows_credited"] for r in runs),
+        "total_credited": sum(r["total_credited"] for r in runs),
+        "runs": runs,
+    }

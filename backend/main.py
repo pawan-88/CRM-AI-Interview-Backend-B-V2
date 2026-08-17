@@ -2357,6 +2357,40 @@ _rl.setup_rate_limit(app)
 
 
 @app.on_event("startup")
+def _start_daily_scheduler() -> None:
+    """Run the daily jobs: timesheet-due reminders, PO-expiry milestone notices
+    and recurring invoice drafts.
+
+    Separate hook and separate thread from the outbox worker so neither can
+    stall the other, and disabled on its own with SCHEDULER_WORKER=false (for a
+    second app instance, or while debugging). Every message the jobs send is
+    deduped by a milestone key, so even a double start cannot duplicate mail.
+    """
+    try:
+        from services.scheduler import start_scheduler
+
+        start_scheduler()
+    except Exception as exc:  # never block boot on background jobs
+        logger.warning("scheduler.worker_start_failed: %s", exc)
+
+
+@app.on_event("startup")
+def _start_email_outbox_worker() -> None:
+    """Drain the notification email outbox in the background.
+
+    Kept separate from the interview-recovery worker so an SMTP problem can
+    never stall interview crash recovery, and so it can be turned off on its own
+    with EMAIL_OUTBOX_WORKER=false (e.g. when a cron drains the table instead).
+    """
+    try:
+        from services.email_outbox import start_outbox_worker
+
+        start_outbox_worker()
+    except Exception as exc:  # never block boot on the notifier
+        logger.warning("email.outbox.worker_start_failed: %s", exc)
+
+
+@app.on_event("startup")
 def _start_interview_recovery_worker() -> None:
     global _RECOVERY_WORKER_STARTED
     if _is_production_env():

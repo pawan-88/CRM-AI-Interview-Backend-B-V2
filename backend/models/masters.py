@@ -133,7 +133,10 @@ class UserTablePreference(Base):
                         sa.ForeignKey("registration_data.id", ondelete="CASCADE"),
                         nullable=False, index=True)
     table_key = sa.Column(sa.String(64), nullable=False)
-    config = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    # Plain '{}' literal, no ::jsonb cast: Postgres casts it implicitly for a
+    # jsonb column, and the ::-cast syntax broke EVERY SQLite-backed test at
+    # CREATE TABLE time (154 collection-level errors across the suite).
+    config = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'"))
     created_at = sa.Column(sa.DateTime(timezone=True),
                            server_default=sa.func.now(), nullable=False)
     updated_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(),

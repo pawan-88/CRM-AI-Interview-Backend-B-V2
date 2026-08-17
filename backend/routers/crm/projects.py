@@ -8,8 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from crm_deps import (
-    CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params,
+from crm_deps import (  # noqa: F401
+    gated_write_action,
+    CurrentUser, PageParams, gated_create, gated_read, gated_write, get_crm_db, page_params,
 )
 from models import (
     BillingFrequency, Customer, CustomerLeavePolicy, Employee, LeavePolicyType, Project,
@@ -25,7 +26,8 @@ from schemas.projects import (
 )
 from services.crm_common import paginate
 from services.project_employees import (
-    clear_other_current_rates, enrich_pe_list_row, ensure_initial_rate, exit_project_employee,
+    apply_rate_rows, clear_other_current_rates, ensure_initial_rate,
+    exit_project_employee,
     get_pe_or_404, group_pe_rows_by_employee, leave_detail_out, project_employee_detail_out,
     rate_out, seed_leave_details_from_customer_policy, sync_pe_billing_from_current_rate,
     sync_pe_leave_from_customer_policy,
@@ -41,8 +43,11 @@ router = APIRouter(prefix="/api/projects", tags=["CRM: Projects"])
 
 read_projects = gated_read("projects")
 write_projects = gated_write("projects", "Sales_Head", "Finance")
+create_projects = gated_create("projects", "Sales_Head", "Finance")
 read_pe = gated_read("project-employees")
-write_pe = gated_write("project-employees", "Sales_Head", "HR", "Finance")
+# Role list admin-editable: Users tab -> Action Permissions ("Map / edit
+# project employees"). Admin/CEO always pass.
+write_pe = gated_write_action("project_employee.manage", "project-employees", "Sales_Head", "HR", "Finance")
 
 
 def _get_leave_policy_or_404(db: Session, policy_id: int) -> ProjectLeavePolicy:
@@ -111,6 +116,7 @@ def delete_project_leave_policy_by_id(
 def list_projects(
     status: str | None = None,
     customer_id: int | None = None,
+    opportunity_id: int | None = None,
     params: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(read_projects),
@@ -123,6 +129,8 @@ def list_projects(
             raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
     if customer_id is not None:
         stmt = stmt.where(Project.customer_id == customer_id)
+    if opportunity_id is not None:
+        stmt = stmt.where(Project.opportunity_id == opportunity_id)
     if params.search:
         stmt = stmt.where(Project.name.ilike(f"%{params.search}%"))
     items, meta = paginate(db, stmt, params.page, params.limit)
@@ -133,7 +141,7 @@ def list_projects(
 def create_project(
     body: ProjectCreate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(write_projects),
+    user: CurrentUser = Depends(create_projects),
 ):
     validate_project_refs(db, body.opportunity_id, body.customer_id)
     # Resolve explicit branch: client branch_id (wizard) → opportunity.branch_id.
@@ -144,7 +152,8 @@ def create_project(
         if branch_row is None or branch_row.customer_id != body.customer_id:
             raise HTTPException(status_code=400, detail="Branch not found for this customer")
     else:
-        opp = db.get(Opportunity, body.opportunity_id)
+        # Branch fallback via the opportunity only applies when one was linked.
+        opp = db.get(Opportunity, body.opportunity_id) if body.opportunity_id else None
         if opp is not None and opp.branch_id is not None:
             opp_branch = db.get(CustomerBranch, opp.branch_id)
             # Never copy a foreign-customer opportunity.branch_id onto the project.
@@ -239,6 +248,7 @@ def list_all_project_employees(
     p: PageParams = Depends(page_params),
     project_id: int | None = None,
     customer_id: int | None = None,
+    opportunity_id: int | None = None,
     status: str | None = None,  # active | exited | all
     group_by: str | None = None,  # employee → nested groups (UC-12)
     db: Session = Depends(get_crm_db),
@@ -259,6 +269,9 @@ def list_all_project_employees(
         base = base.where(ProjectEmployee.project_id == project_id)
     if customer_id is not None:
         base = base.where(Project.customer_id == customer_id)
+    if opportunity_id is not None:
+        # Opportunity detail tab: employees on projects born from this opportunity.
+        base = base.where(Project.opportunity_id == opportunity_id)
     st = (status or "all").strip().lower()
     if st == "active":
         base = base.where(ProjectEmployee.is_active.is_(True), ProjectEmployee.is_exit.is_(False))
@@ -281,24 +294,47 @@ def list_all_project_employees(
     else:
         order = (Project.name.asc(), Employee.first_name.asc())
     total = db.execute(select(func.count()).select_from(base.subquery())).scalar() or 0
+    from sqlalchemy.orm import selectinload
+
     rows = db.execute(
         base.order_by(*order)
         .limit(p.limit).offset(p.offset)
+        # One extra query for ALL rate histories on the page instead of a lazy
+        # load per row — this list used to fire 3-4 queries per mapping.
+        .options(selectinload(ProjectEmployee.rates))
     ).all()
+
+    # Batch the per-row lookups ONCE for the page: designations, leave totals,
+    # and PO summaries (per project, since several rows share a project).
+    from models.masters import Designation
+    from services.project_employees import pe_leave_balance_totals, project_po_summary
+
+    desig_ids = {e.designation_id for _, e, _, _ in rows if e is not None and e.designation_id}
+    desig_names = dict(db.execute(
+        select(Designation.id, Designation.name).where(Designation.id.in_(desig_ids))
+    ).all()) if desig_ids else {}
+    leave_totals = pe_leave_balance_totals(db, [pe.id for pe, _, _, _ in rows])
+    po_by_project: dict[int, dict] = {}
+
     flat: list[dict] = []
     for pe, emp, proj, customer_name in rows:
         d = project_employee_out(pe, emp)
         # Spec: role_title from PE.role_title, else employee designation name,
         # else employee.role_title (already folded into project_employee_out).
         if not d.get("role_title") and emp is not None and emp.designation_id:
-            from models.masters import Designation
-            desig = db.get(Designation, emp.designation_id)
-            if desig and desig.name:
-                d["role_title"] = desig.name
+            name = desig_names.get(emp.designation_id)
+            if name:
+                d["role_title"] = name
         d["project_name"] = proj.name
         d["customer_id"] = proj.customer_id
         d["customer_name"] = customer_name
-        enrich_pe_list_row(db, pe, d)
+        d["leave_balance_total"] = leave_totals.get(pe.id, 0.0)
+        if pe.project_id not in po_by_project:
+            po_by_project[pe.project_id] = project_po_summary(db, pe.project_id)
+        po = po_by_project[pe.project_id]
+        d["po_status"] = po.get("po_status")
+        d["po_utilization_pct"] = po.get("utilization_pct")
+        d["po_number"] = po.get("po_number")
         flat.append(d)
     pages = (total + p.limit - 1) // p.limit if p.limit else 1
     meta = {"page": p.page, "limit": p.limit, "total": total, "pages": pages,
@@ -380,14 +416,17 @@ def update_project_employee_by_id(
         if history:
             history.end_date = date.today()
     if rate_changed:
-        clear_other_current_rates(db, pe.id)
-        db.add(ProjectEmployeeRate(
-            project_employee_id=pe.id,
+        # UPSERT through apply_rate_rows instead of blindly adding a row.
+        # The old code appended a NEW rate at billing_date on every save of
+        # this form, so repeated edits stacked duplicate effective dates —
+        # histories grew twins like three rates all starting 01 Apr. Same
+        # date now refines the existing row; a different date starts a new
+        # one, exactly like the Map Employee wizard.
+        from schemas.projects import MapRateIn
+        apply_rate_rows(db, pe, [MapRateIn(
             effective_from=pe.billing_date or date.today(),
             rate=pe.billing_rate,
-            billing_unit=pe.billing_unit,
-            is_current_rate=True,
-        ))
+        )])
     db.commit()
     db.refresh(pe)
     data = project_employee_detail_out(db, pe)
@@ -531,7 +570,9 @@ def create_pe_rate(
     pe_id: int,
     body: ProjectEmployeeRateIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("project-employees", "Sales_Head", "Finance", "HR")),
+    # RMG added: they own invoice generation, and the Add Rate button on the
+    # PO selection panel must work for the person raising the invoice.
+    user: CurrentUser = Depends(gated_write_action("project_employee.rates", "project-employees", "Sales_Head", "Finance", "HR", "RMG")),
 ):
     pe = get_pe_or_404(db, pe_id)
     if body.is_current_rate:
@@ -558,7 +599,8 @@ def update_pe_rate(
     rate_id: int,
     body: ProjectEmployeeRateUpdate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("project-employees", "Sales_Head", "Finance", "HR")),
+    # RMG added for the same reason as create_pe_rate (Edit Rate on PO panel).
+    user: CurrentUser = Depends(gated_write_action("project_employee.rates", "project-employees", "Sales_Head", "Finance", "HR", "RMG")),
 ):
     pe = get_pe_or_404(db, pe_id)
     row = db.get(ProjectEmployeeRate, rate_id)
@@ -586,7 +628,9 @@ def delete_pe_rate(
     pe_id: int,
     rate_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("project-employees", "Sales_Head", "Finance", "HR")),
+    # RMG matches create/update: whoever manages rates from the invoice flow
+    # must be able to remove a wrong row too.
+    user: CurrentUser = Depends(gated_write_action("project_employee.rates", "project-employees", "Sales_Head", "Finance", "HR", "RMG")),
 ):
     pe = get_pe_or_404(db, pe_id)
     row = db.get(ProjectEmployeeRate, rate_id)
@@ -908,7 +952,12 @@ def add_project_employee(
         )
         db.add(pe)
     db.flush()
-    ensure_initial_rate(db, pe)
+    if body.rates:
+        # The wizard's Commercial Details ARE the rate history; billing_rate is
+        # re-derived from whichever row is in force today.
+        apply_rate_rows(db, pe, body.rates)
+    else:
+        ensure_initial_rate(db, pe)
     seed_leave_details_from_customer_policy(db, pe, project)
     add_history_entry(db, project.id, employee, body.onboarding_date)
     db.commit()
@@ -938,14 +987,17 @@ def update_project_employee(
         if history:
             history.end_date = date.today()
     if rate_changed:
-        clear_other_current_rates(db, pe.id)
-        db.add(ProjectEmployeeRate(
-            project_employee_id=pe.id,
+        # UPSERT through apply_rate_rows instead of blindly adding a row.
+        # The old code appended a NEW rate at billing_date on every save of
+        # this form, so repeated edits stacked duplicate effective dates —
+        # histories grew twins like three rates all starting 01 Apr. Same
+        # date now refines the existing row; a different date starts a new
+        # one, exactly like the Map Employee wizard.
+        from schemas.projects import MapRateIn
+        apply_rate_rows(db, pe, [MapRateIn(
             effective_from=pe.billing_date or date.today(),
             rate=pe.billing_rate,
-            billing_unit=pe.billing_unit,
-            is_current_rate=True,
-        ))
+        )])
     db.commit()
     db.refresh(pe)
     return envelope(data=project_employee_out(pe), message="Project employee updated")
@@ -953,12 +1005,74 @@ def update_project_employee(
 
 # ---------------------------------------------------------------- timesheets
 
+def _coverage_today() -> date:
+    """Seam for tests to freeze 'today' without patching the module's `date`
+    (FastAPI resolves `date | None` annotations lazily, so a MagicMock there
+    breaks route building)."""
+    return date.today()
+
+
+def _due_timesheet_rows(
+    db: Session,
+    project_id: int,
+    existing: set[tuple[int, int, int]],
+    employee_id: int | None,
+) -> list[dict]:
+    """Placeholder rows for every month a PE SHOULD have a timesheet but none
+    exists — from onboarding month through the current month (or exit month).
+
+    An onboarded employee with no sheet used to be invisible on this tab: the
+    list showed what was filed, never what was missing, so "January exists"
+    read as "everything is fine" even in June. Coverage is derived from the
+    project-employee mapping, not from the sheets, so a month that was never
+    created still shows — as `status: "Due"` with no id.
+    """
+    today = _coverage_today()
+    pes = db.execute(
+        select(ProjectEmployee).where(ProjectEmployee.project_id == project_id)
+    ).scalars().all()
+
+    rows: list[dict] = []
+    seen: set[tuple[int, int, int]] = set()
+    for pe in pes:
+        if employee_id is not None and pe.employee_id != employee_id:
+            continue
+        start = pe.onboarding_date
+        if start is None:
+            continue
+        # Exited employees owe sheets only up to their exit month.
+        end = pe.exit_date if (pe.is_exit and pe.exit_date) else today
+        y, m = start.year, start.month
+        while (y, m) <= (end.year, end.month):
+            key = (pe.employee_id, y, m)
+            if key not in existing and key not in seen:
+                seen.add(key)
+                rows.append({
+                    "id": None,
+                    "project_id": project_id,
+                    "employee_id": pe.employee_id,
+                    "project_employee_id": pe.id,
+                    "month": m,
+                    "year": y,
+                    "status": "Due",
+                    "status_label": "Due — not created",
+                    "rejection_reason": None,
+                    "submitted_at": None,
+                    "approved_by": None,
+                    "approved_at": None,
+                })
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return rows
+
+
 @router.get("/{project_id}/timesheets")
 def project_timesheets(
     project_id: int,
     month: int | None = None,
     year: int | None = None,
     status: str | None = None,
+    employee_id: int | None = None,
+    include_missing: bool = False,
     params: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_read("timesheets", "HR", "Finance", "Sales_Head")),
@@ -969,13 +1083,46 @@ def project_timesheets(
         stmt = stmt.where(Timesheet.month == month)
     if year is not None:
         stmt = stmt.where(Timesheet.year == year)
-    if status:
+    if employee_id is not None:
+        # One person's full timesheet history on this project — the review
+        # flow is per-employee, not per-page-of-everyone.
+        stmt = stmt.where(Timesheet.employee_id == employee_id)
+    # "Due" is a synthetic status (a sheet that does not exist); every stored
+    # status filters the real rows as before.
+    due_only = status == "Due"
+    if status and not due_only:
         try:
             stmt = stmt.where(Timesheet.status == TimesheetStatus(status))
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
-    items, meta = paginate(db, stmt, params.page, params.limit)
-    return envelope(data=[timesheet_out(ts) for ts in items], meta=meta)
+
+    if not (include_missing or due_only):
+        items, meta = paginate(db, stmt, params.page, params.limit)
+        return envelope(data=[timesheet_out(ts) for ts in items], meta=meta)
+
+    # Coverage view: merge real sheets with Due placeholders, newest first.
+    real = [] if due_only else [timesheet_out(ts) for ts in db.execute(stmt).scalars().all()]
+    # The existence check must ignore the month/year filters, or a filtered
+    # request would resurrect months that do have sheets.
+    all_keys = {
+        (ts.employee_id, ts.year, ts.month)
+        for ts in db.execute(
+            select(Timesheet).where(Timesheet.project_id == project_id)
+        ).scalars().all()
+    }
+    due = _due_timesheet_rows(db, project_id, all_keys, employee_id)
+    if month is not None:
+        due = [r for r in due if r["month"] == month]
+    if year is not None:
+        due = [r for r in due if r["year"] == year]
+
+    combined = sorted(real + due, key=lambda r: (r["year"], r["month"]), reverse=True)
+    total = len(combined)
+    start_i = (params.page - 1) * params.limit
+    page_rows = combined[start_i:start_i + params.limit]
+    pages = (total + params.limit - 1) // params.limit if params.limit else 1
+    meta = {"page": params.page, "limit": params.limit, "total": total, "pages": pages}
+    return envelope(data=page_rows, meta=meta)
 
 
 # ---------------------------------------------------------------- communication matrix

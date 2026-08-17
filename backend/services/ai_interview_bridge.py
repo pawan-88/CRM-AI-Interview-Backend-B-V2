@@ -39,8 +39,17 @@ CFG_MARKER = "__KARNEX_CFG__:"  # must match main.py::_pack_invite_config_into_n
 
 
 def ai_interview_autosend_enabled() -> bool:
-    """When True, schedule triggers email/WhatsApp the invite. Default: off (show link only)."""
-    return os.getenv("AI_INTERVIEW_AUTOSEND", "false").strip().lower() in ("1", "true", "yes", "on")
+    """When True, schedule triggers email/WhatsApp the invite. Default: off (show link only).
+
+    Settings-page value first (interview.autosend, Admin-editable), the
+    AI_INTERVIEW_AUTOSEND env flag as the fallback.
+    """
+    try:
+        from services.org_settings import setting_bool
+
+        return setting_bool("interview.autosend")
+    except Exception:
+        return os.getenv("AI_INTERVIEW_AUTOSEND", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _legacy_db_target() -> str:
@@ -342,6 +351,7 @@ def sync_completed_interview(record: dict) -> bool:
                 f"AI interview completed: {cname}",
                 f"Score {pct if pct is not None else 'n/a'}% — {'Passed' if passed else 'Failed'}",
                 f"/admin?view=crm&p=profiles/{link.profile_id}",
+                event="ai_interview.completed",
             )
 
             # PASSED L1 → hand off to RMG: auto-advance the profile to RMG_Review
@@ -367,6 +377,7 @@ def sync_completed_interview(record: dict) -> bool:
                         f"Score {pct}%. Review the interview report and decide: "
                         f"request an L2 round or submit to the Sales team.",
                         f"/admin?view=crm&p=profiles/{link.profile_id}",
+                        event="ai_interview.passed_review",
                     )
             db.commit()
             return True

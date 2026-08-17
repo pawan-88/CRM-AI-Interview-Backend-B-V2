@@ -408,7 +408,9 @@ def schedule_ai_interview(
         when_text = resume.ai_interview_scheduled_at.strftime("%A, %d %B %Y at %H:%M UTC")
         msg = interview_link_message(resume.candidate_name, req.title, when_text,
                                      bridge.get("invite_url", ""), bridge.get("access_key", ""))
-        notified = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"])
+        notified = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"],
+                                    db=db, event="candidate.interview_link", actor=user,
+                                    to_name=resume.candidate_name)
 
     db.commit()
     db.refresh(resume)

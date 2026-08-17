@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, get_crm_db, role_required
+from crm_deps import CurrentUser, any_crm_role, get_crm_db, role_required
 from schemas.common import envelope
 from services import dashboards as svc
 
@@ -87,3 +87,18 @@ def requirements_dashboard(
     user: CurrentUser = Depends(role_required("Sales", "Sales_Head", "RMG")),
 ):
     return envelope(svc.requirements_dashboard(db))
+
+
+@router.get("/my-work")
+def my_work(
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(any_crm_role),
+):
+    """The user's to-do list, shaped by their roles AND their access template.
+
+    Nobody needs training to read a to-do list — this is how the tool teaches
+    each role its job. Every item is something the CALLER can act on today,
+    with a count and the page it lives on. Items for tabs the user cannot see
+    (template) are dropped, so the list never points somewhere it can't go.
+    """
+    return envelope(svc.my_work(db, user))

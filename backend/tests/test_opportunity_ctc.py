@@ -184,3 +184,47 @@ def test_exp_max_is_midpoint_of_exp_min_and_target_exp():
 def test_exp_min_cannot_exceed_exp_max():
     with pytest.raises(ValidationError, match="Exp Min"):
         OpportunityCtcSlabIn(exp_min=5, exp_max=3)
+
+
+def test_appraisal_cycles_power_rule():
+    """NEXUS-parity screenshot (14 Aug 2026): budget 143010 at hike 10% —
+    5→7 = 1 cycle → 130009.09; 6→7 = 0 → full budget; 7→10 = 2 → 118190.08.
+    Approved CTC = Budget / 1.1^cycles, cycles = Target − Exp Min − 1."""
+    base = {"billing_type": "Per Year"}
+    for exp_min, target, cycles, approved in [
+        (5, 7, "1", 130009.09),
+        (6, 7, "0", 143010.0),
+        (7, 10, "2", 118190.08),
+    ]:
+        row = derive_ctc_row(
+            {"rate": 204300, "management_cost_pct": 30, "hike_pct": 10,
+             "exp_min": exp_min, "target_exp": target},
+            opportunity_type="T&M", details=base,
+        )
+        assert row["appraisal_cycle"] == cycles
+        assert row["engineering_budget"] == 143010.0
+        assert row["approved_ctc_lac"] == approved
+        # Exp Max stays the midpoint rule.
+        import math
+        assert row["exp_max"] == math.ceil((exp_min + target) / 2)
+
+
+def test_zoho_parity_56_pct_management_cost():
+    """The user's side-by-side test (14 Aug 2026): annual 25,69,222.32 at
+    Mgmt 56% → budget 11,30,457.82; band 3–5 gives targets 5 (cycles 1 →
+    ÷1.1 = 10,27,688.93 ≈ Zoho's 1027689) and 5 (cycles 0 → full budget).
+    Same for the 5–7 band at annual 37,40,796.56 → budget 16,45,950.49."""
+    for exp_min, target, annual, budget, approved in [
+        (3, 5, 2569222.32, 1130457.82, 1027688.93),
+        (4, 5, 2569222.32, 1130457.82, 1130457.82),
+        (5, 7, 3740796.56, 1645950.49, 1496318.63),
+        (6, 7, 3740796.56, 1645950.49, 1645950.49),
+    ]:
+        row = derive_ctc_row(
+            {"rate": annual, "management_cost_pct": 56, "hike_pct": 10,
+             "exp_min": exp_min, "target_exp": target},
+            opportunity_type="T&M", details={"billing_type": "Per Year"},
+        )
+        assert row["engineering_budget"] == budget
+        assert row["approved_ctc_lac"] == approved
+        assert row["appraisal_cycle"] == str(max(0, target - exp_min - 1))

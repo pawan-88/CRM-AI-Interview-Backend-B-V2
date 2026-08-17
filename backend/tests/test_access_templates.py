@@ -40,7 +40,7 @@ def _i(e, c, **k):  # noqa: ANN001
 import importlib
 for _m in ["base", "rbac", "customers", "opportunities", "projects", "leave", "timesheets",
            "finance", "hr", "candidates", "masters", "requirements", "profiles", "resumes",
-           "ai_links", "scheduling", "project_employee", "user_profiles", "template_requests",
+           "ai_links", "scheduling", "user_profiles", "template_requests",
            "access_templates"]:
     importlib.import_module(f"models.{_m}")
 
@@ -100,7 +100,9 @@ def test_resolver_override_wins(db):
     db.commit()
     acc = effective_access(db, 6, {"RMG"})
     assert acc["tabs"]["projects"] == "view"
-    assert acc["tabs"]["invoices"] == "edit"                 # override grants edit
+    # Overrides grant "create": the legacy modal was binary show/hide, and a
+    # granted tab carried FULL access under the old single write level.
+    assert acc["tabs"]["invoices"] == "create"
     assert acc["fields"]["invoices"]["grand_total"] == "edit"
     assert acc["source"] == "template+override"
 
@@ -119,9 +121,9 @@ def test_resolver_legacy_crm_prefixed_override_normalizes(db):
     ))
     db.commit()
     acc = effective_access(db, 53, {"Sales"})
-    assert acc["tabs"]["customers"] == "edit"
-    assert acc["tabs"]["opportunities"] == "edit"
-    assert acc["tabs"]["dashboard"] == "edit"
+    assert acc["tabs"]["customers"] == "create"
+    assert acc["tabs"]["opportunities"] == "create"
+    assert acc["tabs"]["dashboard"] == "create"
     assert "crm:customers" not in acc["tabs"]
     assert acc["visible_tabs"] == ["customers", "dashboard", "opportunities"]
 
@@ -154,7 +156,8 @@ def client(db):
 def test_api_crud_and_assign(client):
     # registry lists grantable tabs + modes
     reg = client.get("/api/access-templates/registry").json()["data"]
-    assert reg["modes"] == ["view", "edit"] and any(t["key"] == "customers" for t in reg["tabs"])
+    assert reg["modes"] == ["view", "edit", "create"]
+    assert any(t["key"] == "customers" for t in reg["tabs"])
 
     # create a Sales template
     r = client.post("/api/access-templates", json={

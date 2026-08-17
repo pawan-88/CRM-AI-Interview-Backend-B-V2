@@ -13,7 +13,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params
+from crm_deps import CurrentUser, PageParams, gated_create, gated_read, gated_write, get_crm_db, page_params
 from models import (
     ContactPerson,
     Customer,
@@ -56,6 +56,7 @@ router = APIRouter(prefix="/api/customers", tags=["CRM: Customers"])
 
 read_customers = gated_read("customers")
 write_customers = gated_write("customers", "Sales", "Sales_Head")
+create_customers = gated_create("customers", "Sales", "Sales_Head")
 # Finance may add/edit contacts from the PO form (quick-add popup).
 write_customer_contacts = gated_write("customers", "Sales", "Sales_Head", "Finance")
 read_branch_policy = gated_read("branch-policy")
@@ -95,7 +96,7 @@ def list_customers(
 def create_customer(
     payload: CustomerCreate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(write_customers),
+    user: CurrentUser = Depends(create_customers),
 ):
     name = payload.name.strip()
     if not name:
@@ -112,6 +113,71 @@ def create_customer(
     db.commit()
     db.refresh(customer)
     return envelope(data=serialize_customer(customer, db, detail=True), message="Customer created")
+
+
+@router.get("/policy-matrix")
+def customer_policy_matrix(
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_customers),
+):
+    """One row per customer: the commercial policy matrix (Settings tab).
+
+    Leaves (per-type monthly credit + carry/lapse), Holidays / Week-off /
+    Comp-off billability, Billing type, Hrs per day, Paid leaves/year and the
+    max-hours cap. READS the same tables the Opportunity form inherits from
+    (customer default billing policy, customer leave policies, branch caps) —
+    this is a window onto the policy store, never a second copy of it.
+    """
+    from models import (
+        Customer as _C, CustomerBillingPolicy as _P, CustomerBranch as _B,
+        CustomerLeavePolicy as _LP, LeavePolicyType as _LT,
+    )
+
+    customers = db.execute(select(_C).order_by(_C.name)).scalars().all()
+    policies = {p.customer_id: p for p in db.execute(select(_P)).scalars().all()}
+    type_names = {t.id: t.name for t in db.execute(select(_LT)).scalars().all()}
+    leaves_by_customer: dict[int, list] = {}
+    for lp in db.execute(select(_LP).where(_LP.is_active.is_(True))).scalars().all():
+        leaves_by_customer.setdefault(lp.customer_id, []).append(lp)
+    # Branch-level hour caps (e.g. Harman's 176/month) — max across branches.
+    caps: dict[int, float] = {}
+    for b in db.execute(select(_B).where(
+            _B.is_max_billable_hours_per_month.is_(True))).scalars().all():
+        if b.max_billable_hours_per_month is not None:
+            caps[b.customer_id] = max(caps.get(b.customer_id, 0.0),
+                                      float(b.max_billable_hours_per_month))
+
+    def _num(v):
+        return float(v) if v is not None else None
+
+    rows = []
+    for c in customers:
+        pol = policies.get(c.id)
+        leaves = []
+        for lp in leaves_by_customer.get(c.id, []):
+            carries = lp.maximum_carry_forward is not None and float(lp.maximum_carry_forward) > 0
+            leaves.append({
+                "type": type_names.get(lp.leave_type_id, f"Type #{lp.leave_type_id}"),
+                "monthly_credit": _num(lp.leave_credit_balance),
+                "carry_forward": carries,
+                "branch_id": lp.branch_id,
+            })
+        rows.append({
+            "customer_id": c.id,
+            "customer_name": c.name,
+            "leaves": leaves,
+            "holidays_billable": bool(pol.holidays_billable) if pol else None,
+            "week_off_billable": bool(pol.week_off_billable) if pol else None,
+            "leave_billable": bool(pol.leave_billable) if pol else None,
+            "comp_off_billable": bool(pol.comp_off_billable) if pol else None,
+            "billing_type": pol.billing_type if pol else None,
+            "hours_per_day": _num(pol.normal_hours_per_day) if pol else None,
+            "min_hours_full_day": _num(pol.min_hours_full_day) if pol else None,
+            "billable_leaves_per_year": _num(getattr(pol, "billable_leaves_per_year", None)) if pol else None,
+            "max_billable_hours_per_month": caps.get(c.id),
+            "has_policy": pol is not None,
+        })
+    return envelope(data=rows, message="Customer policy matrix")
 
 
 @router.get("/all-branches")
@@ -402,6 +468,17 @@ def update_branch_billing_policy(
         raise HTTPException(status_code=400,
                             detail="hours_required_half_day cannot exceed hours_required_full_day")
 
+    # Week-off pattern (0072): validate or 400 — see upsert_billing_policy.
+    if "week_off_days" in changes and changes["week_off_days"] is not None:
+        from services.timesheets import parse_week_off_days
+        parsed = parse_week_off_days(changes["week_off_days"])
+        if parsed is None or len(parsed) >= 7:
+            raise HTTPException(
+                status_code=400,
+                detail="week_off_days must be weekday numbers 0-6 (Mon=0), "
+                       "comma separated, e.g. '5,6' — and not all seven days")
+        changes["week_off_days"] = ",".join(str(d) for d in parsed)
+
     for field, value in changes.items():
         if field in _BRANCH_POLICY_NON_NULL_BOOLS and value is None:
             value = False
@@ -449,6 +526,21 @@ def upsert_billing_policy(
         policy.week_off_billable = payload.week_off_billable
     elif created:
         policy.week_off_billable = False
+    # Week-off pattern (0072): validate before storing — an unparseable value
+    # would silently fall back to Sat+Sun, which is worse than a loud 400.
+    if "week_off_days" in payload.model_fields_set:
+        raw = (payload.week_off_days or "").strip()
+        if raw:
+            from services.timesheets import parse_week_off_days
+            parsed = parse_week_off_days(raw)
+            if parsed is None or len(parsed) >= 7:
+                raise HTTPException(
+                    status_code=400,
+                    detail="week_off_days must be weekday numbers 0-6 (Mon=0), "
+                           "comma separated, e.g. '5,6' — and not all seven days")
+            policy.week_off_days = ",".join(str(d) for d in parsed)
+        else:
+            policy.week_off_days = None
     if payload.leave_billable is not None:
         policy.leave_billable = payload.leave_billable
     elif created:
@@ -471,6 +563,10 @@ def upsert_billing_policy(
     policy.normal_hours_per_day = payload.normal_hours_per_day
     policy.user_role = payload.user_role
     policy.operation = payload.operation
+    # Paid leaves/year billed by the customer (APTIV rule, 0078) — only when
+    # sent, so older callers that omit it can never wipe the value.
+    if "billable_leaves_per_year" in payload.model_fields_set:
+        policy.billable_leaves_per_year = payload.billable_leaves_per_year
     db.commit()
     db.refresh(policy)
     return envelope(data=serialize_policy(policy),
@@ -519,6 +615,50 @@ def upload_document(
     db.commit()
     db.refresh(doc)
     return envelope(data=serialize_documents(db, [doc])[0], message="Document uploaded")
+
+
+from pydantic import BaseModel as _DocBaseModel, Field as _DocField  # noqa: E402
+
+
+class DocumentMetaIn(_DocBaseModel):
+    """Metadata-only update; the uploaded file itself is immutable."""
+
+    document_type_id: int | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    status: str | None = _DocField(default=None, max_length=24)
+
+
+@router.put("/{customer_id}/documents/{doc_id}")
+def update_document(
+    customer_id: int,
+    doc_id: int,
+    body: DocumentMetaIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_customers),
+):
+    """Update a document's metadata (type / dates / status). The file itself is
+    immutable — replacing it is delete + re-upload, so the stored file always
+    matches what was originally reviewed."""
+    doc = get_document_or_404(db, customer_id, doc_id)
+    if body.document_type_id is not None:
+        validate_document_type(db, body.document_type_id)
+        doc.document_type_id = body.document_type_id
+    if body.start_date is not None:
+        doc.start_date = body.start_date
+    if body.end_date is not None:
+        doc.end_date = body.end_date
+    if doc.start_date and doc.end_date and doc.end_date < doc.start_date:
+        raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
+    if body.status is not None:
+        doc.status = body.status
+    # Same auto-expiry rule as upload: a past end date is Expired regardless of
+    # what the caller sent.
+    if doc.end_date and doc.end_date <= date.today():
+        doc.status = "Expired"
+    db.commit()
+    db.refresh(doc)
+    return envelope(data=serialize_documents(db, [doc])[0], message="Document updated")
 
 
 @router.delete("/{customer_id}/documents/{doc_id}")

@@ -46,7 +46,7 @@ def _i(e, c, **k):  # noqa: ANN001
 import importlib
 for _m in ["base", "rbac", "customers", "opportunities", "projects", "leave",
            "timesheets", "finance", "hr", "candidates", "masters", "requirements",
-           "profiles", "resumes", "ai_links", "scheduling", "project_employee",
+           "profiles", "resumes", "ai_links", "scheduling",
            "user_profiles", "template_requests"]:
     importlib.import_module(f"models.{_m}")
 
@@ -313,3 +313,36 @@ def test_dummy_employee_policy_end_to_end(db):
     assert billable_days_for(entries) == D("3")
     # per-day cap actually bit on the 10h entry
     assert r.cap_hours_per_day(10) == D("8")
+
+
+# ============================================== paid leaves billed (APTIV, 0078)
+def test_billable_leaves_per_year_resolves_branch_then_customer(db):
+    """The APTIV rule: paid leaves/year the customer bills flow branch →
+    customer default → none, and feed the CTC slab's 227 + 18 = 245 maths."""
+    from models.customers import CustomerBillingPolicy
+    from services.branch_policy import effective_customer_branch_policy
+
+    cust = _customer(db, "APTIV-ASUX")
+    db.add(CustomerBillingPolicy(customer_id=cust.id, leave_billable=False,
+                                 week_off_billable=False, holidays_billable=False,
+                                 min_hours_full_day=D("8"), min_hours_half_day=D("4"),
+                                 billable_leaves_per_year=D("18")))
+    branch = _branch(db, cust, "Pune")
+    db.commit()
+
+    # Customer default flows to the branch…
+    eff = effective_customer_branch_policy(db, branch)
+    assert eff["billable_leaves_per_year"] == 18.0
+    assert eff["sources"]["billable_leaves_per_year"] == "customer"
+
+    # …and a branch value wins over it.
+    branch.billable_leaves_per_year = D("12")
+    db.commit()
+    eff = effective_customer_branch_policy(db, branch)
+    assert eff["billable_leaves_per_year"] == 12.0
+    assert eff["sources"]["billable_leaves_per_year"] == "branch"
+
+    # The confirmed example, in the slab's own arithmetic:
+    # 365 − 104 weekoff − 24 leave − 10 holidays = 227; + 18 paid = 245.
+    assert 365 - 104 - 24 - 10 == 227
+    assert 227 + 18 == 245

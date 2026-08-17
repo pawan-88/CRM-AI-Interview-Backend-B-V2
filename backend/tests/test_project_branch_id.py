@@ -42,7 +42,7 @@ def _i(e, c, **k):  # noqa: ANN001
 import importlib
 for _m in ["base", "rbac", "customers", "opportunities", "projects", "leave",
            "timesheets", "finance", "hr", "candidates", "masters", "requirements",
-           "profiles", "resumes", "ai_links", "scheduling", "project_employee",
+           "profiles", "resumes", "ai_links", "scheduling",
            "user_profiles", "template_requests"]:
     importlib.import_module(f"models.{_m}")
 
@@ -195,3 +195,29 @@ def test_create_project_inherits_branch_from_opportunity(client):
     assert r.status_code == 200, r.text
     data = r.json()["data"]
     assert data["branch_id"] == branch.id
+
+
+def test_project_creates_without_an_opportunity(client):
+    """Since 0069 a project needs no sales opportunity behind it.
+
+    The form used to force an arbitrary pick just to pass validation, which
+    fabricated sales lineage. Creation, detail and serialization must all be
+    null-safe now.
+    """
+    s = client._session
+    cust, branch = _seed_customer_branch(s, cust_name="Internal", branch_name="Internal HQ")
+    s.commit()
+
+    r = client.post("/api/projects", json={
+        "name": "Internal Tooling",
+        "customer_id": cust.id,
+        "branch_id": branch.id,
+    })
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["opportunity_id"] is None
+    assert data["name"] == "Internal Tooling"
+
+    detail = client.get(f"/api/projects/{data['id']}").json()["data"]
+    assert detail["opportunity_title"] is None
+    assert detail["branch_id"] == branch.id

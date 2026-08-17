@@ -4,6 +4,7 @@ from __future__ import annotations
 import enum
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from models.base import Base, TimestampMixin, USERS_FK, pg_enum
@@ -60,7 +61,18 @@ class Timesheet(TimestampMixin, Base):
     file_attachment_url = sa.Column(sa.String(1024), nullable=True)
     # Comp-off credit already granted for this timesheet (idempotency marker:
     # re-approval after reject/resubmit applies only the delta vs this value).
+    #: Editable period override (0073). NULL = derived from the PE's
+    #: onboarding/exit window. Only meaningful within the sheet's month.
+    period_start_date = sa.Column(sa.Date, nullable=True)
+    period_end_date = sa.Column(sa.Date, nullable=True)
     comp_off_accrued = sa.Column(sa.Numeric(5, 2), nullable=True)
+    #: Frozen invoice figures (0075): the line items + sub-total + summary as
+    #: they stood at APPROVAL. Every read recomputes billables from the
+    #: CURRENT policy, so without this a policy edit after approval silently
+    #: changed what an approved sheet would invoice. The reviewer approved
+    #: THESE numbers; generate-invoice bills them and flags any live drift.
+    #: NULL = not approved yet (or legacy pre-0075 approval → live figures).
+    approved_figures = sa.Column(JSONB, nullable=True)
     __table_args__ = (
         sa.UniqueConstraint("project_id", "employee_id", "month", "year", name="uq_timesheet_period"),
         sa.CheckConstraint("month >= 1 AND month <= 12", name="ck_timesheet_month"),

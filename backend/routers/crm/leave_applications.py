@@ -26,7 +26,7 @@ from models import (
 from schemas.common import RejectIn, envelope
 from schemas.leave import LEAVE_APP_STATUSES, LeaveApplicationCreate, LeaveApplicationUpdate
 from services.crm_common import paginate, to_dict
-from services.notify import notify_user
+from services.notify import notify_employee, notify_role, notify_user
 from services.project_employees import consume_pe_leave, credit_pe_leave, pe_leave_detail_for
 from services.timesheets import employee_display_name, employee_for_user
 
@@ -237,6 +237,30 @@ def create_leave_application(
     db.add(app)
     db.commit()
     db.refresh(app)
+
+    # Approve and reject already notified the employee; submit notified nobody,
+    # so an application could sit in Pending with no HR user aware of it.
+    notify_role(
+        db, "HR",
+        f"Leave application — {employee_display_name(employee)}",
+        f"{employee_display_name(employee)} applied for {days} day(s) of "
+        f"{leave_type.name} from {body.from_date} to {to_date}.",
+        f"leave-applications/{app.id}",
+        exclude_user_id=user.id,
+        actor=user,
+        event="leave.submitted",
+        rows=[
+            ("Employee", employee_display_name(employee)),
+            ("Leave type", leave_type.name),
+            ("From", str(body.from_date)),
+            ("To", str(to_date)),
+            ("Days", str(days)),
+            ("Reason", body.reason or ""),
+        ],
+        dedupe_prefix=f"leave.submitted:{app.id}",
+    )
+    db.commit()
+
     return envelope(data=_app_out(db, app), message="Leave application submitted")
 
 
@@ -330,10 +354,32 @@ def update_leave_application(
 
 # ---------------------------------------------------------------- workflow
 
-def _notify_employee(db: Session, app: LeaveApplication, title: str, message: str) -> None:
+def _notify_employee(db: Session, app: LeaveApplication, title: str, message: str,
+                     actor=None, event: str = "leave.decision") -> None:
+    """Bell where possible, email always.
+
+    Email is the channel that actually matters here: someone whose leave was
+    just approved is, by definition, often not in the app — and an employee with
+    no login account (employees.user_id IS NULL) could never see the bell at all,
+    which is exactly the population this used to drop on the floor.
+    """
     emp = db.get(Employee, app.employee_id)
-    if emp and emp.user_id:
-        notify_user(db, emp.user_id, title, message, f"/leave-applications/{app.id}")
+    if emp is None:
+        return
+    leave_type = db.get(LeavePolicyType, app.leave_type_id)
+    notify_employee(
+        db, emp, title, message, f"leave-applications/{app.id}",
+        actor=actor,
+        event=event,
+        rows=[
+            ("Leave type", getattr(leave_type, "name", "") or ""),
+            ("From", str(app.from_date)),
+            ("To", str(app.to_date)),
+            ("Days", str(app.days)),
+            ("Status", str(app.status)),
+        ],
+        dedupe_key=f"{event}:{app.id}:{app.status}",
+    )
 
 
 @router.post("/{application_id}/approve")

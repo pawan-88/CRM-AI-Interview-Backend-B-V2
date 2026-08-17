@@ -40,7 +40,7 @@ def _i(e, c, **k):  # noqa: ANN001
 import importlib
 for _m in ["base", "rbac", "customers", "opportunities", "projects", "leave",
            "timesheets", "finance", "hr", "candidates", "masters", "requirements",
-           "profiles", "resumes", "ai_links", "scheduling", "project_employee",
+           "profiles", "resumes", "ai_links", "scheduling",
            "user_profiles", "template_requests", "access_templates"]:
     importlib.import_module(f"models.{_m}")
 

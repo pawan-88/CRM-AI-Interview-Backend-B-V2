@@ -41,6 +41,8 @@ class _BranchBillingFields(BaseModel):
     country: str | None = Field(default=None, max_length=120)
     holidays_billable: bool | None = None
     weekoff_billable: bool | None = None
+    #: CSV of weekday numbers 0=Mon..6=Sun, e.g. "5,6". Null = inherit. (0072)
+    week_off_days: str | None = Field(default=None, max_length=20)
     leave_billable: bool | None = None
     comp_off_billable: bool | None = None
     hours_required_half_day: float | None = None
@@ -99,6 +101,7 @@ class BranchBillingPolicyIn(BaseModel):
     weekoff_billable: bool | None = None
     leave_billable: bool | None = None
     comp_off_billable: bool | None = None
+    billable_leaves_per_year: float | None = Field(default=None, ge=0, le=366)
     hours_required_half_day: float | None = Field(default=None, ge=0, le=24)
     hours_required_full_day: float | None = Field(default=None, ge=0, le=24)
     working_hours_per_day: float | None = Field(default=None, ge=0, le=24)
@@ -128,8 +131,11 @@ class BillingPolicyIn(BaseModel):
     """
 
     week_off_billable: bool | None = None
+    #: CSV of weekday numbers 0=Mon..6=Sun, e.g. "5,6". Null = Sat+Sun. (0072)
+    week_off_days: str | None = Field(default=None, max_length=20)
     leave_billable: bool | None = None
     holidays_billable: bool | None = None
+    billable_leaves_per_year: float | None = Field(default=None, ge=0, le=366)
     min_hours_full_day: float = Field(default=8.0, ge=0, le=24)
     min_hours_half_day: float = Field(default=4.0, ge=0, le=24)
     billing_type: BillingType | None = None

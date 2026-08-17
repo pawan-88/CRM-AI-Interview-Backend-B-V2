@@ -481,6 +481,11 @@ def tracked_chat_completion(
     temperature: float | None = None,
     max_tokens: int | None = None,
     response_format: dict | None = None,
+    #: OpenAI tool/function definitions. Passed straight through so callers that
+    #: need tool-calling (Ask AI) stay inside the same logging + retry path
+    #: instead of reaching for the raw client.
+    tools: list[dict] | None = None,
+    tool_choice: Any = None,
     call_type: str = "chat_completion",
     db_target: str = "",
     template_id: str = "",
@@ -503,6 +508,10 @@ def tracked_chat_completion(
         kwargs["max_tokens"] = max_tokens
     if response_format is not None:
         kwargs["response_format"] = response_format
+    if tools:
+        kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
 
     start = time.perf_counter()
     status = "success"

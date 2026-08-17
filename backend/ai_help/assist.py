@@ -35,6 +35,13 @@ SYSTEM_PROMPT = (
     "themselves (you are read-only) and offer a page to open when useful.\n"
     "Keep answers short and practical. Use light Markdown (short paragraphs, bullets, "
     "bold) when it helps readability.\n\n"
+    "When query tools are available, use them for questions about the user's actual "
+    "records — counts, lists, statuses, values, names, dates. Look the answer up "
+    "instead of guessing, and instead of telling them where to click when they asked "
+    "you what the number is. Call several tools if a question needs them. Report what "
+    "comes back plainly; if a tool returns an error, say what you could not find and "
+    "suggest a narrower question. Tools read data and nothing else — you still cannot "
+    "change anything.\n\n"
     "At the end of your reply, if opening another page would help, add a single line "
     "exactly in this form (or omit if none):\n"
     "NAVIGATE_TO: <route_key>\n"
@@ -140,14 +147,97 @@ def build_messages(
     return messages, ctx
 
 
+#: How many times the model may look something up before it has to answer.
+#: Three is enough for "find the requirement, then its candidates, then the
+#: customer" and low enough that a confused model cannot bill a fortune.
+_MAX_TOOL_ROUNDS = 3
+
+
+def _run_tool_rounds(
+    client,
+    *,
+    messages: list[dict],
+    tools: list[dict],
+    ctx: dict,
+    anon_q: str,
+    execute: Any,
+) -> tuple[Any, list[str], list[dict]]:
+    """Let the model query, then answer. Returns (final_response, names, results).
+
+    Each round appends the assistant's tool calls and their results to the
+    conversation, so by the last call the model is answering with the data in
+    front of it rather than from the single guessed snapshot it used to get.
+    """
+    tools_used: list[str] = []
+    tool_results: list[dict] = []
+    response = None
+
+    for round_no in range(_MAX_TOOL_ROUNDS + 1):
+        # On the final round drop the tools entirely: the model must answer
+        # with what it has rather than requesting a fourth lookup it will not
+        # be allowed to make.
+        offer = tools if round_no < _MAX_TOOL_ROUNDS else None
+        response = tracked_chat_completion(
+            client,
+            model=_model(),
+            messages=messages,
+            temperature=0.45,
+            max_tokens=_max_tokens(),
+            tools=offer,
+            tool_choice="auto" if offer else None,
+            call_type="ai_assist",
+            difficulty=f"route:{ctx['tab_key']}",
+            template_name="ask_ai_help",
+            selected_skills=[anon_q[:120]],
+        )
+        choice = response.choices[0].message
+        calls = list(getattr(choice, "tool_calls", None) or [])
+        if not calls:
+            break
+
+        messages.append({
+            "role": "assistant",
+            "content": choice.content or "",
+            "tool_calls": [
+                {"id": c.id, "type": "function",
+                 "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                for c in calls
+            ],
+        })
+        for call in calls:
+            name = call.function.name
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = execute(name, args)
+            tools_used.append(name)
+            tool_results.append({"tool": name, "arguments": args, "result": result})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(result, default=str),
+            })
+
+    return response, tools_used, tool_results
+
+
 def run_assist(
     *,
     message: str,
     tab_key: str | None,
     history: list[dict[str, str]] | None = None,
     data_context: str | None = None,
+    tools: list[dict] | None = None,
+    run_tool: Any = None,
 ) -> dict[str, Any]:
-    """Call LLM and return structured assist payload (no DB writes of CRM data)."""
+    """Call LLM and return structured assist payload (no DB writes of CRM data).
+
+    ``tools`` / ``run_tool`` are supplied by the router when the caller enabled
+    them. They arrive as parameters rather than being imported here so this
+    module keeps no database dependency and stays unit-testable without one —
+    and so permission filtering happens where the current user is known.
+    """
     msg = (message or "").strip()
     if not msg:
         raise ValueError("message is required")
@@ -188,25 +278,40 @@ def run_assist(
         return _response(fallback, navigate_to=nav, ctx=ctx)
 
     client = get_openai_client(purpose)
-    res = tracked_chat_completion(
-        client,
-        model=_model(),
-        messages=messages,
-        temperature=0.45,
-        max_tokens=_max_tokens(),
-        call_type="ai_assist",
-        # Anonymized: no candidate PII; route in difficulty field for filterability
-        difficulty=f"route:{ctx['tab_key']}",
-        template_name="ask_ai_help",
-        selected_skills=[anon_q[:120]],
-    )
+    tools_used: list[str] = []
+    tool_results: list[dict] = []
+
+    if tools and run_tool is not None:
+        res, tools_used, tool_results = _run_tool_rounds(
+            client, messages=messages, tools=tools, ctx=ctx, anon_q=anon_q, execute=run_tool,
+        )
+    else:
+        res = tracked_chat_completion(
+            client,
+            model=_model(),
+            messages=messages,
+            temperature=0.45,
+            max_tokens=_max_tokens(),
+            call_type="ai_assist",
+            # Anonymized: no candidate PII; route in difficulty field for filterability
+            difficulty=f"route:{ctx['tab_key']}",
+            template_name="ask_ai_help",
+            selected_skills=[anon_q[:120]],
+        )
+
     raw = (res.choices[0].message.content or "").strip()
     reply, hint = _parse_reply(raw)
     navigate_to = resolve_navigate_to(hint)
-    return _response(reply or "I could not generate a reply. Please try again.", navigate_to=navigate_to, ctx=ctx)
+    return _response(
+        reply or "I could not generate a reply. Please try again.",
+        navigate_to=navigate_to, ctx=ctx,
+        tools_used=tools_used, tool_results=tool_results,
+    )
 
 
-def _response(reply: str, *, navigate_to: str | None, ctx: dict) -> dict[str, Any]:
+def _response(reply: str, *, navigate_to: str | None, ctx: dict,
+              tools_used: list[str] | None = None,
+              tool_results: list[dict] | None = None) -> dict[str, Any]:
     """Phase-1 response + Phase-2 seams (actions/tools empty / navigate only via button)."""
     from ai_help.loader import NAVIGABLE, all_entries
 
@@ -234,9 +339,11 @@ def _response(reply: str, *, navigate_to: str | None, ctx: dict) -> dict[str, An
         "tab_key": ctx["tab_key"],
         "tab_title": ctx["title"],
         "suggested_prompts": ctx["suggested_prompts"],
-        # Phase-2 seams (whitelisted READ tools / confirmed actions) — unused now
         "actions": actions,
-        "tools_used": [],
-        "tool_results": [],
+        # Which whitelisted reads answered this question. Surfaced so the user
+        # can see the answer came from their data, not from the model's memory.
+        "tools_used": tools_used or [],
+        "tool_results": tool_results or [],
+        # Still true, and still enforced server-side: every tool is a SELECT.
         "read_only": True,
     }

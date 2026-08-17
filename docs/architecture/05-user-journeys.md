@@ -135,8 +135,8 @@ journey
       Create/manage employees: 4: HR
       Map employees to projects (PE bridge): 4: HR
       Seed PE leave from Customer Leave Policy: 4: HR
-      Maintain holidays calendar: 3: HR
-      Edit branch holiday-year dates (Sales/HR): 3: Sales
+      Maintain holidays calendar (customer holidays require branch): 4: HR
+      Edit branch holiday-year dates (Sales/HR) — same rows as Holidays tab: 4: Sales
       Freeze branch holiday year: 3: Sales
       Approve PE-scoped leave applications: 4: HR
       Approve/reject timesheets: 4: HR

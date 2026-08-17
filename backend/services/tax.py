@@ -52,7 +52,18 @@ def gst_component_amounts(base, sgst_pct=None, cgst_pct=None, igst_pct=None) -> 
 
 
 def default_tds_rate() -> Decimal:
-    return _d(os.getenv("TDS_RATE_PERCENT", "10"))
+    """Settings row → TDS_RATE_PERCENT env → 10 (Sec 194J).
+
+    Admin-editable (Settings → Organisation → Finance) because a statutory
+    rate change should be a form edit, not a deploy. Falls back hard to 10 on
+    any bad value — a typo must never zero the deduction.
+    """
+    try:
+        from services.org_settings import setting
+
+        return _d(setting("finance.tds_rate_percent") or "10")
+    except Exception:
+        return _d(os.getenv("TDS_RATE_PERCENT", "10"))
 
 
 def tds_amount(sub_total, rate=None) -> Decimal:

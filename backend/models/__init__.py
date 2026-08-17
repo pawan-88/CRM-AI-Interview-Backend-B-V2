@@ -9,7 +9,8 @@ from models.masters import (  # noqa: F401
     FinancialYear, LeavePolicyType, Location, Skill, TaxRate, UserTablePreference
 )
 from models.customers import (  # noqa: F401
-    BranchHolidayYear, ContactPerson, Customer, CustomerBillingPolicy, CustomerBranch, CustomerDocument, CustomerStatus,
+    BranchHolidayYear, ContactPerson, Customer, CustomerBillingPolicy, CustomerBranch, CustomerDocument,
+    CustomerRateCard, CustomerStatus,
 )
 from models.opportunities import (  # noqa: F401
     Opportunity, OpportunityActivityLog, OpportunityApprovalStatus, OpportunityAttachment,
@@ -48,6 +49,8 @@ from models.leave import (  # noqa: F401
     CustomerLeavePolicy, Holiday, HolidayName, LeaveAccrualEvent, LeaveApplication, LeaveCreditConcept,
 )
 from models.rbac import Notification, Role, RoleName, UserRole  # noqa: F401
+from models.email_outbox import EmailOutbox, EmailStatus  # noqa: F401
+from models.notify_routes import ActionPermission, NotificationRoute, UserNotifyPref  # noqa: F401
 from models.ai_links import AiInterviewLink  # noqa: F401
 from models.scheduling import CandidateOutreach, InterviewEvent, InterviewSlot, SlotBooking  # noqa: F401
 from models.template_requests import TemplateRequest, TemplateRequestStatus  # noqa: F401

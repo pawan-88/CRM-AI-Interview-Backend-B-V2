@@ -66,7 +66,8 @@ def _project_leave_expire(v: str | None) -> str | None:
 
 
 class ProjectCreate(BaseModel):
-    opportunity_id: int
+    #: Optional (0069): projects may have no sales opportunity behind them.
+    opportunity_id: int | None = None
     customer_id: int
     name: str = Field(min_length=1, max_length=255)
     # Optional explicit branch; else resolved from opportunity.branch_id on create.
@@ -140,6 +141,18 @@ class ProjectUpdate(BaseModel):
     )
 
 
+class MapRateIn(BaseModel):
+    """One Commercial Details row on the Map Employee form.
+
+    Only the start is stored. A rate's expiry is DERIVED — it ends the day
+    before the next row's effective_from — so two rows can never disagree
+    about when one rate hands over to the next.
+    """
+
+    effective_from: date
+    rate: Decimal = Field(ge=0)
+
+
 class ProjectEmployeeIn(BaseModel):
     employee_id: int
     onboarding_date: date | None = None
@@ -151,6 +164,21 @@ class ProjectEmployeeIn(BaseModel):
     is_exit: bool = False
     exit_date: date | None = None
     billing_date: date | None = None  # first billable date
+    # Commercial Details rows from the wizard. When present these become the
+    # mapping's effective-dated rate history and billing_rate is re-derived
+    # from whichever row is in force today (billing_rate above then only
+    # matters as a fallback for callers that don't send rows).
+    rates: list[MapRateIn] | None = None
+
+    @field_validator("rates")
+    @classmethod
+    def _no_duplicate_effective_dates(cls, v):
+        """Two rates starting the same day would make "which rate applies" ambiguous."""
+        if v:
+            dates = [r.effective_from for r in v]
+            if len(dates) != len(set(dates)):
+                raise ValueError("two Commercial Details rows share the same Effective From date")
+        return v
 
 
 class ProjectEmployeeUpdate(BaseModel):

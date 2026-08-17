@@ -86,11 +86,14 @@ def derive_ctc_row(
     d = details or {}
     days, hours = calculate_billing_bases(d)
 
-    # Exp Max is derived: midpoint of Exp Min and Target Exp (legacy parity).
+    # Exp Max is derived: midpoint of Exp Min and Target Exp, ROUNDED UP to
+    # the whole year (Zoho parity, 14 Aug 2026): 7→8 shows 8, not 7.5 —
+    # half-years read as noise to sales, and Zoho always ceils.
     exp_min = _decimal(out.get("exp_min"))
     target_exp = _decimal(out.get("target_exp"))
     out["exp_max"] = (
-        float(_money((exp_min + target_exp) / Decimal("2")))
+        float(((exp_min + target_exp) / Decimal("2"))
+              .to_integral_value(rounding="ROUND_CEILING"))
         if exp_min is not None and target_exp is not None
         else None
     )
@@ -140,7 +143,21 @@ def derive_ctc_row(
     engineering_budget = _money(
         annual * (Decimal("1") - management_cost_pct / Decimal("100"))
     )
-    denominator = Decimal("1") + hike_pct / Decimal("100")
+    # APPRAISAL CYCLES (NEXUS parity, 14 Aug 2026): the number of hikes that
+    # must fit inside the fixed budget before the candidate leaves the band —
+    # derived as Target − Exp Min − 1 (the joining year needs no hike).
+    #   Approved CTC = Budget / (1 + hike%)^cycles
+    # so an offer at Approved grows by hike% each appraisal and still fits the
+    # budget in the final year. 5→7 = 1 cycle (÷1.1); 6→7 = 0 (full budget);
+    # 7→10 = 2 (÷1.21). Legacy rows without exp/target keep the old single
+    # division (cycles = 1) so stored opportunities re-derive unchanged.
+    if exp_min is not None and target_exp is not None:
+        cycles = max(0, int(target_exp - exp_min) - 1)
+        out["appraisal_cycle"] = str(cycles)
+    else:
+        raw_cycle = str(out.get("appraisal_cycle") or "").strip()
+        cycles = int(raw_cycle) if raw_cycle.isdigit() else 1
+    denominator = (Decimal("1") + hike_pct / Decimal("100")) ** cycles
     approved_ctc = _money(engineering_budget / denominator) if denominator > ZERO else None
 
     out.update({

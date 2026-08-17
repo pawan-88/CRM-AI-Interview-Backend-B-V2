@@ -43,7 +43,7 @@ import importlib
 for _m in [
     "base", "rbac", "customers", "opportunities", "projects", "leave",
     "timesheets", "finance", "hr", "candidates", "masters", "requirements",
-    "profiles", "resumes", "ai_links", "scheduling", "project_employee",
+    "profiles", "resumes", "ai_links", "scheduling",
     "user_profiles", "template_requests", "access_templates",
 ]:
     importlib.import_module(f"models.{_m}")
@@ -163,6 +163,55 @@ def test_sales_can_transition_to_outcomes(sales_client, new_stage):
     )
     assert r.status_code == 200, r.text
     assert r.json()["data"]["pipeline_stage"] == new_stage
+
+
+def test_update_logs_field_level_old_to_new_diff(sales_client):
+    """PUT logs 'field: old → new' per changed field — incl. CTC slab rows —
+    so an accidental edit is traceable to a person, a field and both values
+    (17 Aug 2026). The old log said only 'Fields updated: …'."""
+    from models.opportunities import OpportunityActivityLog
+
+    session = sales_client._session
+    oid = sales_client._opp_id
+    r = sales_client.put(
+        f"/api/opportunities/{oid}",
+        json={
+            "title": "Renamed target",
+            "rfi_value": 2000,
+            "ctc_slab": [{
+                "exp_min": 1, "target_exp": 3, "rate": 850,
+                "hike_pct": 10, "management_cost_pct": 30,
+            }],
+        },
+    )
+    assert r.status_code == 200, r.text
+    last = (
+        session.query(OpportunityActivityLog)
+        .filter_by(opportunity_id=oid)
+        .order_by(OpportunityActivityLog.id.desc())
+        .first()
+    )
+    assert last is not None and last.action_type == "Updated"
+    assert "Title: Partial close target → Renamed target" in last.comment
+    assert "RFI value: 1000 → 2000" in last.comment
+    assert "CTC Slab: 0 row(s) → 1 row(s)" in last.comment
+
+    # A row-level CTC change names the row, the field and both values.
+    r2 = sales_client.put(
+        f"/api/opportunities/{oid}",
+        json={"ctc_slab": [{
+            "exp_min": 1, "target_exp": 3, "rate": 900,
+            "hike_pct": 10, "management_cost_pct": 30,
+        }]},
+    )
+    assert r2.status_code == 200, r2.text
+    last2 = (
+        session.query(OpportunityActivityLog)
+        .filter_by(opportunity_id=oid)
+        .order_by(OpportunityActivityLog.id.desc())
+        .first()
+    )
+    assert "CTC Slab row 1 rate: 850 → 900" in last2.comment
 
 
 def test_sales_cannot_archive(sales_client):

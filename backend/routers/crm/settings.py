@@ -36,6 +36,29 @@ def get_ai_interview_pass_threshold(db: Session = Depends(get_crm_db),
                     message="AI interview pass threshold")
 
 
+@router.get("/ui-text")
+def ui_text(db: Session = Depends(get_crm_db),
+            user: CurrentUser = Depends(any_crm_role)):
+    """Admin-authored overrides for in-app teaching copy (`uitext.*` settings).
+
+    Readable by every CRM user because the copy renders in everyone's UI;
+    WRITES stay behind the generic admin-only PUT /settings/{key}. Keys:
+
+      uitext.status.<StoredStatus>  — tooltip for that status badge
+      uitext.empty.<page>           — body text of that page's empty state
+
+    Empty values are dropped: "cleared" means "use the built-in copy",
+    never "show nothing".
+    """
+    rows = db.execute(
+        select(AppSetting).where(AppSetting.key.like("uitext.%"))
+    ).scalars().all()
+    return envelope(
+        data={r.key: r.value for r in rows if (r.value or "").strip()},
+        message="UI text overrides",
+    )
+
+
 @router.put("/settings/{key}")
 def upsert_setting(key: str, payload: SettingValueIn,
                    db: Session = Depends(get_crm_db),

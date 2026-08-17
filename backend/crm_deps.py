@@ -217,30 +217,148 @@ def page_params(page: int = 1, limit: int = 20, search: str | None = None,
                       sort_by=sort_by, sort_dir=sort_dir)
 
 
-def gated_read(tab: str, *roles: str, allow_admin: bool = True):
-    """Combine CRM role check (or any_crm_role when roles empty) + template view access."""
-    role_dep = role_required(*roles, allow_admin=allow_admin) if roles else any_crm_role
-    acc_dep = require_access(tab, mode="view")
+def _template_verdict(db: Session, user: CurrentUser, tab: str,
+                      required_mode: str, field: str | None = None) -> bool | None:
+    """What the user's Access Template says about this action.
 
-    def dep(
-        user: CurrentUser = Depends(role_dep),
-        _acc: CurrentUser = Depends(acc_dep),
-    ) -> CurrentUser:
-        return user
+    Returns:
+      * ``None``  — the user is unrestricted (no template, no override).
+        The caller must fall back to role defaults; this function has no say.
+      * ``True``  — the template grants the required mode. **This is
+        authoritative**: for a templated user the template alone decides, so
+        the role check is skipped. Admin/CEO deliberately chose this grant.
+      * raises 403 — the user is templated and the template does NOT grant it.
+
+    Modes are a ladder (view < edit < create): a "create" grant satisfies an
+    "edit" requirement, and so on — see `access_registry.mode_satisfies`.
+    """
+    from services.access_registry import mode_satisfies
+    from services.access_templates import effective_access
+
+    acc = effective_access(db, user.id, set(user.roles))
+    if acc.get("full"):
+        return True
+    if acc.get("visible_tabs") is None:
+        return None  # unrestricted → role defaults decide
+
+    tabs = acc.get("tabs", {})
+    granted = tabs.get(tab)
+    if granted is None:
+        raise HTTPException(status_code=403,
+                            detail=f"You do not have access to the '{tab}' tab")
+    if field is not None and required_mode in ("edit", "create"):
+        # A field grant overrides the tab mode for that field only.
+        fmode = (acc.get("fields", {}).get(tab, {}) or {}).get(field)
+        effective = fmode if fmode is not None else granted
+        if not mode_satisfies(effective, "edit"):
+            raise HTTPException(status_code=403,
+                                detail=f"You have view-only access to '{tab}.{field}'")
+        # The field grants edit; the tab still needs to satisfy view.
+        return True
+    if not mode_satisfies(granted, required_mode):
+        verb = {"view": "view", "edit": "edit records on", "create": "create records on"}
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your access template does not let you {verb.get(required_mode, required_mode)} "
+                   f"the '{tab}' tab")
+    return True
+
+
+def _gate(tab: str, required_mode: str, roles: tuple[str, ...],
+          allow_admin: bool = True, field: str | None = None):
+    """The one gate. Template first, roles as the fallback.
+
+    Decision order, top wins:
+      1. Admin/CEO → allowed.
+      2. User has a template/override → the TEMPLATE alone decides (grant or
+         403). Roles are not consulted: the whole point of Access Templates is
+         that Admin/CEO decide per tab what each person may do, including
+         things their role alone would not allow.
+      3. No template → the endpoint's role list decides, exactly as before
+         templates existed. Empty role list = any CRM role (reads).
+    """
+    def dep(user: CurrentUser = Depends(get_current_user),
+            db: Session = Depends(get_crm_db)) -> CurrentUser:
+        if allow_admin and user.roles & {"Admin", "CEO"}:
+            return user
+        if not user.roles:
+            raise HTTPException(status_code=403, detail="No CRM role assigned to this user")
+
+        verdict = _template_verdict(db, user, tab, required_mode, field=field)
+        if verdict is True:
+            return user
+
+        # Unrestricted user → role defaults.
+        if not roles:  # read-style endpoints: any CRM role
+            return user
+        allowed_set = set(roles) | ({"Admin", "CEO"} if allow_admin else set())
+        if user.roles & allowed_set:
+            return user
+        raise HTTPException(
+            status_code=403,
+            detail=f"Requires one of roles: {', '.join(sorted(allowed_set))}",
+        )
 
     return dep
 
 
-def gated_write(tab: str, *roles: str, allow_admin: bool = True, field: str | None = None):
-    """Combine CRM role check + template edit access (optional field)."""
-    role_dep = role_required(*roles, allow_admin=allow_admin)
-    acc_dep = require_access(tab, mode="edit", field=field)
+def gated_read(tab: str, *roles: str, allow_admin: bool = True):
+    """Template view access when templated; else role check (empty = any CRM role)."""
+    return _gate(tab, "view", roles, allow_admin=allow_admin)
 
+
+def gated_write(tab: str, *roles: str, allow_admin: bool = True, field: str | None = None):
+    """Template edit access when templated; else role check."""
+    return _gate(tab, "edit", roles, allow_admin=allow_admin, field=field)
+
+
+def gated_create(tab: str, *roles: str, allow_admin: bool = True):
+    """Template create access when templated; else role check.
+
+    Use on the POST that brings a record into existence. Editing endpoints
+    stay on `gated_write` — the ladder means a create grant passes both.
+    """
+    return _gate(tab, "create", roles, allow_admin=allow_admin)
+
+
+def gated_write_action(action: str, tab: str, *default_roles: str, field: str | None = None):
+    """gated_write whose ROLE LIST is admin-editable at runtime.
+
+    The roles named in code are only the default: when Admin/CEO save a row
+    for `action` in the Users tab's Action Permissions panel, that row decides
+    who may perform the action — resolved PER REQUEST, so a change applies
+    without a restart. Admin/CEO always pass (same as role_required's
+    allow_admin), which makes lock-out impossible. Any lookup problem falls
+    back to the code default, so this can never fail closed by accident.
+
+    Template users: a template grant of edit+ on the tab is authoritative here
+    too (chosen deliberately — Admin/CEO decide access, roles are the
+    fallback), and a templated user WITHOUT the grant is refused before the
+    action's role list is even consulted.
+    """
     def dep(
-        user: CurrentUser = Depends(role_dep),
-        _acc: CurrentUser = Depends(acc_dep),
+        user: CurrentUser = Depends(get_current_user),
+        db: Session = Depends(get_crm_db),
     ) -> CurrentUser:
-        return user
+        if user.roles & {"Admin", "CEO"}:
+            return user
+        if not user.roles:
+            raise HTTPException(status_code=403, detail="No CRM role assigned to this user")
+
+        verdict = _template_verdict(db, user, tab, "edit", field=field)
+        if verdict is True:
+            return user
+
+        from services.action_permissions import roles_for_action
+
+        allowed = set(roles_for_action(action, default_roles))
+        if user.roles & allowed:
+            return user
+        raise HTTPException(
+            status_code=403,
+            detail="Requires one of roles: "
+                   + ", ".join(sorted(allowed | {"Admin", "CEO"})),
+        )
 
     return dep
 
@@ -261,20 +379,25 @@ def require_access(tab: str, *, mode: str = "edit", field: str | None = None):
         # full (Admin/CEO) or unrestricted (role defaults) -> allowed
         if acc.get("full") or acc.get("visible_tabs") is None:
             return user
+        from services.access_registry import mode_satisfies
         tabs = acc.get("tabs", {})
         bare = tab  # callers pass bare registry keys; resolver normalizes stored keys
         if bare not in tabs:
             raise HTTPException(status_code=403, detail=f"You do not have access to the '{tab}' tab")
         if mode == "view":
             return user
-        # edit required — field mode (if any) governs, else the tab mode
+        # edit/create required — modes ladder (view < edit < create); a field
+        # grant (view|edit) governs that field over the tab mode.
         tab_mode = tabs.get(bare)
         if field is not None:
             fmode = (acc.get("fields", {}).get(bare, {}) or {}).get(field, tab_mode)
-            if fmode != "edit":
+            if not mode_satisfies(fmode, "edit"):
                 raise HTTPException(status_code=403,
                                     detail=f"You have view-only access to '{tab}.{field}'")
-        elif tab_mode != "edit":
-            raise HTTPException(status_code=403, detail=f"You have view-only access to the '{tab}' tab")
+        elif not mode_satisfies(tab_mode, mode):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Your access template does not let you "
+                       f"{'create records on' if mode == 'create' else 'edit'} the '{tab}' tab")
         return user
     return dep

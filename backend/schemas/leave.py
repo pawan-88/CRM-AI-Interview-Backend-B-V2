@@ -98,6 +98,10 @@ class HolidayCreate(BaseModel):
     observance: str = "Mandatory"
     customer_id: int | None = None
     branch_id: int | None = None
+    # One or more branches (preferred). branch_id kept for single-branch callers.
+    branch_ids: list[int] = []
+    # When true with a customer_id, create/link the holiday on every branch.
+    all_branches: bool = False
     is_active: bool = True
 
     _type = field_validator("holiday_type")(_one_of(HOLIDAY_TYPES, "holiday_type"))
@@ -112,6 +116,8 @@ class HolidayUpdate(BaseModel):
     observance: str | None = None
     customer_id: int | None = None
     branch_id: int | None = None
+    branch_ids: list[int] = []
+    all_branches: bool = False
     is_active: bool | None = None
 
     _type = field_validator("holiday_type")(_one_of(HOLIDAY_TYPES, "holiday_type"))

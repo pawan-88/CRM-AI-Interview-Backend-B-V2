@@ -158,6 +158,7 @@ def serialize_branch(branch: CustomerBranch) -> dict:
         # leave & holiday billing policy (tri-state: None = inherit customer default)
         "holidays_billable": g("holidays_billable"),
         "weekoff_billable": g("weekoff_billable"),
+        "week_off_days": g("week_off_days"),
         "leave_billable": g("leave_billable"),
         "comp_off_billable": g("comp_off_billable"),
         "hours_required_half_day": _bnum(g("hours_required_half_day")),
@@ -185,7 +186,7 @@ def serialize_branch(branch: CustomerBranch) -> dict:
 # Branch-level billing-policy fields (subset of serialize_branch keys). Nullable
 # fields left NULL inherit the customer-level default policy field-by-field.
 BRANCH_BILLING_POLICY_FIELDS: tuple[str, ...] = (
-    "holidays_billable", "weekoff_billable", "leave_billable", "comp_off_billable",
+    "holidays_billable", "weekoff_billable", "week_off_days", "leave_billable", "comp_off_billable",
     "hours_required_half_day", "hours_required_full_day", "working_hours_per_day",
     "hours_required_half_day_comp_off", "hours_required_full_day_comp_off",
     "billing_type", "billing_frequency", "billing_cycle_start_day", "billing_cycle_end_day",
@@ -214,6 +215,7 @@ def serialize_policy(policy: CustomerBillingPolicy | None) -> dict | None:
         "id": policy.id,
         "customer_id": policy.customer_id,
         "week_off_billable": policy.week_off_billable,
+        "week_off_days": getattr(policy, "week_off_days", None),
         "leave_billable": policy.leave_billable,
         "holidays_billable": policy.holidays_billable,
         "min_hours_full_day": float(policy.min_hours_full_day),
@@ -225,6 +227,8 @@ def serialize_policy(policy: CustomerBillingPolicy | None) -> dict | None:
         "comp_off_max_limit": _bnum(getattr(policy, "comp_off_max_limit", None)),
         "comp_off_max_carry_forward": _bnum(getattr(policy, "comp_off_max_carry_forward", None)),
         "normal_hours_per_day": _bnum(getattr(policy, "normal_hours_per_day", None)),
+        # Paid leaves/year billed by the customer (APTIV rule, 0078).
+        "billable_leaves_per_year": _bnum(getattr(policy, "billable_leaves_per_year", None)),
         "user_role": getattr(policy, "user_role", None),
         "operation": getattr(policy, "operation", None),
     }

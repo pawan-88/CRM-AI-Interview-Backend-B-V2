@@ -26,9 +26,23 @@ def smtp_configured() -> bool:
 
 
 def send_email(to_address: str, subject: str, body_text: str, body_html: str | None = None,
-               attachments: list[tuple[str, bytes, str]] | None = None) -> dict[str, Any]:
+               attachments: list[tuple[str, bytes, str]] | None = None,
+               from_name: str | None = None, reply_to: str | None = None,
+               reply_to_name: str | None = None) -> dict[str, Any]:
     """`attachments`: optional list of (filename, content_bytes, mime_type) —
-    e.g. ("invite.ics", b"BEGIN:VCALENDAR...", "text/calendar")."""
+    e.g. ("invite.ics", b"BEGIN:VCALENDAR...", "text/calendar").
+
+    `from_name` / `reply_to` shape the HEADERS only. The envelope sender stays
+    SMTP_FROM so SPF and DKIM remain aligned with the tenant — Office 365
+    rejects a From: of another mailbox with "5.7.60 Client does not have
+    permissions to send as this sender" unless Send As has been granted.
+
+    So a recruiter-triggered mail goes out as:
+        From:     "Pavan Sanap (Karnex)" <SMTP_FROM>
+        Reply-To: pavan.sanap@karnex.in
+    The candidate sees who is handling them, and hitting reply reaches that
+    person's own inbox rather than a shared one.
+    """
     if not smtp_configured():
         return {"ok": False, "error": "SMTP not configured (set SMTP_HOST, SMTP_USER, SMTP_PASSWORD)."}
 
@@ -62,8 +76,49 @@ def send_email(to_address: str, subject: str, body_text: str, body_html: str | N
         if body_html:
             msg.attach(MIMEText(body_html, "html", "utf-8"))
     msg["Subject"] = subject
-    msg["From"] = from_addr
+
+    # Send AS the person whose action triggered this, when their address sits on
+    # a domain the provider has verified for us.
+    #
+    # This only became possible on ZeptoMail. Office 365 rejects a From: of
+    # another mailbox with "5.7.60 Client does not have permissions to send as
+    # this sender" unless an admin grants SendAs per mailbox; a provider that
+    # verifies a whole DOMAIN accepts any address on it, with no per-user setup.
+    #
+    # The ENVELOPE sender deliberately stays SMTP_FROM. Only the visible From
+    # header changes. That keeps bounces and complaints landing on one monitored
+    # address instead of scattering across every recruiter's mailbox, and it is
+    # the ordinary arrangement for application mail.
+    #
+    # EMAIL_SENDER_DOMAINS is the guard. An address outside it falls back to
+    # SMTP_FROM rather than attempting a send the provider would refuse — so an
+    # external or malformed address degrades quietly instead of bouncing.
+    from email.utils import formataddr
+
+    # Settings-page value first (Admin-editable), EMAIL_SENDER_DOMAINS env as
+    # the fallback — same list either way: domains we may put in From.
+    try:
+        from services.org_settings import setting as _org_setting
+
+        _domains_raw = _org_setting("email.sender_domains")
+    except Exception:
+        _domains_raw = (os.getenv("EMAIL_SENDER_DOMAINS") or "")
+    allowed_domains = {
+        d.strip().lower().lstrip("@")
+        for d in _domains_raw.split(",")
+        if d.strip()
+    }
+    actor = (reply_to or "").strip()
+    actor_domain = actor.rsplit("@", 1)[-1].lower() if "@" in actor else ""
+    send_as = actor if (actor and actor_domain in allowed_domains) else from_addr
+
+    display = (from_name or "").strip()
+    msg["From"] = formataddr((display, send_as)) if display else send_as
     msg["To"] = to_address
+    # Reply-To is redundant once From IS the actor; only add it when they differ.
+    if actor and actor.lower() != send_as.lower():
+        rname = (reply_to_name or "").strip()
+        msg["Reply-To"] = formataddr((rname, actor)) if rname else actor
 
     try:
         if use_tls and port == 465:
@@ -106,6 +161,33 @@ def send_password_reset_email(to_email: str, full_name: str, reset_url: str) -> 
       <p>— KARNEX AI HR</p>
     </div>
     """
+    # Durable-first: queue on the email outbox so the reset gets the same
+    # retries and Email Outbox audit row as every other application email —
+    # a transient SMTP failure no longer means a silently lost reset link.
+    # Any problem with queueing (outbox not migrated, DB down) falls back to
+    # the original inline send; a reset must never be stopped by plumbing.
+    try:
+        from crm_db import get_session_factory
+        from services.email_outbox import queue_email
+
+        session = get_session_factory()()
+        try:
+            row = queue_email(
+                session,
+                to_email=to_email,
+                to_name=(full_name or "").strip(),
+                subject=subject,
+                body_text=text,
+                body_html=html,
+                event="auth.password_reset",
+            )
+            if row is not None:
+                session.commit()
+                return {"ok": True, "queued": True}
+        finally:
+            session.close()
+    except Exception:
+        pass
     return send_email(to_email, subject, text, html)
 
 

@@ -8,19 +8,20 @@ opportunity_activity_log.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params
+from crm_deps import CurrentUser, PageParams, gated_create, gated_read, gated_write, get_crm_db, page_params
 from models import (
     Opportunity,
     OpportunityActivityLog,
     OpportunityApprovalStatus,
     OpportunityCtcSlab,
     OpportunitySkill,
+    OppType,
     PipelineStage,
     Priority,
     Requirement,
@@ -55,6 +56,7 @@ router = APIRouter(prefix="/api/opportunities", tags=["CRM: Opportunities"])
 
 read_opportunities = gated_read("opportunities")
 write_opportunities = gated_write("opportunities", "Sales", "Sales_Head")
+create_opportunities = gated_create("opportunities", "Sales", "Sales_Head")
 
 _SORTABLE = {"opp_id": Opportunity.opp_id, "title": Opportunity.title,
              "pipeline_stage": Opportunity.pipeline_stage,
@@ -120,7 +122,8 @@ def _spawn_requirement_from_opportunity(db: Session, opp: Opportunity, approver:
     notify_role(db, "RMG",
                 f"Requirement {req.req_number} pending engineering review",
                 f"'{req.title}' (from opportunity {opp.opp_id}) needs engineering review.",
-                f"/requirements/{req.id}", exclude_user_id=approver.id)
+                f"/requirements/{req.id}", exclude_user_id=approver.id,
+                event="opportunity.approved")
     return req
 
 
@@ -133,6 +136,7 @@ def list_opportunities(
     pipeline_stage: str | None = None,
     approval_status: str | None = None,
     customer_id: int | None = None,
+    opp_type: str | None = None,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(read_opportunities),
@@ -152,6 +156,18 @@ def list_opportunities(
         stmt = stmt.where(Opportunity.approval_status == approval_status)
     if customer_id is not None:
         stmt = stmt.where(Opportunity.customer_id == customer_id)
+    if opp_type:
+        # "SOW" = everything that is NOT T&M (Work Package / Fixed Price /
+        # Retainer) — the Pipeline T&M / Pipeline SOW workspace split.
+        if opp_type == "SOW":
+            stmt = stmt.where(Opportunity.opp_type != OppType.T_AND_M)
+        else:
+            valid_types = {t.value for t in OppType}
+            if opp_type not in valid_types:
+                raise HTTPException(status_code=400,
+                                    detail=f"Invalid opp_type. Allowed: SOW, "
+                                           f"{', '.join(sorted(valid_types))}")
+            stmt = stmt.where(Opportunity.opp_type == OppType(opp_type))
     if p.search:
         like = f"%{p.search}%"
         stmt = stmt.where(or_(Opportunity.title.ilike(like), Opportunity.opp_id.ilike(like)))
@@ -194,11 +210,67 @@ def _existing_ctc_rows(db: Session, opportunity_id: int) -> list[dict]:
     return [{field: getattr(row, field) for field in _CTC_FIELDS} for row in rows]
 
 
+# ------------------------------------------------------------------ audit diff
+# The activity log used to record only "Fields updated: details" — useless for
+# answering "who changed the CTC and from what to what?". Updates now log a
+# field-level OLD → NEW diff (17 Aug 2026) so an accidental edit is traceable
+# to a person, a field and both values. Purely descriptive — the log write
+# already existed; only the comment got richer.
+
+_UPDATE_LABELS = {
+    "title": "Title", "customer_id": "Customer", "branch_id": "Branch",
+    "contact_person_id": "Contact person", "hiring_manager_id": "Hiring manager",
+    "opp_type": "Type", "pipeline_stage": "Pipeline stage",
+    "onboarding_status": "Onboarding status", "rfi_value": "RFI value",
+    "rfi_received_date": "RFI received date",
+}
+
+
+def _audit_val(v) -> str:
+    """One comparable, human-readable token for a diff line."""
+    if v is None or v == "":
+        return "—"
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if hasattr(v, "value"):  # Enum
+        v = v.value
+    if isinstance(v, Decimal):
+        v = format(v.normalize(), "f")
+    if isinstance(v, float) and v == int(v):
+        v = int(v)
+    s = str(v)
+    return s if len(s) <= 80 else s[:77] + "…"
+
+
+def _audit_diff_lines(old_top: dict, new_top: dict,
+                      old_details: dict, new_details: dict,
+                      old_slab: list[dict] | None,
+                      new_slab: list[dict] | None) -> list[str]:
+    lines: list[str] = []
+    for f in sorted(new_top):
+        o, n = _audit_val(old_top.get(f)), _audit_val(new_top[f])
+        if o != n:
+            lines.append(f"{_UPDATE_LABELS.get(f, f.replace('_', ' '))}: {o} → {n}")
+    for k in sorted(set(old_details) | set(new_details)):
+        o, n = _audit_val(old_details.get(k)), _audit_val(new_details.get(k))
+        if o != n:
+            lines.append(f"{k.replace('_', ' ')}: {o} → {n}")
+    if old_slab is not None and new_slab is not None:
+        if len(old_slab) != len(new_slab):
+            lines.append(f"CTC Slab: {len(old_slab)} row(s) → {len(new_slab)} row(s)")
+        for i, (o_row, n_row) in enumerate(zip(old_slab, new_slab), start=1):
+            for f in _CTC_FIELDS:
+                o, n = _audit_val(o_row.get(f)), _audit_val(n_row.get(f))
+                if o != n:
+                    lines.append(f"CTC Slab row {i} {f.replace('_', ' ')}: {o} → {n}")
+    return lines
+
+
 @router.post("")
 def create_opportunity(
     payload: OpportunityCreate,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(write_opportunities),
+    user: CurrentUser = Depends(create_opportunities),
 ):
     validate_refs(db, payload.customer_id, payload.branch_id,
                   payload.contact_person_id, payload.hiring_manager_id)
@@ -221,7 +293,10 @@ def create_opportunity(
         opp_type=payload.opp_type,
         rfi_value=payload.rfi_value,
         rfi_received_date=payload.rfi_received_date,
-        onboarding_status=payload.onboarding_status,
+        # The form no longer asks (Aug 2026): every new opportunity starts at
+        # Sales Validation. Kept as a payload fallback so API callers that DO
+        # send a status still win.
+        onboarding_status=payload.onboarding_status or "Sales Validation",
         onboarded_count=payload.onboarded_count or 0,
         details=clean_details or None,
         pipeline_stage=PipelineStage.NEW,
@@ -252,10 +327,33 @@ def create_opportunity(
         notify_role(db, "Sales_Head",
                     f"Opportunity {opp.opp_id} awaiting approval",
                     f"'{opp.title}' was created and needs your approval.",
-                    f"/opportunities/{opp.id}", exclude_user_id=user.id)
+                    f"/opportunities/{opp.id}", exclude_user_id=user.id,
+                    event="opportunity.submitted")
     db.commit()
     db.refresh(opp)
     return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity created")
+
+
+@router.get("/{opportunity_id}/suggested-candidates")
+def suggested_candidates(
+    opportunity_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_opportunities),
+):
+    """Database scan: who already fits this position?
+
+    Deterministic scoring over skills / experience band / pipeline history /
+    contactability — see services/candidate_match.py for the exact weights.
+    Candidates already applied here are excluded; ones currently
+    Joined/Preboarding elsewhere come back flagged ``engaged``.
+    """
+    from services.candidate_match import suggest_candidates
+
+    opp = db.get(Opportunity, opportunity_id)
+    if opp is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    return envelope(data=suggest_candidates(db, opp),
+                    message="Suggested candidates")
 
 
 @router.get("/{opportunity_id}")
@@ -277,6 +375,17 @@ def update_opportunity(
 ):
     opp = get_opportunity_or_404(db, opportunity_id)
     changes = payload.model_dump(exclude_unset=True)
+    # Field-level template enforcement — the API twin of the greyed inputs.
+    # Every type-specific detail travels inside the `details` JSONB, so the
+    # single "details" registry key governs the whole schema-driven form body.
+    from services.access_templates import reject_view_only_fields
+    reject_view_only_fields(db, user.id, set(user.roles), "opportunities", changes, {
+        "title": "title", "customer_id": "customer_id", "branch_id": "branch_id",
+        "opp_type": "opp_type", "pipeline_stage": "pipeline_stage",
+        "onboarding_status": "onboarding_status",
+        "rfi_value": "rfi_value", "rfi_received_date": "rfi_received_date",
+        "details": "details", "ctc_slab": "ctc_slab",
+    })
     if not changes:
         raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -287,6 +396,12 @@ def update_opportunity(
             status_code=409,
             detail="This opportunity was changed by someone else. Reload and re-apply your edits.",
         )
+
+    # Audit snapshots BEFORE any mutation — the log compares against these.
+    audit_top_old = {f: getattr(opp, f) for f in changes
+                     if f not in ("details", "ctc_slab") and hasattr(opp, f)}
+    audit_details_old = dict(opp.details or {})
+    audit_slab_old = _existing_ctc_rows(db, opp.id)
 
     target_customer = changes.get("customer_id", opp.customer_id)
     validate_refs(
@@ -344,8 +459,26 @@ def update_opportunity(
     # title, customer and carried details — they're denormalized copies.
     sync_requirement_from_opportunity(db, opp)
 
+    # Field-level OLD → NEW audit trail. Slab rows are diffed only when the
+    # save touched them (directly or via a details re-derivation) — flush so
+    # the freshly replaced rows are queryable.
+    db.flush()
+    slab_touched = ctc_provided or details_changed
+    audit_lines = _audit_diff_lines(
+        audit_top_old,
+        {f: getattr(opp, f) for f in audit_top_old},
+        audit_details_old, dict(opp.details or {}),
+        audit_slab_old if slab_touched else None,
+        _existing_ctc_rows(db, opp.id) if slab_touched else None,
+    )
+    comment = "\n".join(audit_lines) if audit_lines else (
+        f"Saved with no visible change (fields sent: "
+        f"{', '.join(sorted(changes.keys())) or 'ctc_slab'})"
+    )
+    if len(comment) > 1800:
+        comment = comment[:1797] + "…"
     log_activity(db, OpportunityActivityLog, "opportunity_id", opp.id, user.id,
-                 "Updated", f"Fields updated: {', '.join(sorted(changes.keys()))}")
+                 "Updated", comment)
     db.commit()
     db.refresh(opp)
     return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity updated")
@@ -471,7 +604,8 @@ def resubmit_opportunity(
     notify_role(db, "Sales_Head",
                 f"Opportunity {opp.opp_id} resubmitted for approval",
                 f"'{opp.title}' was resubmitted and needs your approval.",
-                f"/opportunities/{opp.id}", exclude_user_id=user.id)
+                f"/opportunities/{opp.id}", exclude_user_id=user.id,
+                event="opportunity.submitted")
     db.commit()
     db.refresh(opp)
     return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity resubmitted for approval")

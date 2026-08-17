@@ -59,8 +59,12 @@ class CustomerBranch(Base):
     # billing policy" (see services.timesheets.effective_billing_policy).
     holidays_billable = sa.Column(sa.Boolean, nullable=True)
     weekoff_billable = sa.Column(sa.Boolean, nullable=True)
+    #: NULL = inherit customer default / built-in Sat+Sun. (0072)
+    week_off_days = sa.Column(sa.String(20), nullable=True)
     leave_billable = sa.Column(sa.Boolean, nullable=True)
     comp_off_billable = sa.Column(sa.Boolean, nullable=True)
+    #: NULL = inherit customer default. Paid leaves/year billed by customer (0078).
+    billable_leaves_per_year = sa.Column(sa.Numeric(5, 2), nullable=True)
     hours_required_half_day = sa.Column(sa.Numeric(4, 2), nullable=True)
     hours_required_full_day = sa.Column(sa.Numeric(4, 2), nullable=True)
     working_hours_per_day = sa.Column(sa.Numeric(4, 2), nullable=True)
@@ -124,6 +128,9 @@ class CustomerBillingPolicy(Base):
     id = sa.Column(sa.Integer, primary_key=True)
     customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id"), nullable=False, unique=True)
     week_off_billable = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    #: CSV of Python weekday numbers (0=Mon..6=Sun) that count as week-off,
+    #: e.g. "5,6". NULL = built-in Sat+Sun. (0072)
+    week_off_days = sa.Column(sa.String(20), nullable=True)
     leave_billable = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     holidays_billable = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     min_hours_full_day = sa.Column(sa.Numeric(4, 2), nullable=False, server_default="8.00")
@@ -137,6 +144,11 @@ class CustomerBillingPolicy(Base):
     comp_off_balance_initial = sa.Column(sa.Numeric(7, 2), nullable=True)
     comp_off_max_limit = sa.Column(sa.Numeric(7, 2), nullable=True)
     comp_off_max_carry_forward = sa.Column(sa.Numeric(7, 2), nullable=True)
+
+    #: Paid leaves per year the CUSTOMER covers (the "APTIV rule", 0078):
+    #: these many leave days are billed even when leave_billable is off —
+    #: the CTC slab adds them back to the billable-days base.
+    billable_leaves_per_year = sa.Column(sa.Numeric(5, 2), nullable=True)
 
     # Attendance rule
     normal_hours_per_day = sa.Column(sa.Numeric(4, 2), nullable=True)
@@ -157,6 +169,47 @@ class CustomerDocument(Base):
     status = sa.Column(sa.String(32), nullable=False, server_default="Active")
 
     customer = relationship("Customer", back_populates="documents")
+
+
+class CustomerRateCard(Base):
+    """Experience-band pricing quoted by a customer (0076).
+
+    One row per band (1–2 yrs, 2–3 yrs, … up to 15). Every rate column is
+    NULLABLE on purpose: most customers quote only the unit they bill in —
+    hourly for one, monthly for another — and a blank cell must read as "not
+    quoted", never as zero. The Opportunity form's Candidate CTC Slab pulls
+    the column matching the opportunity's billing type.
+    """
+    __tablename__ = "customer_rate_cards"
+    id = sa.Column(sa.Integer, primary_key=True)
+    customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id"),
+                            nullable=False, index=True)
+    #: Branch-wise since 0077. NULL = customer-wide default; the Opportunity
+    #: form prefers the selected branch's rows and falls back to NULL rows.
+    branch_id = sa.Column(sa.Integer, sa.ForeignKey("customer_branches.id"),
+                          nullable=True, index=True)
+    exp_min = sa.Column(sa.Numeric(4, 1), nullable=False)   # years
+    exp_max = sa.Column(sa.Numeric(4, 1), nullable=False)
+    #: Slab VERSIONING (0079): the ladder applies FROM this date. A newer
+    #: ladder (later effective_from <= today) supersedes the whole older one —
+    #: nothing is deleted, so old opportunities stay explainable. NULL =
+    #: legacy rows, treated as effective since forever.
+    effective_from = sa.Column(sa.Date, nullable=True)
+    rate_hourly = sa.Column(sa.Numeric(12, 2), nullable=True)
+    rate_daily = sa.Column(sa.Numeric(12, 2), nullable=True)
+    rate_weekly = sa.Column(sa.Numeric(12, 2), nullable=True)
+    rate_monthly = sa.Column(sa.Numeric(12, 2), nullable=True)
+    rate_yearly = sa.Column(sa.Numeric(12, 2), nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(),
+                           onupdate=sa.func.now())
+    __table_args__ = (
+        sa.UniqueConstraint("customer_id", "branch_id", "effective_from",
+                            "exp_min", "exp_max", name="uq_rate_card_band"),
+        sa.CheckConstraint("exp_max > exp_min", name="ck_rate_card_band_order"),
+    )
+
+    customer = relationship("Customer")
 
 
 class ContactPerson(Base):

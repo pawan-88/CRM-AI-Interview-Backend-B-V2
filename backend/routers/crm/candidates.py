@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from pydantic import BaseModel
 
-from crm_deps import CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, role_required
+from crm_deps import CurrentUser, PageParams, any_crm_role, gated_create, get_crm_db, page_params, role_required
 from models import (
     Candidate, CandidateEducation, CandidateExperience, CandidateSkill,
     Requirement, RequirementActivityLog, RequirementStatus, Resume, Skill,
@@ -30,6 +30,7 @@ from services.crm_common import log_activity, paginate, save_upload
 router = APIRouter(prefix="/api/candidates", tags=["CRM: Candidates"])
 
 write_roles = role_required("TA", "RMG", "Sales", "Sales_Head", "HR")
+create_candidates = gated_create("candidates", "TA", "RMG", "Sales", "Sales_Head", "HR")
 
 
 def _email_taken(db: Session, email: str, exclude_id: int | None = None) -> bool:
@@ -70,10 +71,93 @@ def list_candidates(pp: PageParams = Depends(page_params),
     return envelope(data=[candidate_to_dict(c) for c in items], meta=meta)
 
 
+# NOTE: literal route — MUST stay above GET /{candidate_id} or FastAPI tries
+# to coerce "check-duplicates" into an int.
+@router.get("/check-duplicates")
+def check_duplicates(
+    phone: str | None = None,
+    email: str | None = None,
+    name: str | None = None,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(any_crm_role),
+):
+    """Possible duplicates BEFORE a candidate is created — a warning, not a wall.
+
+    The same person arrives through the portal, a referral and a Zoho import,
+    and untangling two half-populated records after profiles hang off both is
+    miserable. The exact-email 409 on create catches only the narrowest case;
+    this catches the rest and lets the recruiter decide:
+
+    * **Phone** — last 10 digits, so "+91 81234 56789" matches "8123456789".
+      The strongest signal: people re-type numbers, not addresses.
+    * **Email** — case-insensitive, EXCLUDING the synthesised
+      ``@import.karnex.in`` placeholders (unique hashes; matching them would
+      be noise and they are never a real person's address).
+    * **Name** — normalised full-name equality. Weakest signal, so it is
+      reported last and never on its own for very short names (<6 chars —
+      "A Ku" would flag half the database).
+    """
+    def digits(v: str | None) -> str:
+        return "".join(ch for ch in (v or "") if ch.isdigit())[-10:]
+
+    def norm_name(v: str | None) -> str:
+        return "".join(ch for ch in (v or "").lower() if ch.isalpha())
+
+    want_phone = digits(phone)
+    want_email = (email or "").strip().lower()
+    want_name = norm_name(name)
+
+    matches: dict[int, dict] = {}
+
+    def note(c: Candidate, reason: str) -> None:
+        entry = matches.setdefault(c.id, {
+            "id": c.id,
+            "name": " ".join(p for p in [c.first_name, c.last_name] if p),
+            "email": c.email,
+            "phone": c.phone,
+            "created_at": c.source_created_date.isoformat() if c.source_created_date else None,
+            "match_on": [],
+        })
+        if reason not in entry["match_on"]:
+            entry["match_on"].append(reason)
+
+    # One pass over a bounded candidate set per signal — each is an indexed-ish
+    # narrow query rather than a full-table scan in Python.
+    if want_email and not want_email.endswith("@import.karnex.in"):
+        for c in db.execute(select(Candidate).where(
+                func.lower(Candidate.email) == want_email).limit(5)).scalars():
+            note(c, "email")
+    if len(want_phone) >= 7:
+        # Normalise INSIDE the query so "+91 81234 56789" matches "8123456789":
+        # strip the separators people actually type, then suffix-match.
+        stripped = Candidate.phone
+        for sep in (" ", "-", "+", "(", ")", "."):
+            stripped = func.replace(stripped, sep, "")
+        for c in db.execute(select(Candidate).where(
+                Candidate.phone.isnot(None),
+                stripped.like(f"%{want_phone}")).limit(25)).scalars():
+            if digits(c.phone) == want_phone:
+                note(c, "phone")
+    if len(want_name) >= 6:
+        for c in db.execute(select(Candidate).where(
+                func.lower(func.coalesce(Candidate.first_name, ""))
+                .like(f"{(name or '').strip().split(' ')[0].lower()}%")).limit(50)).scalars():
+            full = norm_name(" ".join(p for p in [c.first_name, c.middle_name, c.last_name] if p))
+            if full == want_name:
+                note(c, "name")
+
+    # Strongest evidence first: more signals, then phone > email > name.
+    weight = {"phone": 0, "email": 1, "name": 2}
+    out = sorted(matches.values(),
+                 key=lambda m: (-len(m["match_on"]),
+                                min(weight[r] for r in m["match_on"])))
+    return envelope(data=out[:5])
+
+
 @router.post("")
 def create_candidate(payload: CandidateCreate,
                      db: Session = Depends(get_crm_db),
-                     user: CurrentUser = Depends(write_roles)):
+                     user: CurrentUser = Depends(create_candidates)):
     if _email_taken(db, payload.email):
         raise HTTPException(status_code=409,
                             detail=f"A candidate with email '{payload.email}' already exists")
@@ -98,6 +182,16 @@ def update_candidate(candidate_id: int, payload: CandidateUpdate,
                      user: CurrentUser = Depends(write_roles)):
     candidate = get_candidate_or_404(db, candidate_id)
     updates = payload.model_dump(exclude_unset=True)
+    # Field-level template enforcement — the API twin of the greyed inputs.
+    from services.access_templates import reject_view_only_fields
+    reject_view_only_fields(db, user.id, set(user.roles), "candidates", updates, {
+        "salutation": "name", "first_name": "name", "middle_name": "name", "last_name": "name",
+        "email": "email", "phone": "phone",
+        "experience_years": "experience_years", "notice_period": "notice_period",
+        "current_ctc": "current_ctc", "expected_ctc": "expected_ctc",
+        "resignation_status": "resignation", "last_working_day": "resignation",
+        "resignation_certificate_url": "resignation",
+    })
     new_email = updates.get("email")
     if new_email and _email_taken(db, new_email, exclude_id=candidate.id):
         raise HTTPException(status_code=409,

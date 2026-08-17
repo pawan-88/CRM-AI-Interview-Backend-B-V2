@@ -38,7 +38,7 @@ import importlib
 
 for _m in ["base", "rbac", "customers", "opportunities", "projects", "leave",
            "timesheets", "finance", "hr", "candidates", "masters", "requirements",
-           "profiles", "resumes", "ai_links", "scheduling", "project_employee",
+           "profiles", "resumes", "ai_links", "scheduling",
            "user_profiles", "template_requests"]:
     importlib.import_module(f"models.{_m}")
 
@@ -208,3 +208,118 @@ def test_branch_year_holiday_crud(client, db):
     )
     assert delete_res.status_code == 200
     assert delete_res.json()["data"]["is_active"] is False
+
+
+def test_global_holidays_tab_links_branch_year(client, db):
+    """Holidays-tab create must upsert branch_holiday_years and set calendar id."""
+    cust, branch, _, _, _ = _seed_daimler_world(db)
+    # 2027 year header does not exist yet — Holidays tab should create it.
+    res = client.post("/api/holidays", json={
+        "name": "Ganesh Chaturthi",
+        "holiday_date": "2027-09-14",
+        "holiday_type": "Customer",
+        "observance": "Mandatory",
+        "customer_id": cust.id,
+        "branch_id": branch.id,
+    })
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["branch_id"] == branch.id
+    assert data["customer_id"] == cust.id
+    assert data["holiday_calendar_id"] is not None
+    assert data["year"] == 2027
+
+    years = client.get(f"/api/customers/branches/{branch.id}/holiday-years")
+    assert years.status_code == 200
+    year_nums = {y["calendar_year"] for y in years.json()["data"]}
+    assert 2027 in year_nums
+
+    branch_list = client.get(
+        f"/api/customers/branches/{branch.id}/holiday-years/2027/holidays"
+    )
+    assert branch_list.status_code == 200
+    names = {h["name"] for h in branch_list.json()["data"]}
+    assert "Ganesh Chaturthi" in names
+
+
+def test_customer_holiday_requires_branch(client, db):
+    cust, _, _, _, _ = _seed_daimler_world(db)
+    res = client.post("/api/holidays", json={
+        "name": "Orphan Holiday",
+        "holiday_date": "2025-08-15",
+        "holiday_type": "Customer",
+        "observance": "Mandatory",
+        "customer_id": cust.id,
+        # branch_id omitted
+    })
+    assert res.status_code == 400
+    assert "branch" in res.json()["detail"].lower()
+
+
+def test_all_branches_maps_every_customer_branch(client, db):
+    cust, branch, other, _, _ = _seed_daimler_world(db)
+    res = client.post("/api/holidays", json={
+        "name": "New Year",
+        "holiday_date": "2025-01-01",
+        "holiday_type": "National",
+        "observance": "Mandatory",
+        "customer_id": cust.id,
+        "all_branches": True,
+    })
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert isinstance(data, list)
+    assert len(data) == 2
+    branch_ids = {row["branch_id"] for row in data}
+    assert branch_ids == {branch.id, other.id}
+    for row in data:
+        assert row["holiday_calendar_id"] is not None
+        assert row["name"] == "New Year"
+
+
+def test_branch_ids_maps_selected_branches_only(client, db):
+    cust, branch, other, _, _ = _seed_daimler_world(db)
+    res = client.post("/api/holidays", json={
+        "name": "Pongal",
+        "holiday_date": "2025-01-15",
+        "holiday_type": "Regional",
+        "observance": "Mandatory",
+        "customer_id": cust.id,
+        "branch_ids": [branch.id],
+    })
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    # Single selected branch returns one object (not a list).
+    assert isinstance(data, dict)
+    assert data["branch_id"] == branch.id
+    assert data["name"] == "Pongal"
+
+    res2 = client.post("/api/holidays", json={
+        "name": "Onam",
+        "holiday_date": "2025-09-05",
+        "holiday_type": "Regional",
+        "observance": "Mandatory",
+        "customer_id": cust.id,
+        "branch_ids": [branch.id, other.id],
+    })
+    assert res2.status_code == 200, res2.text
+    data2 = res2.json()["data"]
+    assert isinstance(data2, list)
+    assert {r["branch_id"] for r in data2} == {branch.id, other.id}
+
+
+def test_holidays_tab_hard_delete(client, db):
+    cust, branch, _, _, _ = _seed_daimler_world(db)
+    created = client.post("/api/holidays", json={
+        "name": "Temp Off",
+        "holiday_date": "2025-12-31",
+        "holiday_type": "Customer",
+        "observance": "Optional",
+        "customer_id": cust.id,
+        "branch_id": branch.id,
+    })
+    assert created.status_code == 200, created.text
+    hid = created.json()["data"]["id"]
+    deleted = client.delete(f"/api/holidays/{hid}")
+    assert deleted.status_code == 200, deleted.text
+    assert db.get(Holiday, hid) is None

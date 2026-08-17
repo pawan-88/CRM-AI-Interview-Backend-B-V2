@@ -22,7 +22,8 @@ _MODULES: tuple[str, ...] = (
     "calendar", "table_preferences", "projects", "timesheets", "finance",
     "finance_reports", "credit_notes", "tax_invoice", "employees", "dashboards",
     "reports", "apply", "template_requests", "slots", "outreach", "holidays",
-    "leave_policies", "leave_applications", "ai_assist",
+    "leave_policies", "leave_applications", "ai_assist", "email_outbox", "email_flows",
+    "payroll", "rate_cards",
 )
 
 

@@ -19,17 +19,52 @@ logger = logging.getLogger("karnex.crm.candidate_comms")
 # --------------------------------------------------------------------- email
 
 def send_candidate_email(to: str, subject: str, text: str, html: str | None = None,
-                         attachments: list[tuple[str, bytes, str]] | None = None) -> dict:
-    """Send one candidate email via the platform SMTP config. Never raises.
+                         attachments: list[tuple[str, bytes, str]] | None = None,
+                         *, db=None, event: str = "candidate", actor=None,
+                         to_name: str = "") -> dict:
+    """Send one candidate email. Never raises.
 
-    Returns {"sent": bool, "error": str|None}; {"sent": False, "error":
-    "smtp_disabled"} when SMTP is not enabled/configured.
-    `attachments`: optional (filename, bytes, mime) list — e.g. an .ics invite.
+    DURABLE PATH: pass `db` (the caller's session) and the message is QUEUED on
+    the email outbox instead of sent inline — it gets the same five retries
+    with backoff and the same audit row in the Email Outbox screen that staff
+    notifications get, and it only goes out if the caller's transaction
+    commits. This closed the old gap where a ZeptoMail hiccup at the wrong
+    moment silently lost a candidate's interview invitation with no record.
+
+    INLINE PATH (no `db`, or `attachments` present): the original direct SMTP
+    send. Attachments stay inline because the outbox table stores text bodies
+    only — today that is exactly one email, the L2 calendar invite (.ics).
+
+    Returns {"sent": bool, "error": str|None} either way; the durable path
+    adds {"queued": True} so activity logs can say which road it took.
     """
     try:
         to = (to or "").strip()
         if not to:
             return {"sent": False, "error": "no_email"}
+        if db is not None and not attachments:
+            try:
+                from services.email_outbox import queue_email
+
+                row = queue_email(
+                    db,
+                    to_email=to,
+                    to_name=to_name,
+                    subject=subject,
+                    body_text=text,
+                    body_html=html,
+                    event=event or "candidate",
+                    actor=actor,
+                )
+                if row is not None:
+                    return {"sent": True, "error": None, "queued": True}
+                # Queueing declined (e.g. email disabled in settings) — report
+                # honestly rather than silently double-sending inline.
+                return {"sent": False, "error": "email_disabled", "queued": False}
+            except Exception as exc:
+                # The outbox must never take a candidate flow down with it —
+                # fall back to the old inline send.
+                logger.warning("candidate email queue failed for %s (%s); sending inline", to, exc)
         if not smtp_configured():
             return {"sent": False, "error": "smtp_disabled"}
         result = send_email(to, subject, text, html, attachments=attachments)
@@ -118,12 +153,18 @@ def send_candidate_whatsapp(phone: str, message: str) -> dict:
 # ------------------------------------------------------------- multi-channel
 
 def notify_candidate(email: str | None, phone: str | None, subject: str,
-                     message_text: str, message_html: str | None = None) -> dict:
+                     message_text: str, message_html: str | None = None,
+                     *, db=None, event: str = "candidate", actor=None,
+                     to_name: str = "") -> dict:
     """Try email first, then WhatsApp. Returns per-channel results:
     {"email": {"sent": bool, "error": ...}, "whatsapp": {"sent": bool, "error": ...}}.
+
+    Pass `db` to route the email through the durable outbox (retries + audit)
+    — see send_candidate_email. WhatsApp stays inline either way.
     """
     email_result = (
-        send_candidate_email(email, subject, message_text, message_html)
+        send_candidate_email(email, subject, message_text, message_html,
+                             db=db, event=event, actor=actor, to_name=to_name)
         if (email or "").strip() else {"sent": False, "error": "no_email"}
     )
     whatsapp_result = (

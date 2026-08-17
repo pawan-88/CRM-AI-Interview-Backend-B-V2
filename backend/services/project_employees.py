@@ -349,6 +349,55 @@ def ensure_initial_rate(db: Session, pe: ProjectEmployee, *, flush: bool = True)
     return row
 
 
+def apply_rate_rows(db: Session, pe: ProjectEmployee, rows) -> None:
+    """Install the Map Employee wizard's Commercial Details as rate history.
+
+    Each incoming row is (effective_from, rate). Expiry is never stored — a rate
+    simply ends the day before the next one starts, which is how the invoice
+    engine (split_period_by_rate) already reads the table. So "auto-detecting
+    the expiry" costs nothing here: it falls out of the ordering.
+
+    Upserts by effective_from, so remapping an exited employee refines the
+    history rather than duplicating dates. The current flag then lands on the
+    row in force TODAY — the latest effective_from <= today — or the earliest
+    row when every date is still in the future. pe.billing_rate is synced from
+    that row so list pages and PO checks keep reading one denormalized number.
+    """
+    if not rows:
+        return
+    existing = {
+        r.effective_from: r
+        for r in db.execute(
+            select(ProjectEmployeeRate)
+            .where(ProjectEmployeeRate.project_employee_id == pe.id)
+        ).scalars()
+    }
+    for entry in sorted(rows, key=lambda r: r.effective_from):
+        row = existing.get(entry.effective_from)
+        if row is not None:
+            row.rate = entry.rate
+            row.billing_unit = pe.billing_unit
+        else:
+            row = ProjectEmployeeRate(
+                project_employee_id=pe.id,
+                effective_from=entry.effective_from,
+                rate=entry.rate,
+                billing_unit=pe.billing_unit,
+                is_current_rate=False,
+            )
+            db.add(row)
+            existing[entry.effective_from] = row
+    db.flush()
+
+    all_rows = sorted(existing.values(), key=lambda r: r.effective_from)
+    today = date.today()
+    in_force = [r for r in all_rows if r.effective_from <= today]
+    current = in_force[-1] if in_force else all_rows[0]
+    for r in all_rows:
+        r.is_current_rate = r is current
+    sync_pe_billing_from_current_rate(pe, current)
+
+
 def _seed_balance_from_policy(policy: CustomerLeavePolicy) -> tuple[Decimal, Decimal]:
     """Return (initial_balance, leave_accrual) respecting leave_credit_timing.
 
@@ -606,6 +655,28 @@ def pe_leave_balance_total(db: Session, pe_id: int) -> float:
             continue
         total += max(Decimal(row.leave_balance or 0), Decimal("0"))
     return float(total)
+
+
+def pe_leave_balance_totals(db: Session, pe_ids) -> dict[int, float]:
+    """Batched pe_leave_balance_total: ONE query for a whole list page instead
+    of one per row. Same clamping semantics as the single-row version."""
+    from services.employees import is_loss_of_pay_name
+
+    ids = [int(i) for i in pe_ids]
+    if not ids:
+        return {}
+    rows = db.execute(
+        select(ProjectEmployeeLeaveDetail, LeavePolicyType.name)
+        .join(LeavePolicyType, LeavePolicyType.id == ProjectEmployeeLeaveDetail.leave_type_id,
+              isouter=True)
+        .where(ProjectEmployeeLeaveDetail.project_employee_id.in_(ids))
+    ).all()
+    totals: dict[int, Decimal] = {i: Decimal("0") for i in ids}
+    for row, name in rows:
+        if name and is_loss_of_pay_name(name):
+            continue
+        totals[row.project_employee_id] += max(Decimal(row.leave_balance or 0), Decimal("0"))
+    return {i: float(v) for i, v in totals.items()}
 
 
 def consume_pe_leave(db: Session, pe_id: int, leave_type_id: int, days: Decimal,

@@ -12,7 +12,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params, role_required
+from crm_deps import (
+    CurrentUser, PageParams, gated_read, gated_write, gated_write_action,
+    get_crm_db, page_params, role_required,
+)
 from models import (
     Customer,
     Invoice,
@@ -37,6 +40,7 @@ from schemas.finance import (
     PaymentIn,
     ProjectCreatePOIn,
     PurchaseOrderCreate,
+    PurchaseOrderRenewIn,
     PurchaseOrderUpdate,
     TdsCreateIn,
     TdsPaymentIn,
@@ -76,7 +80,8 @@ from services.invoice_pdf import generate_invoice_pdf
 
 router = APIRouter(prefix="/api", tags=["CRM: Finance"])
 
-PO_WRITE = gated_write("pos", "Finance")
+# Role lists admin-editable: Users tab -> Action Permissions. Admin/CEO always pass.
+PO_WRITE = gated_write_action("po.manage", "pos", "Finance")
 # Read floor includes Sales & Sales Head so the Access Template can grant them the
 # PO tab (Admin/CEO/Finance always allowed). Without Sales here the role check
 # rejects the tab before the template is ever consulted. Writes stay Finance-only.
@@ -84,7 +89,7 @@ PO_READ = gated_read("pos", "Finance", "Sales_Head", "Sales")
 # PO expiry is a dashboard heads-up card (not the PO tab): role-only so Sales &
 # Sales Head see it even without "pos" tab access. Admin/CEO included by default.
 PO_EXPIRY_READ = role_required("Finance", "Sales_Head", "Sales")
-INV_WRITE = gated_write("invoices", "Finance")
+INV_WRITE = gated_write_action("invoice.manage", "invoices", "Finance")
 # Same as PO_READ: Sales & Sales Head can be granted the Invoices tab via the
 # Access Template; writes remain Finance-only.
 INV_READ = gated_read("invoices", "Finance", "Sales_Head", "Sales")
@@ -373,6 +378,93 @@ def cancel_purchase_order(po_id: int, db: Session = Depends(get_crm_db),
     return envelope(serialize_po(po), "Purchase order cancelled")
 
 
+@router.post("/purchase-orders/{po_id}/renew")
+def renew_purchase_order(po_id: int, body: PurchaseOrderRenewIn,
+                         db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(PO_WRITE)):
+    """Raise the next PO in a series, carrying the old one's terms forward.
+
+    The expiry notices told Finance a PO was running out but left them to
+    re-key customer, branches, contact, tax and payment terms into a fresh
+    form — the same fields, from the same customer, every time. This copies
+    them and records the link.
+
+    What deliberately does NOT happen:
+
+    * **The old PO is not touched.** No status change, no cancel, no closing
+      date moved. Invoices may still be in flight against it, and its consumed
+      and balance figures have to stay reconcilable.
+    * **No money carries over.** An unspent balance belongs to the order it was
+      raised under; carrying it forward would silently inflate the new PO and
+      double-count the customer's commitment.
+    * **No allocations carry over.** Which projects the new order funds is a
+      decision, not a copy — the previous split is usually the starting point,
+      not the answer.
+    """
+    old = get_po_or_404(db, po_id)
+    if old.status == POStatus.CANCELLED:
+        raise HTTPException(
+            status_code=400,
+            detail="This purchase order was cancelled. Raise a new PO instead of renewing it.",
+        )
+
+    po_number = (body.po_number or "").strip()
+    if not po_number:
+        raise HTTPException(status_code=400, detail="Enter the new PO number from the customer")
+    ensure_unique_po_number(db, po_number)
+
+    def pick(field: str):
+        """Body value when supplied, otherwise the old PO's."""
+        value = getattr(body, field, None)
+        return getattr(old, field) if value is None else value
+
+    start_date = body.start_date
+    if start_date is None and old.end_date is not None:
+        # Default the renewal to start the day the old one ends, so the two do
+        # not overlap and there is no uncovered day between them.
+        start_date = old.end_date + timedelta(days=1)
+
+    inter_state = body.inter_state
+    if inter_state is None:
+        inter_state = bool(old.igst and Decimal(str(old.igst)) > 0)
+
+    new = PurchaseOrder(
+        po_number=po_number,
+        customer_id=old.customer_id,
+        billing_branch_id=pick("billing_branch_id"),
+        delivery_branch_id=pick("delivery_branch_id"),
+        received_date=body.received_date or date.today(),
+        start_date=start_date,
+        end_date=body.end_date,
+        contact_person_id=pick("contact_person_id"),
+        po_type=pick("po_type"),
+        payment_terms=pick("payment_terms"),
+        terms_conditions=pick("terms_conditions"),
+        tax_slab=pick("tax_slab"),
+        total_value=body.total_value,
+        consumed_value=Decimal("0"),
+        balance_value=body.total_value,
+        status=POStatus.ACTIVE,
+        billing_address_snapshot=old.billing_address_snapshot,
+        delivery_address_snapshot=old.delivery_address_snapshot,
+        renewed_from_po_id=old.id,
+    )
+    apply_gst_split(new, bool(inter_state))
+    db.add(new)
+    db.flush()
+
+    log_po_activity(db, new.id, user.id, "PO_CREATED",
+                    comment=f"Purchase order {new.po_number} created as a renewal of "
+                            f"{old.po_number}")
+    # Also on the old PO, so its own history explains where the work went.
+    log_po_activity(db, old.id, user.id, "PO_RENEWED",
+                    comment=f"Renewed by {new.po_number}")
+    db.commit()
+    db.refresh(new)
+    return envelope(serialize_po(new, detail=True, db=db),
+                    f"Purchase order {new.po_number} created as a renewal of {old.po_number}")
+
+
 @router.get("/purchase-orders/{po_id}/invoices")
 def list_po_invoices(po_id: int, db: Session = Depends(get_crm_db),
                      user: CurrentUser = Depends(PO_READ)):
@@ -437,6 +529,8 @@ def create_po_from_project(project_id: int, body: ProjectCreatePOIn,
         billing_branch_id=branch.id if branch else None,
         delivery_branch_id=branch.id if branch else None,
         received_date=body.received_date,
+        start_date=body.start_date,
+        end_date=body.end_date,
         contact_person_id=contact.id if contact else None,
         po_type=body.po_type,
         payment_terms=body.payment_terms,
@@ -548,7 +642,8 @@ def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
 
 @router.get("/invoices")
 def list_invoices(payment_status: str | None = None, project_id: int | None = None,
-                  po_id: int | None = None, pp: PageParams = Depends(page_params),
+                  po_id: int | None = None, customer_id: int | None = None,
+                  pp: PageParams = Depends(page_params),
                   db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
     stmt = select(Invoice)
     if payment_status:
@@ -556,6 +651,10 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
             Invoice.payment_status == _enum_or_400(PaymentStatus, payment_status, "payment_status"))
     if project_id is not None:
         stmt = stmt.where(Invoice.project_id == project_id)
+    if customer_id is not None:
+        # Customer hub tab: an invoice belongs to a customer via its project.
+        stmt = stmt.join(Project, Project.id == Invoice.project_id).where(
+            Project.customer_id == customer_id)
     if po_id is not None:
         stmt = stmt.where(Invoice.po_id == po_id)
     if pp.search:

@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, role_required
+from crm_deps import CurrentUser, PageParams, any_crm_role, gated_create, get_crm_db, page_params, role_required
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Customer,
     InterviewEvent, OfferHistory, OfferStatus, Opportunity, PipelineStatus,
@@ -40,6 +40,7 @@ from services.interview_rounds import (
 router = APIRouter(prefix="/api/candidate-profiles", tags=["CRM: Candidate Profiles"])
 
 create_roles = role_required("TA", "Sales", "RMG")
+create_profiles_gate = gated_create("profiles", "TA", "Sales", "RMG")
 evaluation_roles = role_required("RMG", "TA", "Sales")
 #: Roles that may record an offer — on the Offers tab or alongside the status
 #: change that requires one.
@@ -225,7 +226,7 @@ def list_profiles(pp: PageParams = Depends(page_params),
 @router.post("")
 def create_profile(payload: ProfileCreate,
                    db: Session = Depends(get_crm_db),
-                   user: CurrentUser = Depends(create_roles)):
+                   user: CurrentUser = Depends(create_profiles_gate)):
     if not db.get(Candidate, payload.candidate_id):
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not db.get(Opportunity, payload.opportunity_id):
@@ -349,7 +350,8 @@ def schedule_l2_face_to_face(
     notify_role(db, "TA",
                 f"L2 face-to-face scheduled: {cname}",
                 " — ".join(parts[1:]) or "RMG will take a face-to-face L2 round.",
-                f"/admin?view=crm&p=profiles/{profile.id}", exclude_user_id=user.id)
+                f"/admin?view=crm&p=profiles/{profile.id}", exclude_user_id=user.id,
+                event="candidate.l2_scheduled")
 
     # Best-effort email to the candidate with the call details + calendar invite.
     email_sent = False
@@ -394,6 +396,16 @@ def update_profile(profile_id: int, payload: ProfileUpdate,
                    user: CurrentUser = Depends(create_roles)):
     profile = get_profile_or_404(db, profile_id)
     updates = payload.model_dump(exclude_unset=True)
+    # Field-level template enforcement — the API twin of the greyed inputs.
+    from services.access_templates import reject_view_only_fields
+    reject_view_only_fields(db, user.id, set(user.roles), "profiles", updates, {
+        "current_ctc": "current_ctc",
+        "expected_ctc": "expected_ctc",
+        "ctc_approval_amount": "approved_ctc",
+        "commercial_approved": "approved_ctc",
+        "offer_letter_reference": "offers",
+        "customer_onboarding_date": "submit_to_customer",
+    })
     for field, value in updates.items():
         setattr(profile, field, value)
     if "current_ctc" in updates or "expected_ctc" in updates:

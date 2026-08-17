@@ -35,10 +35,17 @@ class AssistRequest(BaseModel):
     route: str | None = Field(default=None, max_length=120)
     tab_key: str | None = Field(default=None, max_length=120)
     history: list[AssistHistoryTurn] = Field(default_factory=list, max_length=16)
-    # ---- Phase-2 seams (ignored in MVP; schema reserved) ----
-    enable_tools: bool = False
+    #: Let the model run whitelisted READ queries (ai_help/tools.py) instead of
+    #: relying only on the keyword-guessed snapshot. Tools are SELECT-only and
+    #: filtered by the caller's roles before they are offered to the model.
+    enable_tools: bool = True
+    #: Restrict this request to a subset of tool names. None = every tool the
+    #: caller's roles allow.
     tool_whitelist: list[str] | None = None
-    confirm_actions: bool = True  # future: actions[] only after user confirm
+    #: Reserved: navigation actions are already user-confirmed (the frontend
+    #: renders a button; nothing runs on its own). No write action exists to
+    #: confirm, because no write tool exists.
+    confirm_actions: bool = True
 
 
 @router.get("/help-context")
@@ -71,11 +78,9 @@ def assist(
     user: CurrentUser = Depends(any_crm_role),
     db: Session = Depends(get_crm_db),
 ):
-    """Read-only help reply grounded in the per-tab KB + a live CRM data snapshot."""
+    """Read-only help reply grounded in the per-tab KB, a live CRM snapshot, and
+    whitelisted read queries the model may run itself."""
     _ = request  # slowapi key_func may use request
-    # Explicitly ignore phase-2 tool flags in MVP
-    if payload.enable_tools or payload.tool_whitelist:
-        logger.info("ai_assist.tools_ignored", extra={"user_id": user.id})
 
     tab = payload.tab_key or payload.route
     history = [{"role": t.role, "content": t.content} for t in payload.history]
@@ -90,9 +95,32 @@ def assist(
         )
     except Exception:
         logger.warning("ai_assist.data_context_failed", exc_info=True)
+
+    # Whitelisted READ tools. Permission filtering happens HERE, where the
+    # current user is known — a tool this person may not call is never offered
+    # to the model, so it cannot describe or attempt a capability they lack.
+    roles = set(user.roles)
+    is_admin = bool(getattr(user, "is_admin", False))
+    tools: list[dict] | None = None
+    tool_runner = None
+    if payload.enable_tools:
+        try:
+            from ai_help.tools import available_tools, run_tool
+
+            tools = available_tools(roles, is_admin, payload.tool_whitelist) or None
+            if tools:
+                def tool_runner(name: str, args: dict) -> dict:  # noqa: F811
+                    return run_tool(db, name, args, roles=roles, is_admin=is_admin,
+                                    whitelist=payload.tool_whitelist)
+        except Exception:
+            # A broken tool layer must degrade to the old snapshot-only
+            # behaviour, never to a failed answer.
+            logger.warning("ai_assist.tools_unavailable", exc_info=True)
+            tools, tool_runner = None, None
+
     try:
         data = run_assist(message=payload.message, tab_key=tab, history=history,
-                          data_context=data_context)
+                          data_context=data_context, tools=tools, run_tool=tool_runner)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

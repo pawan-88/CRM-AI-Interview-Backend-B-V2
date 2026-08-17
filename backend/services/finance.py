@@ -287,6 +287,34 @@ def karnex_gst_tax_and_grand(
         subtotal=float(sub_total),
     )
     tax_amount = Decimal(str(gst["total_gst"]))
+    if (
+        tax_amount == 0
+        and not gst.get("buyer_state_code")
+        and po is not None
+        and po.tax_slab is not None
+        and Decimal(str(po.tax_slab)) > 0
+    ):
+        # The state-code engine could not rate this invoice (customer branch has
+        # no state / GSTIN), which used to send the invoice out with ZERO tax.
+        # The PO already knows its slab — apply_gst_split spread it into
+        # sgst/cgst/igst at PO creation — so fall back to that rather than
+        # billing tax-free. IGST>0 on the PO marks it inter-state.
+        from decimal import ROUND_HALF_UP
+        slab = Decimal(str(po.tax_slab))
+        tax_amount = (Decimal(str(sub_total)) * slab / Decimal(100)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)
+        inter = po.igst is not None and Decimal(str(po.igst)) > 0
+        half = (tax_amount / 2).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        gst = {
+            **gst,
+            "total_gst": float(tax_amount),
+            "igst": float(tax_amount) if inter else 0.0,
+            "cgst": 0.0 if inter else float(half),
+            "sgst": 0.0 if inter else float(tax_amount - half),
+            "grand_total": float(Decimal(str(sub_total)) + tax_amount),
+            "intra": not inter,
+            "note": f"GST from PO tax slab ({slab}%) — buyer state code missing",
+        }
     # Keep stored grand consistent with the invoice's sub_total column.
     grand_total = (Decimal(str(sub_total)) + tax_amount)
     return tax_amount, grand_total, gst
@@ -634,11 +662,24 @@ def serialize_po(po: PurchaseOrder, detail: bool = False, db: Session | None = N
         "consumed_value": _num(po.consumed_value),
         "balance_value": _num(po.balance_value),
         "status": _ev(po.status),
+        "renewed_from_po_id": getattr(po, "renewed_from_po_id", None),
     }
     if detail:
         data["allocations"] = [serialize_allocation(a) for a in po.allocations]
         data["invoice_count"] = len(po.invoices)
         data["commercial"] = po_commercial_block(po)
+        # Both ends of the renewal chain, so Finance can walk it from either PO.
+        parent = getattr(po, "renewed_from", None)
+        data["renewed_from"] = (
+            {"id": parent.id, "po_number": parent.po_number, "end_date": _iso(parent.end_date)}
+            if parent is not None else None
+        )
+        data["renewals"] = [
+            {"id": child.id, "po_number": child.po_number,
+             "start_date": _iso(child.start_date), "end_date": _iso(child.end_date),
+             "status": _ev(child.status)}
+            for child in (getattr(po, "renewals", None) or [])
+        ]
         if db is not None:
             billing = db.get(CustomerBranch, po.billing_branch_id) if po.billing_branch_id else None
             delivery = db.get(CustomerBranch, po.delivery_branch_id) if po.delivery_branch_id else None
@@ -822,6 +863,13 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
             opp = db.get(Opportunity, invoice.project.opportunity_id)
             project_type = _ev(opp.opp_type) if opp else None
         data["project_type"] = project_type
+
+        # Qty/Rate column labels from the timesheet assignment's billing unit
+        # (Hourly/Daily/Monthly/Yearly) — same helper the PDF uses, resolved at
+        # render time so pre-existing invoices display correctly too.
+        if db is not None:
+            from services.tax_invoice import invoice_unit_labels
+            data["qty_label"], data["rate_label"] = invoice_unit_labels(db, invoice)
 
         # --- Tax Invoice enrichment (seller, buyer, shipping, GST split, SAC) ---
         seller = get_seller_details()

@@ -128,6 +128,20 @@ def project_employee_out(pe: ProjectEmployee, emp: Employee | None = None) -> di
         "exit_date": pe.exit_date.isoformat() if pe.exit_date else None,
         "billing_date": pe.billing_date.isoformat() if pe.billing_date else None,
         "settlement_pending": bool(getattr(pe, "settlement_pending", False)),
+        # Full Commercial Details history, oldest first (relationship order).
+        # billing_rate above stays the CURRENT rate; this is the whole story,
+        # so the Team tab / PE list / PE detail can show every rate with its
+        # derived expiry, not just today's number.
+        "rates": [
+            {
+                "id": r.id,
+                "effective_from": r.effective_from.isoformat() if r.effective_from else None,
+                "rate": _num(r.rate),
+                "billing_unit": getattr(r.billing_unit, "value", r.billing_unit) if r.billing_unit else None,
+                "is_current_rate": bool(r.is_current_rate),
+            }
+            for r in (pe.rates or [])
+        ],
     }
 
 
@@ -147,7 +161,7 @@ def comm_entry_out(entry: ProjectCommunicationMatrix) -> dict:
 def project_detail_out(db: Session, p: Project) -> dict:
     data = project_out(p)
     customer = db.get(Customer, p.customer_id)
-    opportunity = db.get(Opportunity, p.opportunity_id)
+    opportunity = db.get(Opportunity, p.opportunity_id) if p.opportunity_id else None
     branch = _project_branch(db, p)
     foreign = opportunity_branch_foreign_to_project(db, p)
     data["customer_name"] = customer.name if customer else None

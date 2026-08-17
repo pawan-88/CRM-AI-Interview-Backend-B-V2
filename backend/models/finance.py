@@ -68,7 +68,13 @@ class PurchaseOrder(Base):
     balance_value = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
     status = sa.Column(pg_enum(POStatus, "po_status"), nullable=False,
                        server_default=POStatus.ACTIVE.value, index=True)
+    #: The PO this one was raised to replace. Set by POST /purchase-orders/{id}/renew.
+    #: Deliberately does NOT change the old PO — it keeps its status and runs to
+    #: its own end date, because invoices may still be in flight against it.
+    renewed_from_po_id = sa.Column(sa.Integer, sa.ForeignKey("purchase_orders.id"),
+                                   nullable=True, index=True)
 
+    renewed_from = relationship("PurchaseOrder", remote_side=[id], backref="renewals")
     allocations = relationship("POProjectAllocation", back_populates="po", cascade="all, delete-orphan")
     invoices = relationship("Invoice", back_populates="po")
     activity_log = relationship("POActivityLog", back_populates="po", cascade="all, delete-orphan",
@@ -151,7 +157,10 @@ class InvoiceLine(Base):
     invoice_id = sa.Column(sa.Integer, sa.ForeignKey("invoices.id"), nullable=False, index=True)
     s_no = sa.Column(sa.Integer, nullable=False)
     description = sa.Column(sa.String(512), nullable=False)
-    qty = sa.Column(sa.Numeric(10, 2), nullable=False)
+    # 4dp (0074): a Monthly qty is the billed FRACTION of the month, and at
+    # 2dp qty x rate could sit ~1% of a month away from the amount — a phantom
+    # few thousand rupees between the stored line and the printed invoice.
+    qty = sa.Column(sa.Numeric(12, 4), nullable=False)
     rate = sa.Column(sa.Numeric(12, 2), nullable=False)
     amount = sa.Column(sa.Numeric(14, 2), nullable=False)
 

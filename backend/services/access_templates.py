@@ -44,6 +44,30 @@ def list_templates(db: Session) -> list[dict]:
     return [serialize_template(t) for t in rows]
 
 
+def _strip_removed_keys(tab_access, field_access) -> tuple[dict, dict]:
+    """Drop tab/field keys that no longer exist in the registry.
+
+    A tab removed from the product (e.g. "requirements", Aug 2026) lingers in
+    templates saved before the removal. The editor round-trips the stored
+    dict, so validating it verbatim used to 400 EVERY save of an old template
+    — the admin couldn't even fix it from the UI. Unknown keys are dead weight
+    (no gate reads them), so they are silently dropped; genuinely bad MODES on
+    known keys still fail validation loudly.
+    """
+    tabs = {k: v for k, v in (tab_access or {}).items()
+            if _bare_tab_key(k) in access_registry.TABS}
+    fields = {}
+    for tab, grants in (field_access or {}).items():
+        bare = _bare_tab_key(tab)
+        if bare not in access_registry.TABS:
+            continue
+        catalogue = access_registry.FIELDS_BY_TAB.get(bare, {})
+        kept = {f: m for f, m in (grants or {}).items() if f in catalogue}
+        if kept:
+            fields[tab] = kept
+    return tabs, fields
+
+
 def _validate(tab_access, field_access) -> None:
     try:
         access_registry.validate_access(tab_access, field_access)
@@ -52,6 +76,9 @@ def _validate(tab_access, field_access) -> None:
 
 
 def create_template(db: Session, payload: dict) -> dict:
+    payload = dict(payload)
+    payload["tab_access"], payload["field_access"] = _strip_removed_keys(
+        payload.get("tab_access"), payload.get("field_access"))
     _validate(payload.get("tab_access"), payload.get("field_access"))
     existing = db.execute(
         select(AccessTemplate).where(AccessTemplate.name == payload["name"])
@@ -73,8 +100,16 @@ def create_template(db: Session, payload: dict) -> dict:
 
 def update_template(db: Session, template_id: int, payload: dict) -> dict:
     t = get_template_or_404(db, template_id)
+    payload = dict(payload)
     if "tab_access" in payload or "field_access" in payload:
-        _validate(payload.get("tab_access", t.tab_access), payload.get("field_access", t.field_access))
+        tabs, fields = _strip_removed_keys(
+            payload.get("tab_access", t.tab_access),
+            payload.get("field_access", t.field_access))
+        if "tab_access" in payload:
+            payload["tab_access"] = tabs
+        if "field_access" in payload:
+            payload["field_access"] = fields
+        _validate(tabs, fields)
     for field in ("name", "description", "department_id", "role", "is_active", "tab_access", "field_access"):
         if field in payload and payload[field] is not None:
             setattr(t, field, payload[field])
@@ -163,11 +198,15 @@ def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
             fields = _normalize_field_modes(t.field_access or {})
             source = "template"
 
-    # per-user override (legacy list/dict) wins per tab/field, granted as "edit"
+    # Per-user override (legacy list/dict) wins per tab/field. Granted as
+    # "create": the old Users modal was a binary show/hide — a tab it granted
+    # carried FULL access under the old single write level, and demoting it to
+    # the ladder's middle rung would silently remove creation rights that were
+    # deliberately given.
     override_tabs = _decode_tab_access(profile.tab_access) if profile else None
     if override_tabs is not None:
         for k in override_tabs:
-            tabs[_bare_tab_key(k)] = "edit"
+            tabs[_bare_tab_key(k)] = "create"
         source = "override" if source == "role_default" else "template+override"
     override_fields = get_field_access(db, user_id) if profile else None
     if override_fields:
@@ -203,3 +242,55 @@ def can_view_tab(access: dict, tab: str) -> bool:
         return True
     bare = _bare_tab_key(tab)
     return bare in access.get("tabs", {})
+
+
+def reject_view_only_fields(
+    db: Session,
+    user_id: int,
+    roles: set[str],
+    tab: str,
+    changes: dict,
+    field_map: dict[str, str],
+) -> None:
+    """403 when a templated user's update touches a field their template locks.
+
+    The tab-level gate has already run by the time this is called — this is
+    the SECOND layer, matching the greyed-out inputs in the forms: a field the
+    template sets to view-only must be un-savable through the API too,
+    otherwise the grey input is theatre for anyone with a REST client.
+
+    ``field_map``: payload key -> registry field key. Several payload keys may
+    map to one registry field (first/middle/last name -> "name"). Payload keys
+    NOT in the map are governed by the tab mode alone — the map lists what is
+    independently lockable, not everything that exists.
+
+    Field modes: an explicit field grant wins over the tab mode; no explicit
+    grant means the tab mode decides (`mode_satisfies` ladder).
+    """
+    from fastapi import HTTPException
+
+    from services.access_registry import mode_satisfies
+
+    acc = effective_access(db, user_id, roles)
+    if acc.get("full") or acc.get("visible_tabs") is None:
+        return  # unrestricted → role defaults already decided upstream
+
+    bare = _bare_tab_key(tab)
+    tab_mode = acc.get("tabs", {}).get(bare)
+    field_modes = acc.get("fields", {}).get(bare, {}) or {}
+
+    blocked: list[str] = []
+    for payload_key in changes:
+        registry_key = field_map.get(payload_key)
+        if registry_key is None:
+            continue
+        effective = field_modes.get(registry_key, tab_mode)
+        if not mode_satisfies(effective, "edit"):
+            blocked.append(payload_key)
+
+    if blocked:
+        raise HTTPException(
+            status_code=403,
+            detail="Your access template gives view-only access to: "
+                   + ", ".join(sorted(blocked)),
+        )

@@ -6,7 +6,6 @@ Seller PAN/GSTIN/bank are hardcoded constants (never env-overridden here).
 from __future__ import annotations
 
 import io
-import os
 import re
 import zipfile
 from dataclasses import dataclass
@@ -130,6 +129,45 @@ class Invoice(BaseModel):
     footer_text: str = DEFAULT_FOOTER
     buyer: Buyer = Field(default_factory=Buyer)
     items: list[LineItem] = Field(default_factory=list)
+    #: Column labels follow the assignment's billing unit — a Monthly-billed
+    #: project must not print "Rate/Hour" (customers query invoices over less).
+    qty_label: str = "Billing Hours"
+    rate_label: str = "Rate/Hour (INR)"
+
+
+#: PE billing_unit -> (qty column, rate column) on the Tax Invoice.
+UNIT_LABELS: dict[str, tuple[str, str]] = {
+    "Hourly": ("Billing Hours", "Rate/Hour (INR)"),
+    "Daily": ("Billing Days", "Rate/Day (INR)"),
+    "Monthly": ("Billed Qty (Months)", "Rate/Month (INR)"),
+    # Yearly assignments are invoiced at rate/12 through the Monthly branch.
+    "Yearly": ("Billed Qty (Months)", "Rate/Month (INR)"),
+}
+
+
+def invoice_unit_labels(db, invoice) -> tuple[str, str]:
+    """Qty/Rate column labels resolved from the invoice's timesheet assignment.
+
+    Shared by the PDF renderer AND the invoice detail API, so the on-screen
+    "View Tax Invoice" and the downloaded PDF can never disagree about whether
+    this project bills per hour, day, month or year. Resolved at render time
+    (nothing is stored), which retroactively corrects invoices generated
+    before billing-unit labelling existed. Any lookup failure falls back to
+    the historical hourly wording — labels must never block an invoice.
+    """
+    try:
+        ts_row = getattr(invoice, "timesheet", None)
+        pe_id = getattr(ts_row, "project_employee_id", None) if ts_row else None
+        if pe_id:
+            from models import ProjectEmployee
+            pe = db.get(ProjectEmployee, pe_id)
+            unit = getattr(getattr(pe, "billing_unit", None), "value",
+                           getattr(pe, "billing_unit", None))
+            if unit in UNIT_LABELS:
+                return UNIT_LABELS[unit]
+    except Exception:
+        pass
+    return UNIT_LABELS["Hourly"]
 
 
 class Totals(BaseModel):
@@ -864,6 +902,9 @@ def map_crm_invoice_to_tax_invoice(db, invoice) -> Invoice:
     if not ship_name:
         ship_name = buyer_name
 
+    # Column labels from the billing unit of the timesheet's assignment.
+    qty_label, rate_label = invoice_unit_labels(db, invoice)
+
     items: list[LineItem] = []
     lines = list(invoice.lines or [])
     lines.sort(key=lambda l: l.s_no or 0)
@@ -885,6 +926,8 @@ def map_crm_invoice_to_tax_invoice(db, invoice) -> Invoice:
         po_date = format_date_en_in(raw) if raw else None
 
     return Invoice(
+        qty_label=qty_label,
+        rate_label=rate_label,
         invoice_no=inv_no,
         invoice_date=format_date_en_in(invoice.invoice_date) or today_ddmmyyyy(),
         po_no=po_no,
@@ -1131,8 +1174,8 @@ table.services tr.spacer td {{ height: 16px; color: transparent; }}
         <th class="col-sno">S. No.</th>
         <th class="col-desc">Description of Services</th>
         <th class="col-sac">SAC Code</th>
-        <th class="col-hrs">Billing Hours</th>
-        <th class="col-rate">Rate/Hour (INR)</th>
+        <th class="col-hrs">{_esc(inv.qty_label)}</th>
+        <th class="col-rate">{_esc(inv.rate_label)}</th>
         <th class="col-amt">Amount (INR)</th>
       </tr>
     </thead>
@@ -1214,18 +1257,16 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     """A4 PDF fallback when WeasyPrint/GTK is unavailable (Windows)."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
-    from reportlab.lib.colors import Color, HexColor, white, black
+    from reportlab.lib.colors import HexColor, white, black
     from reportlab.platypus import (
-        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, HRFlowable,
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image,
     )
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_RIGHT, TA_CENTER, TA_LEFT
+    from reportlab.lib.enums import TA_LEFT
 
     navy = HexColor("#173B7A")
-    orange = HexColor("#F59E0B")
     border = HexColor("#D9E2EC")
     muted = HexColor("#64748B")
-    light = HexColor("#F8FAFC")
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -1321,7 +1362,7 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
 
     svc_data = [[
         "S. No.", "Description of Services", "SAC Code",
-        "Billing Hours", "Rate/Hour (INR)", "Amount (INR)",
+        inv.qty_label, inv.rate_label, "Amount (INR)",
     ]]
     for i, it in enumerate(inv.items or [], start=1):
         svc_data.append([

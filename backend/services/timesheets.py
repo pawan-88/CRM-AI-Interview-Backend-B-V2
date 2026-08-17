@@ -57,6 +57,30 @@ class BillingPolicy:
     comp_off_billable: bool = False
     min_hours_full_day: Decimal = Decimal("8.00")
     min_hours_half_day: Decimal = Decimal("4.00")
+    #: Which weekdays are the week-off (0=Mon..6=Sun). Sat+Sun unless a
+    #: policy level overrides it (0072) — Gulf customers run Fri+Sat.
+    week_off_days: tuple = (5, 6)
+
+
+def parse_week_off_days(raw) -> tuple | None:
+    """CSV "5,6" -> (5, 6). None/blank/invalid -> None (= inherit).
+
+    Silently dropping bad tokens would turn a typo into a 7-day work week;
+    instead ANY invalid token invalidates the whole value so the level is
+    skipped and the next one in the chain decides.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part.isdigit() or not 0 <= int(part) <= 6:
+            return None
+        out.append(int(part))
+    return tuple(sorted(set(out))) or None
 
 
 def _project_branch(db: Session, project: Project) -> CustomerBranch | None:
@@ -254,6 +278,7 @@ def effective_billing_policy(
             comp_off_billable=bool(getattr(row, "comp_off_billable", False)),
             min_hours_full_day=Decimal(row.min_hours_full_day),
             min_hours_half_day=Decimal(row.min_hours_half_day),
+            week_off_days=parse_week_off_days(getattr(row, "week_off_days", None)) or (5, 6),
         )
     if branch is None:
         branch = resolve_timesheet_display_branch(db, project, pe=pe)
@@ -271,6 +296,8 @@ def effective_billing_policy(
             else Decimal(branch.hours_required_full_day),
             min_hours_half_day=base.min_hours_half_day if branch.hours_required_half_day is None
             else Decimal(branch.hours_required_half_day),
+            week_off_days=parse_week_off_days(getattr(branch, "week_off_days", None))
+            or base.week_off_days,
         )
     # Project overrides (spec §6 / resolve_branch_project_policy order)
     return BillingPolicy(
@@ -286,6 +313,8 @@ def effective_billing_policy(
         else Decimal(project.hours_required_full_day),
         min_hours_half_day=base.min_hours_half_day if project.hours_required_half_day is None
         else Decimal(project.hours_required_half_day),
+        week_off_days=parse_week_off_days(getattr(project, "week_off_days", None))
+        or base.week_off_days,
     )
 
 
@@ -346,17 +375,69 @@ def period_range_label(year: int, month: int) -> str:
     return f"{start.strftime('%d-%b-%Y')} to {end.strftime('%d-%b-%Y')}"
 
 
+def pe_period_bounds(year: int, month: int, pe) -> tuple[date, date]:
+    """The month clamped to the employee's actual time ON the project.
+
+    A mid-month joiner (onboarded the 10th) owes days from the 10th; a
+    mid-month leaver owes days up to the exit date. Generating the full
+    calendar month for them padded the sheet with days that never happened —
+    and a Monthly rate then billed a full month for half a month's presence.
+
+    Onboarding/exit dates on the Project Employee record are the source of
+    truth; edit those (HR) and the NEXT generated sheet follows. Sheets keep
+    the days they were generated with.
+    """
+    start, end = period_bounds(year, month)
+    onboarding = getattr(pe, "onboarding_date", None) if pe is not None else None
+    if onboarding and onboarding > start:
+        start = min(onboarding, end)
+    exit_date = getattr(pe, "exit_date", None) if pe is not None else None
+    if getattr(pe, "is_exit", False) and exit_date and exit_date < end:
+        end = max(exit_date, start)
+    return start, end
+
+
+def pe_period_range_label(year: int, month: int, pe) -> str:
+    start, end = pe_period_bounds(year, month, pe)
+    return f"{start.strftime('%d-%b-%Y')} to {end.strftime('%d-%b-%Y')}"
+
+
+def sheet_period_bounds(ts, pe) -> tuple[date, date]:
+    """THE period resolver for one sheet: explicit override, else PE window.
+
+    ``timesheets.period_start_date/period_end_date`` (0073) win when set — an
+    editor adjusted this one sheet deliberately. Otherwise the window derives
+    from the PE's onboarding/exit dates as usual. Overrides are stored clamped
+    to the sheet's month, so nothing here can leak into a neighbouring month.
+    """
+    start, end = pe_period_bounds(ts.year, ts.month, pe)
+    o_start = getattr(ts, "period_start_date", None)
+    o_end = getattr(ts, "period_end_date", None)
+    if o_start:
+        start = o_start
+    if o_end:
+        end = o_end
+    if end < start:
+        end = start
+    return start, end
+
+
 def classify_calendar_day(
     d: date,
     holiday_dates: set[date],
     *,
     default_hours: Decimal | None = None,
+    week_off_days: tuple = (5, 6),
 ) -> tuple[DayType, bool, AttendanceStatus, Decimal]:
-    """Auto-classify a calendar day for timesheet generation."""
+    """Auto-classify a calendar day for timesheet generation.
+
+    ``week_off_days`` comes from the resolved billing policy (0072) so a
+    Fri+Sat customer's sheets generate with the right rest days.
+    """
     hours = default_hours if default_hours is not None else DEFAULT_WORKING_HOURS
     if d in holiday_dates:
         return DayType.HOLIDAY, False, AttendanceStatus.HOLIDAY, ZERO
-    if d.weekday() >= 5:
+    if d.weekday() in (week_off_days or (5, 6)):
         return DayType.WEEK_OFF, False, AttendanceStatus.WEEK_OFF, ZERO
     return DayType.WORKING, True, AttendanceStatus.PRESENT, hours
 
@@ -366,6 +447,7 @@ def build_generated_entry(*, timesheet_id: int, d: date, holiday_dates: set[date
                           branch: CustomerBranch | None = None) -> TimesheetEntry:
     day_type, is_working, attendance, hours = classify_calendar_day(
         d, holiday_dates, default_hours=default_hours_worked(project, branch),
+        week_off_days=policy.week_off_days,
     )
     billable_hours, billable_days = compute_billables(
         is_working=is_working,
@@ -550,6 +632,12 @@ def compute_billables(*, is_working: bool, hours_worked: Decimal,
         if hours > ZERO and (policy.week_off_billable or policy.comp_off_billable):
             bh = _capped_hours(hours, project)
             return bh, _days_from_hours(hours, policy)
+        # Pure week-off (0 hours): Week Off Billable bills the day itself,
+        # exactly as Holidays Billable does for an unworked holiday. This is
+        # the calendar-month billing model — with both flags on, a 31-day
+        # month bills 31 days, not just the worked ones.
+        if policy.week_off_billable:
+            return Decimal(policy.min_hours_full_day), ONE
         return ZERO, ZERO
 
     if attendance_status == AttendanceStatus.PRESENT:
@@ -1202,13 +1290,21 @@ def employee_display_name(emp: Employee | None) -> str | None:
 
 
 def _user_display_name(db: Session, user_id: int | None) -> str | None:
-    """Display name of an auth user (registration_data): full_name, else username."""
+    """Display name of an auth user (registration_data): full_name, else username.
+
+    Never raises: this decorates summaries that sit on the BILLING path (the
+    approval freeze snapshots the summary), and a missing legacy users table
+    or column must cost a name, not an invoice figure.
+    """
     if not user_id:
         return None
-    row = db.execute(
-        text(f"SELECT full_name, username FROM {USERS_TABLE} WHERE id = :i"),
-        {"i": user_id},
-    ).first()
+    try:
+        row = db.execute(
+            text(f"SELECT full_name, username FROM {USERS_TABLE} WHERE id = :i"),
+            {"i": user_id},
+        ).first()
+    except Exception:
+        return None
     if not row:
         return None
     return row[0] or row[1]
@@ -1234,7 +1330,9 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
         opportunity_branch_foreign_to_project(db, project) if project else False
     )
     emp = db.get(Employee, ts.employee_id)
-    start, end = period_bounds(ts.year, ts.month)
+    # Period shown = editable override when set, else the employee's actual
+    # window on the project (mid-month join/exit aware).
+    start, end = sheet_period_bounds(ts, pe)
     # Header/display enrichment (all null-safe). Note: employees has no
     # employee_code column, so the employee's primary key doubles as the code.
     data["project_title"] = project_title_label(customer=customer, employee=emp,
@@ -1249,7 +1347,7 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
         "Branch not linked to this customer" if data["branch_unlinked"] else None
     )
     data["project_type"] = getattr(opp.opp_type, "value", opp.opp_type) if opp else None
-    data["timesheet_period"] = period_range_label(ts.year, ts.month)
+    data["timesheet_period"] = f"{start.strftime('%d-%b-%Y')} to {end.strftime('%d-%b-%Y')}"
     data["period_start_date"] = start.isoformat()
     data["period_end_date"] = end.isoformat()
     data["employee_name"] = employee_display_name(emp)
@@ -1321,8 +1419,17 @@ def _billable_rollup(project: Project | None,
     }
 
 
-def _is_comp_off_work_day(e) -> bool:
-    """True when the entry is a week-off or holiday day that can earn/bill comp-off."""
+def _is_comp_off_work_day(e, policy: "BillingPolicy | None" = None) -> bool:
+    """True when the entry is a week-off or holiday day that can earn/bill comp-off.
+
+    day_type is AUTHORITATIVE when present (fix, Aug 2026): a Working day that
+    merely falls on a Saturday — an ad-hoc working weekend, or a customer whose
+    week-off pattern isn't Sat/Sun — is normal billed time. The old weekday>=5
+    fallback fired for those rows too, so the same day was billed as worked
+    time AND credited comp-off, breaking the bill-XOR-credit rule. The weekday
+    fallback now (a) runs only when day_type is absent (legacy rows) and
+    (b) uses the policy's week_off_days pattern, not hardcoded Sat/Sun.
+    """
     att = e.attendance_status
     att_val = getattr(att, "value", att)
     day = getattr(e, "day_type", None)
@@ -1331,10 +1438,10 @@ def _is_comp_off_work_day(e) -> bool:
         return True
     if att_val in (AttendanceStatus.WEEK_OFF, "Week_Off") or day_val in (DayType.WEEK_OFF, "Week_Off"):
         return True
-    # Sat/Sun even if attendance was left as Present by a legacy row.
-    if e.entry_date is not None and e.entry_date.weekday() >= 5:
-        return True
-    return False
+    if day_val not in (None, ""):
+        return False  # an explicit Working/other day_type is never comp-off
+    week_off = tuple(policy.week_off_days) if policy is not None and policy.week_off_days else (5, 6)
+    return e.entry_date is not None and e.entry_date.weekday() in week_off
 
 
 def _is_holiday_work_day(e) -> bool:
@@ -1356,7 +1463,7 @@ def _work_day_is_billed(e, policy: BillingPolicy) -> bool:
     Either path bills → no leave credit (bill XOR credit).
     """
     hours = Decimal(e.hours_worked or 0)
-    if hours <= ZERO or not _is_comp_off_work_day(e):
+    if hours <= ZERO or not _is_comp_off_work_day(e, policy):
         return False
     if _is_holiday_work_day(e):
         return bool(policy.holidays_billable or policy.comp_off_billable)
@@ -1385,7 +1492,7 @@ def comp_off_earned(entries: list[TimesheetEntry], policy: BillingPolicy) -> Dec
     earned = ZERO
     for e in entries:
         hours = Decimal(e.hours_worked or 0)
-        if hours <= ZERO or not _is_comp_off_work_day(e):
+        if hours <= ZERO or not _is_comp_off_work_day(e, policy):
             continue
         # DECISION (ISSUE-1): any billing path → earned = 0 for that day.
         if _work_day_is_billed(e, policy):
@@ -1436,7 +1543,10 @@ def accrue_comp_off(db: Session, ts: Timesheet, entries: list[TimesheetEntry]) -
     if project is not None:
         ensure_project_branch_id(db, project, pe=pe)
     policy = effective_billing_policy(db, project, pe=pe) if project else BillingPolicy()
-    earned = comp_off_earned(entries, policy)
+    # NET of LOP cover (the Harman rule): a weekend day that made up a
+    # Loss-of-Pay day is spent — it must not ALSO credit comp-off leave.
+    # timesheet_summary is the single source of that netting.
+    earned = Decimal(str(timesheet_summary(db, ts, entries)["comp_off_earned"]))        .quantize(Decimal("0.01"))
     prior = Decimal(ts.comp_off_accrued or 0)
     delta = earned - prior
     if delta == ZERO:
@@ -1734,10 +1844,21 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
     if leave_req_from_clf > ZERO:
         leave_days = leave_req_from_clf
     # LOP reporting = leave excess + Absent working days + Half_Day unworked half.
-    # Billing math is unchanged; this is visibility only.
     lop_from_leave = classification.lop_days_total
     lop_from_absent, lop_from_half = _attendance_reporting_lop(live)
     total_lop_days = lop_from_leave + lop_from_absent + lop_from_half
+
+    # WEEKEND WORK COVERS LOP (14 Aug 2026, the "Harman rule"): in comp-off
+    # CREDIT mode, a worked week-off/holiday day first MAKES UP a Loss-of-Pay
+    # day — the employee delivered the month's required time, so the invoice
+    # bills the full month and the LOP disappears. The covering fraction earns
+    # NO comp-off credit (one day of work buys one benefit, never two); only
+    # the remainder credits. Billed modes are untouched: comp_off_earned is
+    # already zero there, so cover is zero too.
+    raw_comp_off_earned = comp_off_earned(live, policy)  # type: ignore[arg-type]
+    lop_cover = min(total_lop_days, raw_comp_off_earned)
+    total_lop_days = total_lop_days - lop_cover
+    net_comp_off_earned = raw_comp_off_earned - lop_cover
     paid_leave_days = sum(
         (s.paid_days for s in classification.splits_by_date.values()),
         ZERO,
@@ -1771,14 +1892,18 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
         # total_leave_days == total_leave_billable_days + loss_of_pay_from_leave
         "total_leave_days": float(leave_days),
         "total_leave_billable_days": float(leave_billable_days),
+        # Raw components — their sum can EXCEED total_loss_of_pay_days when
+        # weekend work covered part of it (lop_covered_days below).
         "loss_of_pay_from_leave": float(lop_from_leave),
         "loss_of_pay_from_absent": float(lop_from_absent),
         "loss_of_pay_from_half_day": float(lop_from_half),
         "total_loss_of_pay_days": float(total_lop_days),
+        "lop_covered_days": float(lop_cover),
         "total_leave_paid_days": float(paid_leave_days),
-        # Comp-off EARNED by weekend/holiday work (leave credit) when NOT billable.
+        # Comp-off EARNED by weekend/holiday work (leave credit) when NOT
+        # billable — NET of any fraction spent covering LOP days above.
         # Comp-off BILLED when Comp Off Billable ON (invoiced instead of credit).
-        "comp_off_earned": float(comp_off_earned(live, policy)),  # type: ignore[arg-type]
+        "comp_off_earned": float(net_comp_off_earned),
         "comp_off_billed": float(comp_off_billed(live, policy)),  # type: ignore[arg-type]
         "comp_off_billed_hours": float(comp_off_billed_hours(live, policy, project)),  # type: ignore[arg-type]
         "comp_off_credited": float(ts.comp_off_accrued or 0),
@@ -1828,7 +1953,7 @@ def timesheet_report_out(db: Session, ts: Timesheet,
                 ProjectEmployee.employee_id == ts.employee_id,
             )
         ).scalars().first()
-    start, end = period_bounds(ts.year, ts.month)
+    start, end = sheet_period_bounds(ts, pe)
     if entries is None:
         entries = db.execute(
             select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
@@ -1850,7 +1975,7 @@ def timesheet_report_out(db: Session, ts: Timesheet,
         "period_end": end.isoformat(),
         "period_start_date": start.isoformat(),
         "period_end_date": end.isoformat(),
-        "timesheet_period": period_range_label(ts.year, ts.month),
+        "timesheet_period": f"{start.strftime('%d-%b-%Y')} to {end.strftime('%d-%b-%Y')}",
         "actual_billable_hours": float(actual_billable_hours),
         "total_hours_worked": float(hours_worked),
         "total_leave_billable_days": float(rollup["leave_billable_days"]),
@@ -2098,9 +2223,28 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
     if not rate_rows:
         rate_rows = [RateRow.of(period_start, fallback_rate)]
 
+    if unit == BillingUnit.YEARLY:
+        # A Yearly assignment stores the ANNUAL price; a monthly invoice bills
+        # its monthly equivalent. Converting the rate rows up front (rather
+        # than special-casing every formula below) means Yearly then flows
+        # through the Monthly branch untouched — including mid-period rate
+        # splits, which keep their effective dates and just carry /12 values.
+        fallback_rate = fallback_rate / Decimal(12)
+        rate_rows = [RateRow.of(r.effective_from, r.rate / Decimal(12)) for r in rate_rows]
+
     current_rate = rate_for_date(rate_rows, period_end) or fallback_rate
     subs = split_period_by_rate(period_start, period_end, rate_rows)
     rate_changed = len({s.rate for s in subs}) > 1
+
+    # Mid-month join/exit (PE onboarding/exit dates): a Monthly rate bills the
+    # PRESENT fraction of the month, not the whole month. Hourly/Daily need no
+    # ratio — their quantities come from the (already clamped) entries.
+    window_start, window_end = sheet_period_bounds(ts, assignment)
+    month_len = Decimal((period_end - period_start).days + 1)
+    window_len = Decimal((window_end - window_start).days + 1)
+    presence_ratio = (window_len / month_len) if month_len > ZERO else ONE
+    if presence_ratio > ONE:
+        presence_ratio = ONE
 
     def _entry_in_range(e: TimesheetEntry, start: date, end: date) -> bool:
         return start <= e.entry_date <= end
@@ -2145,6 +2289,10 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         qty = ONE
         monthly_cost = current_rate
         working_days = Decimal(rollup["working_days"])
+        # Week-off/holiday days the employee WORKED and the policy bills.
+        # These are EXTRA effort above the standard working month the flat
+        # rate covers — valued per working day and added on top (below).
+        co_billed_days = comp_off_billed(entries, policy)  # type: ignore[arg-type]
         if rate_changed:
             parts = []
             for sub in subs:
@@ -2155,12 +2303,15 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
                     parts.append((ratio, sub.rate))
                 else:
                     if working_days > ZERO:
+                        sub_entries = [e for e in entries
+                                       if _entry_in_range(e, sub.start, sub.end)]
                         sub_billable = sum(
-                            (Decimal(e.billable_days or 0) for e in entries
-                             if _entry_in_range(e, sub.start, sub.end)),
-                            ZERO,
-                        )
-                        parts.append((min(sub_billable / working_days, ONE), sub.rate))
+                            (Decimal(e.billable_days or 0) for e in sub_entries), ZERO)
+                        # Same rule as the uniform path: billed weekend work is
+                        # priced as the explicit extra below, not in the ratio.
+                        sub_co = comp_off_billed(sub_entries, policy)  # type: ignore[arg-type]
+                        base_days = max(sub_billable - sub_co, ZERO)
+                        parts.append((min(base_days / working_days, ONE), sub.rate))
                     else:
                         parts.append((ZERO, sub.rate))
             amount = invoice_amount_split(parts)
@@ -2171,10 +2322,78 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
                 amount = rate.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             else:
                 if working_days > ZERO:
-                    ratio = min(rollup["actual_billable_days"] / working_days, ONE)
+                    # Billed weekend/holiday work is excluded here and priced
+                    # as the explicit extra below — its billable_days used to
+                    # inflate this numerator (while the denominator counts
+                    # only working days), double-paying it on partial months
+                    # and silently discarding it on full ones (the min cap).
+                    base_days = max(rollup["actual_billable_days"] - co_billed_days, ZERO)
+                    ratio = min(base_days / working_days, ONE)
                 else:
                     ratio = ZERO
                 amount = (rate * ratio).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+        if presence_ratio < ONE:
+            # Present a fraction of the month -> bill that fraction.
+            amount = (amount * presence_ratio).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+        # LOSS OF PAY reduces a Monthly bill (fix, Aug 2026). The leave-
+        # billable path used to charge the full month regardless — an employee
+        # with an unpaid day still invoiced 100%, so LOP was a red number that
+        # cost nobody anything. Each LOP day (over-balance leave, explicit
+        # Loss of Pay, Absent, unworked half-days) now deducts one working
+        # day's value: rate × lop / working-days-in-window.
+        # The non-leave-billable path needs no deduction here — its ratio is
+        # built from billable days, where LOP days already contribute zero.
+        lop_days = Decimal(str(lop_summary["total_loss_of_pay_days"]))
+        if policy.leave_billable and lop_days > ZERO and working_days > ZERO:
+            lop_ratio = min(lop_days / working_days, ONE)
+            amount = (amount * (ONE - lop_ratio)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+        # COMP-OFF BILLED work ADDS to a Monthly bill (fix, 13 Aug 2026).
+        # Hourly/Daily units already carry worked week-off/holiday time inside
+        # their quantities; the Monthly flat rate swallowed it — the popup
+        # said "Comp-Off Billed (qty) 1 · ₹86.96" while the sub-total stayed
+        # at the bare month. Each billed day-fraction is worth one working
+        # day of this window: (rate × presence) / working_days — the same
+        # per-day figure the popup prints, so its maths tie out exactly.
+        if co_billed_days > ZERO and working_days > ZERO:
+            per_day_val = (rate * presence_ratio) / working_days
+            amount = (amount + co_billed_days * per_day_val).quantize(
+                TWO_PLACES, rounding=ROUND_HALF_UP)
+
+        # QTY is the fraction of the monthly rate actually billed, at 4dp —
+        # and the amount is then REDEFINED as qty x rate, so stored line,
+        # printed PDF and GST base all reconcile exactly by construction
+        # (max rounding cost: rate x 0.00005). 2dp qty was the old precision;
+        # 0.96 x 3,00,000 = 2,88,000 vs an amount of 2,86,957 put a phantom
+        # thousand rupees between the popup and the invoice.
+        if rate > ZERO:
+            qty = (amount / rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            amount = (qty * rate).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+    # Rate basis for the breakdown popup: WHICH unit the assignment bills in
+    # (straight from the Project Employee record) and the derived per-day /
+    # per-hour charge for this sheet's window. Monthly/Yearly derive per-day
+    # from the window's working days — the same denominator the LOP deduction
+    # uses, so "1 LOP day costs the per-day charge" reads true in the popup.
+    wd_count = Decimal(rollup["working_days"])
+    hours_per_day = policy.min_hours_full_day or Decimal("8")
+    if unit == BillingUnit.HOURLY:
+        per_hour: Decimal | None = current_rate
+        per_day: Decimal | None = current_rate * hours_per_day
+    elif unit == BillingUnit.DAILY:
+        per_day = current_rate
+        per_hour = (current_rate / hours_per_day) if hours_per_day > ZERO else None
+    else:  # Monthly — and Yearly, whose rate rows were already divided by 12
+        # presence_ratio matters: a mid-month joiner's window bills HALF the
+        # monthly rate over the window's working days, so one day of that
+        # window is worth (rate x presence) / wd — this keeps the popup's
+        # per-day figure equal to what one LOP day actually deducts.
+        per_day = ((current_rate * presence_ratio) / wd_count) if wd_count > ZERO else None
+        per_hour = (per_day / hours_per_day) if per_day is not None and hours_per_day > ZERO else None
+
+    def _money(v: Decimal | None) -> float | None:
+        return float(v.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)) if v is not None else None
 
     line = {
         "s_no": 1,
@@ -2182,6 +2401,11 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         "monthly_cost": float(monthly_cost) if monthly_cost is not None else None,
         "total_billed_qty": float(qty),
         "rate_per_unit": float(rate),
+        "billing_unit": getattr(unit, "value", str(unit)),
+        "working_days_in_period": float(wd_count),
+        "hours_per_full_day": float(hours_per_day),
+        "per_day_charge": _money(per_day),
+        "per_hour_charge": _money(per_hour),
         "leave_billable_days": float(rollup["leave_billable_days"]),
         # Comp-off billed qty: hours for Hourly unit, day-fractions for Daily/Monthly.
         "comp_off_billable_qty": float(
@@ -2189,8 +2413,10 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
             if unit == BillingUnit.HOURLY
             else comp_off_billed(entries, policy)  # type: ignore[arg-type]
         ),
-        # Reporting only — does not change billed qty/amount.
+        # Since Aug 2026 this also REDUCES a leave-billable Monthly amount.
+        # NET of lop_covered_days (weekend work that made up the time).
         "loss_of_pay_days": float(lop_summary["total_loss_of_pay_days"]),
+        "lop_covered_days": float(lop_summary.get("lop_covered_days", 0)),
         "amount": float(amount),
         "rate_split": rate_changed,
     }

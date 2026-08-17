@@ -156,7 +156,8 @@ def create_request(
     notify_role(db, "RMG",
                 f"Template request {tr.tr_number} for {tr.role_title}",
                 f"TA requested an interview template (exp {tr.experience_level or 'n/a'}). Skills: {tr.skills or 'n/a'}.",
-                f"/template-requests/{tr.id}", exclude_user_id=user.id)
+                f"/template-requests/{tr.id}", exclude_user_id=user.id,
+                event="template_request.created")
     db.commit()
     db.refresh(tr)
     return envelope(_serialize(db, tr), message=f"Template request {tr.tr_number} raised")

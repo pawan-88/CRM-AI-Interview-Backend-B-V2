@@ -3,21 +3,39 @@
 This is the catalogue the template editor renders (real checkboxes) and the server
 validates against, so a template can never grant an unknown tab/field/mode.
 
-MODES: "view" (read-only) | "edit" (insert/update).
-Tab keys mirror the CRM router nav; field keys mirror each page's primary form fields.
-Extend freely — add tabs/fields here and they light up in the editor automatically.
+MODES form a LADDER: "view" < "edit" < "create". A higher grant satisfies every
+lower requirement — someone who may create records on a tab can obviously edit
+and view them, so the editor asks one question per tab, not three. Fields carry
+only "view" | "edit": creation is a record-level act, there is no such thing as
+creating a single field.
+
+Tab keys mirror the CRM router nav; field keys mirror each page's primary form
+fields. Extend freely — add tabs/fields here and they light up in the editor
+automatically.
 """
 from __future__ import annotations
 
-MODES = ("view", "edit")
+MODES = ("view", "edit", "create")
+#: Field grants stop at edit — see module docstring.
+FIELD_MODES = ("view", "edit")
+
+_MODE_RANK = {"view": 1, "edit": 2, "create": 3}
+
+
+def mode_satisfies(granted: str | None, required: str) -> bool:
+    """True when a granted mode covers the required one (ladder semantics)."""
+    if granted is None:
+        return False
+    return _MODE_RANK.get(granted, 0) >= _MODE_RANK.get(required, 99)
+
 
 # ------------------------------------------------------------------ tabs
 # key -> human label. Keys match the CRM query-param routes (?view=crm&p=<key>).
 TABS: dict[str, str] = {
     "dashboard": "Dashboard",
     "customers": "Customers",
+    "rate-cards": "Rate Card",
     "opportunities": "Opportunities",
-    "requirements": "Requirements",
     "candidates": "Candidates",
     "template-requests": "Template Requests",
     "profiles": "Candidate Profiles",
@@ -38,87 +56,138 @@ TABS: dict[str, str] = {
 }
 
 # ------------------------------------------------------------------ fields per tab
-# tab_key -> { field_key: label }. A curated set of the primary form fields per tab.
+# tab_key -> { field_key: label }. The primary form fields of each page — what a
+# template can independently show or lock. Grouped keys (e.g. "address") stand
+# for the whole section where locking individual sub-inputs would be noise.
 FIELDS_BY_TAB: dict[str, dict[str, str]] = {
+    "rate-cards": {
+        "band": "Experience Band", "rate_hourly": "Hourly Rate",
+        "rate_daily": "Daily Rate", "rate_weekly": "Weekly Rate",
+        "rate_monthly": "Monthly Rate", "rate_yearly": "Yearly Rate",
+    },
     "customers": {
         "name": "Customer Name", "legal_entity_name": "Legal Entity Name",
         "customer_type": "Customer Type", "status": "Status",
         "address": "Address", "branches": "Branches", "billing_policy": "Billing Policy",
+        "leave_policy": "Leave Billing Policy", "comp_off": "Comp Off",
+        "attendance_rule": "Attendance Rule",
         "contacts": "Contacts", "documents": "Documents",
     },
     "opportunities": {
-        "title": "Opportunity Title", "customer_id": "Customer", "opp_type": "Type",
-        "sales_stage": "Sales Stage", "rfi_value": "RFI Value",
+        "title": "Opportunity Title", "customer_id": "Customer", "branch_id": "Branch",
+        "opp_type": "Type", "pipeline_stage": "Pipeline Stage",
+        "sales_stage": "Sales Stage", "onboarding_status": "Onboarding Status",
+        "rfi_value": "RFI Value", "rfi_received_date": "RFI Received Date",
         "customer_type": "Customer Type", "contact_email": "Contact Email",
         "hiring_manager_email": "Hiring Manager Email",
+        "ctc_slab": "CTC Slab", "skills": "Skills", "attachments": "Attachments",
+        "details": "Type-specific Details",
+    },
+    "candidates": {
+        "name": "Name", "email": "Email", "phone": "Phone",
+        "experience_years": "Experience", "notice_period": "Notice Period",
+        "current_ctc": "Current CTC", "expected_ctc": "Expected CTC",
+        "cv": "Resume", "education": "Education", "experience_history": "Work Experience",
+        "skills": "Skills", "outreach": "Outreach Log",
+        "resignation": "Resignation Details",
+    },
+    "profiles": {
+        "candidate": "Candidate", "opportunity": "Opportunity",
+        "pipeline_status": "Pipeline Status", "status_transition": "Stage Transitions",
+        "current_ctc": "Current CTC", "expected_ctc": "Expected CTC",
+        "approved_ctc": "Approved CTC", "hike_percent": "Hike %",
+        "skill_evaluation": "Skill Evaluation", "offers": "Offers",
+        "interview_rounds": "Interview Rounds", "ai_interviews": "AI Interviews",
+        "submit_to_customer": "Submit to Customer",
+    },
+    "template-requests": {
+        "title": "Title", "requirement_id": "Requirement", "status": "Status",
+        "template_body": "Body", "fulfill": "Fulfill (RMG)", "prepare": "Prepare (TA)",
     },
     "projects": {
-        "name": "Project Name", "customer_id": "Customer", "status": "Status",
+        "name": "Project Name", "customer_id": "Customer", "branch_id": "Branch",
+        "status": "Status",
         "billing_frequency": "Billing Frequency", "billing_cycle_start_day": "Cycle Start",
-        "billing_cycle_end_day": "Cycle End", "max_billable_hours_day": "Max Billable Hrs/Day",
+        "billing_cycle_end_day": "Cycle End", "recurring_billing": "Recurring Billing",
+        "billability": "Billability Flags", "thresholds": "Hour Thresholds",
+        "caps": "Billing Caps", "leave_policies": "Leave Billing Policy",
+        "team": "Team", "communication_matrix": "Communication Matrix",
+        "create_po": "Create PO",
     },
     "project-employees": {
         "employee_id": "Employee", "project_id": "Project", "onboarding_date": "Onboarding Date",
         "billing_rate": "Billing Rate", "billing_unit": "Billing Unit",
-        "leave_details": "Leave", "rates": "Commercial Rate", "is_exit": "Exit",
+        "work_mode": "Work Mode", "location": "Location",
+        "leave_details": "Leave", "leave_sync": "Leave Sync",
+        "rates": "Commercial Rate", "is_exit": "Exit / Settlement",
     },
     "branch-policy": {
         "identity": "Branch Identity", "holiday_years": "Holiday Years",
         "billability": "Billability Flags", "thresholds": "Hour Thresholds",
         "caps": "Billing Caps", "leave_policies": "Billable Leave Policy",
     },
-    "timesheets": {
-        "period": "Period", "status": "Status", "entries": "Daily Entries",
-        "billable_days": "Billable Days", "approve": "Approve/Reject",
-    },
-    "invoices": {
-        "invoice_number": "Invoice Number", "po_id": "PO", "sub_total": "Sub Total",
-        "tax_amount": "Tax", "grand_total": "Grand Total", "payment_status": "Payment Status",
-    },
-    "pos": {
-        "po_number": "PO Number", "customer_id": "Customer", "total_value": "Total Value",
-        "allocations": "Project Allocations", "status": "Status",
-    },
-    "employees": {
-        "first_name": "First Name", "last_name": "Last Name", "email": "Email",
-        "department_id": "Department", "designation_id": "Designation", "current_ctc": "CTC",
-    },
-    "requirements": {
-        "title": "Requirement Title", "customer_id": "Customer", "priority": "Priority",
-        "status": "Status", "skills": "Skills", "description": "Description",
-    },
-    "candidates": {
-        "name": "Name", "email": "Email", "phone": "Phone", "experience_years": "Experience",
-        "current_ctc": "Current CTC", "expected_ctc": "Expected CTC", "cv": "Resume",
-    },
-    "profiles": {
-        "full_name": "Full Name", "email": "Email", "phone": "Phone", "skills": "Skills",
-        "experience": "Experience", "ctc": "CTC",
-    },
-    "template-requests": {
-        "title": "Title", "requirement_id": "Requirement", "status": "Status", "template_body": "Body",
-    },
-    "leave-applications": {
-        "employee_id": "Employee", "leave_type": "Leave Type", "dates": "Dates", "status": "Status",
-    },
-    "holidays": {
-        "branch_id": "Branch", "year": "Year", "holiday_date": "Date", "name": "Holiday Name",
-    },
     "my-leave": {
         "balance": "Leave Balance", "projects": "Project Leave",
     },
-    "reports": {
-        "date_range": "Date Range", "export": "Export",
+    "leave-applications": {
+        "employee_id": "Employee", "project_id": "Project", "leave_type": "Leave Type",
+        "period_type": "Period Type", "dates": "Dates", "reason": "Reason",
+        "status": "Status", "approve": "Approve/Reject",
     },
-    "settings": {
-        "company": "Company Settings", "smtp": "SMTP", "sequences": "Sequences",
+    "holidays": {
+        "customer_id": "Customer", "branch_id": "Branch", "year": "Year",
+        "holiday_date": "Date", "name": "Holiday Name",
+        "holiday_type": "Type", "observance": "Observance",
+    },
+    "timesheets": {
+        "period": "Period", "status": "Status", "entries": "Daily Entries",
+        "hours_worked": "Hours Worked", "attendance": "Attendance",
+        "leave_applied": "Leave Applied", "billable_days": "Billable Days",
+        "attachments": "Attachments", "approve": "Approve/Reject",
+        "generate_invoice": "Generate Invoice",
+    },
+    "pos": {
+        "po_number": "PO Number", "customer_id": "Customer", "branches": "Branches",
+        "contact_person_id": "Contact", "po_type": "PO Type",
+        "dates": "Dates", "payment_terms": "Payment Terms",
+        "tax_slab": "Tax Slab", "total_value": "Total Value",
+        "allocations": "Project Allocations", "attachments": "Attachments",
+        "status": "Status", "renew": "Renew", "cancel": "Cancel",
+    },
+    "invoices": {
+        "invoice_number": "Invoice Number", "po_id": "PO", "project_id": "Project",
+        "invoice_date": "Invoice Date", "due_date": "Due Date",
+        "lines": "Line Items", "sub_total": "Sub Total",
+        "tax_amount": "Tax", "grand_total": "Grand Total",
+        "payment_status": "Payment Status", "record_payment": "Record Payment",
+        "record_tds": "Record TDS", "pdf": "Invoice PDF",
     },
     "tds": {
         "tds_amount": "TDS Amount", "payment_status": "Payment Status", "payments": "Payments",
     },
+    "employees": {
+        "name": "Name", "email": "Email", "phone": "Phone",
+        "employee_code": "Employee Code", "profile_type": "Profile Type",
+        "department_id": "Department", "designation_id": "Designation",
+        "reporting": "Reporting Manager / HR", "employment_type": "Employment Type",
+        "current_ctc": "CTC", "bank_details": "Bank Details",
+        "addresses": "Addresses", "education": "Education",
+        "experience": "Experience", "leave_balances": "Leave Balances",
+        "attendance_rule": "Attendance Rule", "separation": "Separation",
+        "cv": "CV",
+    },
+    "reports": {
+        "opportunities": "Opportunity Report", "profiles": "Profile Report",
+        "productivity": "Recruiter Productivity", "export": "CSV Export",
+    },
     "users": {
         "roles": "Roles", "tab_access": "Tab Access", "access_template": "Access Template",
         "activation": "Activation", "portal_access": "Portal Access",
+        "email_flows": "Email Flows", "action_permissions": "Action Permissions",
+    },
+    "settings": {
+        "masters": "Masters (Departments, Skills…)", "organisation": "Organisation",
+        "operations": "Operations / Scheduler", "app_settings": "App Settings",
     },
 }
 
@@ -143,6 +212,7 @@ def registry() -> dict:
     """Full catalogue for the template-editor UI."""
     return {
         "modes": list(MODES),
+        "field_modes": list(FIELD_MODES),
         "tabs": [
             {"key": k, "label": v, "fields": [{"key": fk, "label": fl}
                                               for fk, fl in FIELDS_BY_TAB.get(k, {}).items()]}
@@ -164,5 +234,5 @@ def validate_access(tab_access: dict | None, field_access: dict | None) -> None:
         for fk, mode in (fields or {}).items():
             if not is_valid_field(tab, fk):
                 raise ValueError(f"Unknown field {fk!r} for tab {tab}")
-            if mode not in MODES:
+            if mode not in FIELD_MODES:
                 raise ValueError(f"Invalid mode {mode!r} for field {tab}.{fk}")

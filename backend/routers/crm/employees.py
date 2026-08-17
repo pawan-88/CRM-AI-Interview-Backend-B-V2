@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, gated_read, gated_write, get_crm_db, page_params
+from crm_deps import CurrentUser, PageParams, gated_create, gated_read, gated_write, get_crm_db, page_params
 from models import (
     Employee,
     EmployeeEducation,
@@ -62,6 +62,7 @@ router = APIRouter(prefix="/api/employees", tags=["CRM: Employees"])
 subform_router = APIRouter(prefix="/api", tags=["CRM: Employees"])
 
 EMP_WRITE = gated_write("employees", "HR")
+EMP_CREATE = gated_create("employees", "HR")
 # Read floor includes Sales & RMG so the Access Template can grant them the
 # Employees tab (Admin/CEO always pass). Without them here the role check
 # rejects the tab before the template is consulted (sidebar shows, data 403s).
@@ -75,7 +76,7 @@ EMP_READ = gated_read("employees", "HR", "Finance", "Sales_Head", "Sales", "RMG"
 
 @router.post("")
 def create_employee(body: EmployeeCreate, db: Session = Depends(get_crm_db),
-                    user: CurrentUser = Depends(EMP_WRITE)):
+                    user: CurrentUser = Depends(EMP_CREATE)):
     ensure_unique_email(db, body.email)
     validate_user_link(db, body.user_id)
     validate_department(db, body.department_id)
@@ -144,6 +145,21 @@ def update_employee(employee_id: int, body: EmployeeUpdate, db: Session = Depend
                     user: CurrentUser = Depends(EMP_WRITE)):
     emp = get_employee_or_404(db, employee_id)
     data = body.model_dump(exclude_unset=True)
+    # Field-level template enforcement — the API twin of the greyed inputs.
+    from services.access_templates import reject_view_only_fields
+    reject_view_only_fields(db, user.id, set(user.roles), "employees", data, {
+        "title": "name", "first_name": "name", "middle_name": "name", "last_name": "name",
+        "display_name": "name",
+        "email": "email", "personal_email": "email", "phone": "phone",
+        "employee_code": "employee_code", "profile_type": "profile_type",
+        "department_id": "department_id", "designation_id": "designation_id",
+        "reporting_manager_id": "reporting", "reporting_hr_id": "reporting",
+        "employment_type": "employment_type",
+        "current_ctc": "current_ctc", "bank_account_details": "bank_details",
+        "present_address": "addresses", "permanent_address": "addresses",
+        "is_resigned": "separation", "date_of_resignation": "separation",
+        "last_working_day": "separation",
+    })
 
     if "email" in data and data["email"]:
         ensure_unique_email(db, data["email"], exclude_id=emp.id)

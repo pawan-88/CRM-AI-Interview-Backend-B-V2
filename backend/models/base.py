@@ -53,6 +53,14 @@ class TimestampMixin:
 
 
 class WorkMode(str, enum.Enum):
+    """Where the deployment sits. The UI presents this as "Location".
+
+    OFFSHORE was added for the Map Employee form (On Site / Off-Shore / Remote).
+    HYBRID stays for existing rows even though the new form no longer offers it —
+    removing a Postgres enum value would require rewriting history.
+    """
+
     REMOTE = "Remote"
     ONSITE = "Onsite"
     HYBRID = "Hybrid"
+    OFFSHORE = "Off-Shore"

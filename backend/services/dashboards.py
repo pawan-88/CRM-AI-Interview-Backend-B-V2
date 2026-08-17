@@ -575,3 +575,122 @@ def bench_requirement_matches(db: Session, employee_id: int) -> list[dict]:
         })
     out.sort(key=lambda x: x["match_score"] or 0, reverse=True)
     return out[:10]
+
+
+# --------------------------------------------------------------------- my work
+
+def my_work(db: Session, user) -> dict:
+    """Action items for THIS user — the to-do list that teaches each role its job.
+
+    Design rules, learned from every dashboard that came before it:
+
+    * **Only actionable items.** Every entry is something the caller's role
+      decides or unblocks, with the page it happens on. Informational counts
+      belong on the role dashboards, not here.
+    * **Template-aware.** A user whose access template hides a tab never sees
+      its items — a to-do you cannot open is an irritation, not a task.
+    * **Zero-count items are dropped** server-side. An empty list means
+      "all clear", and the UI says exactly that.
+    """
+    from datetime import timedelta
+
+    from models import LeaveApplication, Timesheet, TimesheetStatus
+    from services.access_templates import can_view_tab, effective_access
+
+    roles = set(user.roles)
+    is_admin = bool(roles & {"Admin", "CEO"})
+    acc = effective_access(db, user.id, roles)
+
+    def allowed(tab: str, *needed_roles: str) -> bool:
+        if is_admin:
+            return True
+        if acc.get("visible_tabs") is not None:
+            return can_view_tab(acc, tab)
+        return bool(roles & set(needed_roles))
+
+    def count(stmt) -> int:
+        return int(db.execute(select(func.count()).select_from(stmt.subquery())).scalar() or 0)
+
+    today = date.today()
+    items: list[dict] = []
+
+    def add(key: str, n: int, label: str, path: str, urgency: str = "normal") -> None:
+        if n > 0:
+            items.append({"key": key, "count": n, "label": label, "path": path,
+                          "urgency": urgency})
+
+    # Timesheets waiting for a decision (RMG/Sales approve; admin sees all).
+    if allowed("timesheets", "RMG", "Sales"):
+        add("timesheets_to_approve",
+            count(select(Timesheet.id).where(Timesheet.status == TimesheetStatus.SUBMITTED)),
+            "timesheets waiting for your approval", "timesheets", "warning")
+
+    # Own unsubmitted sheets — anyone linked to an employee record.
+    emp_id = db.execute(
+        sa.text("SELECT id FROM employees WHERE user_id = :uid LIMIT 1"), {"uid": user.id}
+    ).scalar()
+    if emp_id:
+        add("own_draft_timesheets",
+            count(select(Timesheet.id).where(Timesheet.employee_id == emp_id,
+                                             Timesheet.status == TimesheetStatus.DRAFT)),
+            "of your timesheets are not submitted yet", "timesheets", "warning")
+
+    # Opportunities awaiting Sales Head approval.
+    if allowed("opportunities", "Sales_Head"):
+        from models import OpportunityApprovalStatus
+
+        add("opportunities_to_approve",
+            count(select(Opportunity.id).where(
+                Opportunity.approval_status
+                == OpportunityApprovalStatus.PENDING_SALES_HEAD_APPROVAL)),
+            "opportunities awaiting Sales Head approval", "opportunities", "warning")
+
+    # Requirements stuck in engineering review (RMG must attach a JD + approve).
+    if allowed("requirements", "RMG"):
+        add("requirements_engineering_review",
+            count(select(Requirement.id).where(
+                Requirement.status == RequirementStatus.PENDING_ENGINEERING_REVIEW)),
+            "requirements waiting for RMG review (JD + approve)", "requirements", "warning")
+
+    # Requirements open for sourcing (TA's queue).
+    if allowed("requirements", "TA"):
+        add("requirements_to_source",
+            count(select(Requirement.id).where(
+                Requirement.status.in_(OPEN_SOURCING_STATUSES))),
+            "requirements open for sourcing", "requirements")
+
+    # Leave applications waiting on HR.
+    if allowed("leave-applications", "HR"):
+        add("leave_to_decide",
+            count(select(LeaveApplication.id).where(LeaveApplication.status == "Pending")),
+            "leave applications waiting for HR", "leave-applications", "warning")
+
+    # POs expiring within 30 days (or already past) but still Active.
+    if allowed("pos", "Finance", "Sales_Head"):
+        add("pos_expiring",
+            count(select(PurchaseOrder.id).where(
+                PurchaseOrder.status == POStatus.ACTIVE,
+                PurchaseOrder.end_date.is_not(None),
+                PurchaseOrder.end_date <= today + timedelta(days=30))),
+            "purchase orders expire within 30 days", "pos", "danger")
+
+    # Overdue receivables.
+    if allowed("invoices", "Finance", "Sales_Head"):
+        add("invoices_overdue",
+            count(select(Invoice.id).where(
+                Invoice.due_date.is_not(None),
+                Invoice.due_date < today,
+                Invoice.payment_status != PaymentStatus.PAID)),
+            "invoices are overdue for payment", "invoices", "danger")
+
+    # Profiles at Customer_Approval — only the Sales Head can move them.
+    if allowed("profiles", "Sales_Head"):
+        add("profiles_awaiting_signoff",
+            count(select(CandidateProfile.id).where(
+                CandidateProfile.pipeline_status == PipelineStatus.CUSTOMER_APPROVAL)),
+            "candidates await your final sign-off", "profiles", "warning")
+
+    # Danger first, then warning, then the rest — the eye reads top-down.
+    rank = {"danger": 0, "warning": 1, "normal": 2}
+    items.sort(key=lambda x: (rank.get(x["urgency"], 9), -x["count"]))
+    return {"items": items, "all_clear": not items}
