@@ -70,6 +70,11 @@ class Requirement(Base, TimestampMixin):
     engineering_reviewed_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
     engineering_rejection_reason = sa.Column(sa.Text, nullable=True)
 
+    #: Read-only link to the parent opportunity (18 Aug 2026) — the requirement
+    #: displays and is searchable by the opportunity's ID, so every role tracks
+    #: ONE id from create to close. No cascade: the opportunity owns itself.
+    opportunity = relationship("Opportunity", foreign_keys=[opportunity_id], viewonly=True)
+
     skills = relationship("RequirementSkill", back_populates="requirement", cascade="all, delete-orphan")
     job_postings = relationship("RequirementJobPosting", back_populates="requirement",
                                 cascade="all, delete-orphan")

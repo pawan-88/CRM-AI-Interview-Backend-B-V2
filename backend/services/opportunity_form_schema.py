@@ -40,6 +40,10 @@ _TM_DETAIL: frozenset[str] = frozenset({
     # Leave & Holiday Details (full for T&M only)
     "holidays_billable", "weekoff_billable", "leave_billable",
     "credit_leave_monthly", "leave_policy", "holidays", "weekoff", "leave",
+    # Paid leaves the customer bills even when leave isn't billable (the
+    # "APTIV rule"; frontend twin has carried it since 14 Aug 2026 — its
+    # absence HERE made every T&M create with a prefilled branch policy 422).
+    "paid_leaves",
     # Commercial Details extras (rfi_value is a core column, handled elsewhere)
     "billing_type", "hours_per_day", "actual_billing_days", "actual_billing_hours",
 })

@@ -33,16 +33,23 @@ def _is_true(value: Any) -> bool:
 def calculate_billing_bases(details: dict | None) -> tuple[Decimal, Decimal | None]:
     """Return (actual billing days, hours).
 
-    Only non-billable weekoffs/holidays/leave are deducted. Blank leave values
-    count as zero. Hours stay blank until Hours Per Day is supplied.
+    BILLABLE means the customer pays for that day, so it stays IN the base
+    (user-confirmed 18 Aug 2026): Holidays+Weekoff billable, 24 leave, 12 paid
+    → 365−24+12 = 353; nothing billable → 365−10−104−24 = 227 (+12 paid =
+    239); everything billable → 365. Customer-paid leaves add back capped at
+    what leave deducted. Blank values count as zero; hours stay blank until
+    Hours Per Day is supplied. Mirror of ctcSlab.ts::calculateBillingBases —
+    change BOTH or the form and the server disagree.
     """
     d = details or {}
+    leave_deducted = ZERO if _is_true(d.get("leave_billable")) else _zero_when_blank(d.get("leave"))
     deductions = (
         (ZERO if _is_true(d.get("weekoff_billable")) else _zero_when_blank(d.get("weekoff")))
         + (ZERO if _is_true(d.get("holidays_billable")) else _zero_when_blank(d.get("holidays")))
-        + (ZERO if _is_true(d.get("leave_billable")) else _zero_when_blank(d.get("leave")))
+        + leave_deducted
     )
-    days = _money(max(ZERO, Decimal("365") - deductions))
+    paid_add_back = min(_zero_when_blank(d.get("paid_leaves")), leave_deducted)
+    days = _money(max(ZERO, Decimal("365") - deductions + paid_add_back))
     hours_per_day = _decimal(d.get("hours_per_day"))
     hours = _money(days * max(ZERO, hours_per_day)) if hours_per_day is not None else None
     return days, hours

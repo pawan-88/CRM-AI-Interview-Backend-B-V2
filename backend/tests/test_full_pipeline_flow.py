@@ -139,16 +139,9 @@ def test_every_notified_role_can_act_on_the_stage():
 
 # ------------------------------------------------------------ Sales visibility
 
-def test_sales_sees_the_customer_ladder():
-    visible = visible_statuses_for(FakeUser(["Sales"]))
-    for stage in (PS.CUSTOMER_INTERVIEW, PS.L1_FEEDBACK, PS.L2_FEEDBACK, PS.SHORTLISTED):
-        assert stage.value in visible, stage.value
-
-
-def test_sales_still_cannot_see_work_before_the_handoff():
-    visible = visible_statuses_for(FakeUser(["Sales"]))
-    for hidden in (PS.SOURCING, PS.TECHNICAL_SCREENING, PS.RMG_REVIEW):
-        assert hidden.value not in visible, hidden.value
+def test_sales_visibility_is_unrestricted():
+    """No stage scoping since 18 Aug 2026 — see test_pipeline_handoff.py."""
+    assert visible_statuses_for(FakeUser(["Sales"])) is None
 
 
 # ------------------------------------------------------------------ AI L1 gate

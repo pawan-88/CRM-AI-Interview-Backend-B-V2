@@ -36,6 +36,8 @@ class OpportunityCtcSlabIn(BaseModel):
 
 
 class OpportunityCreate(BaseModel):
+    #: Optional custom ID (18 Aug 2026). Blank/None = server auto-numbers.
+    opp_id: str | None = Field(default=None, max_length=64)
     title: str = Field(min_length=1, max_length=255)
     customer_id: int
     branch_id: int | None = None
@@ -53,6 +55,8 @@ class OpportunityCreate(BaseModel):
 
 
 class OpportunityUpdate(BaseModel):
+    #: Editable ID (18 Aug 2026) — uniqueness enforced server-side.
+    opp_id: str | None = Field(default=None, max_length=64)
     title: str | None = Field(default=None, min_length=1, max_length=255)
     customer_id: int | None = None
     branch_id: int | None = None

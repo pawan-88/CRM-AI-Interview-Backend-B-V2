@@ -6872,6 +6872,37 @@ def auth_login(
     }
 
 
+@app.post("/auth/refresh")
+@_rl.limit("30/minute")
+def auth_refresh(request: Request):
+    """Re-issue a fresh token for a STILL-VALID session (17 Aug 2026).
+
+    Lets the dashboard offer "Stay signed in" shortly before expiry instead of
+    dumping the user (and their half-typed form) onto the login page. An
+    expired or missing token gets 401 — this never resurrects a dead session.
+    Candidate interview sessions (invite_token claim) are excluded on purpose:
+    those are device-bound and end when the interview window ends.
+    """
+    payload = _decode_token_from_header(request)
+    if not payload:
+        return JSONResponse(status_code=401, content={"error": "Session expired. Please login again."})
+    if payload.get("invite_token"):
+        return JSONResponse(status_code=403, content={"error": "Interview sessions cannot be extended."})
+    user = {
+        "username": payload.get("sub", ""),
+        "role": payload.get("role", ""),
+        "full_name": payload.get("full_name", ""),
+        "email": payload.get("email", ""),
+    }
+    token, expires_at_ist = _issue_access_token(user)
+    return {
+        "status": "ok",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at_ist": expires_at_ist,
+    }
+
+
 @app.post("/auth/forgot-password")
 @_rl.limit("5/minute")
 def auth_forgot_password(

@@ -101,14 +101,7 @@ def test_every_verdict_is_a_real_result_value():
 
 # ------------------------------------------------------- Sales visibility holds
 
-def test_sales_still_sees_the_whole_tail_it_works():
-    visible = visible_statuses_for(FakeUser(["Sales"]))
-    for stage in (PS.SALES_SCREENING, PS.CUSTOMER_SCREENING, PS.CUSTOMER_INTERVIEW,
-                  PS.SHORTLISTED, PS.CUSTOMER_APPROVAL, PS.PREBOARDING, PS.JOINED):
-        assert stage.value in visible, stage.value
-
-
-def test_sales_head_can_see_what_it_must_approve():
-    """Losing sight of Customer Approval would make the gate unusable."""
-    visible = visible_statuses_for(FakeUser(["Sales_Head"]))
-    assert PS.CUSTOMER_APPROVAL.value in visible
+def test_sales_and_sales_head_see_everything():
+    """Including Customer Approval, the gate Sales Head must action."""
+    assert visible_statuses_for(FakeUser(["Sales"])) is None
+    assert visible_statuses_for(FakeUser(["Sales_Head"])) is None

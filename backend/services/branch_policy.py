@@ -342,6 +342,20 @@ def effective_customer_branch_policy(db: Session, branch: CustomerBranch) -> dic
     )
     sources["branch_leave_total"] = "branch" if branch_linked else None
 
+    # Per-type breakup (18 Aug 2026): the Opportunity form shows WHICH leaves
+    # make up the paid allowance — "Earned 12 · Sick 6 · Casual 6", not one
+    # bare number. Same rows the totals above summed, so they always agree.
+    _breakup_ids = {id(p) for p in (branch_linked if branch_linked else picked)}
+    breakup = sorted(
+        (
+            {"name": type_name, "annual": float(_annual_leave(pol))}
+            for pol, type_name in chosen.values()
+            if id(pol) in _breakup_ids
+        ),
+        key=lambda r: r["name"],
+    )
+    data["leave_breakup"] = breakup or None
+
     # Holidays that belong to THIS branch calendar only (not customer-wide / global).
     branch_holidays_count = int(db.execute(
         select(func.count(func.distinct(Holiday.holiday_date))).where(

@@ -31,6 +31,7 @@ from services.crm_common import log_activity, next_sequence_number, paginate, sa
 from services.notify import notify_role, notify_user
 from services.opportunities import backfill_requirement_from_opportunity
 from services.requirements import (
+    requirement_label,
     EDITABLE_STATUSES, TERMINAL_STATUSES, apply_visibility, enrich_requirement_jd, ensure_visible,
     get_requirement_or_404, serialize_attachment_row, serialize_job_posting, serialize_requirement,
     skills_by_requirement, usernames_for,
@@ -79,7 +80,38 @@ def _validated_skills(db: Session, skills: list[RequirementSkillIn]) -> list[Req
 
 def _one(db: Session, req: Requirement) -> dict:
     data = serialize_requirement(req, skills_by_requirement(db, [req.id]).get(req.id, []))
+    data["ctc_bands"] = _safe_ctc_bands(db, req)
     return enrich_requirement_jd(db, data, req)
+
+
+def _safe_ctc_bands(db: Session, req: Requirement) -> list[dict]:
+    """Slab-wise budget for RMG/TA (18 Aug 2026): the experience columns plus
+    Engineering Budget and Approved CTC. Everything that reveals the MARGIN —
+    rate, monthly/annual revenue, management cost %, hike %, appraisal cycles
+    — is withheld here and stays on the Sales-gated opportunity. This is the
+    deliberate middle: enough to source the right candidate at the right
+    money, nothing about what the customer is charged."""
+    from models import OpportunityCtcSlab
+
+    if not req.opportunity_id:
+        return []
+    rows = db.execute(
+        select(OpportunityCtcSlab)
+        .where(OpportunityCtcSlab.opportunity_id == req.opportunity_id)
+        .order_by(OpportunityCtcSlab.position, OpportunityCtcSlab.id)
+    ).scalars().all()
+    def _f(v):
+        return float(v) if v is not None else None
+    return [
+        {
+            "exp_min": _f(r.exp_min),
+            "exp_max": _f(r.exp_max),
+            "target_exp": _f(r.target_exp),
+            "engineering_budget": _f(r.engineering_budget),
+            "approved_ctc_lac": _f(r.approved_ctc_lac),
+        }
+        for r in rows
+    ]
 
 
 _ATT_MAX_BYTES = 15 * 1024 * 1024
@@ -122,10 +154,10 @@ def create_requirement(
         db.add(RequirementSkill(requirement_id=req.id, skill_id=s.skill_id,
                                 is_mandatory=s.is_mandatory, min_rating=s.min_rating))
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
-                 "CREATED", f"Requirement {req.req_number} created as Draft")
+                 "CREATED", f"Requirement {requirement_label(req)} created as Draft")
     db.commit()
     db.refresh(req)
-    return envelope(_one(db, req), message=f"Requirement {req.req_number} created")
+    return envelope(_one(db, req), message=f"Requirement {requirement_label(req)} created")
 
 
 @router.get("")
@@ -150,7 +182,16 @@ def list_requirements(
         stmt = stmt.where(Requirement.priority == Priority(priority))
     if p.search:
         like = f"%{p.search}%"
-        stmt = stmt.where(or_(Requirement.title.ilike(like), Requirement.req_number.ilike(like)))
+        # Searching by the OPPORTUNITY id must find the requirement too — all
+        # roles track one number (18 Aug 2026). Outer join: never drops rows.
+        from models import Opportunity
+        stmt = stmt.outerjoin(Opportunity, Opportunity.id == Requirement.opportunity_id).where(
+            or_(Requirement.title.ilike(like), Requirement.req_number.ilike(like),
+                Opportunity.opp_id.ilike(like)))
+    # Eager-load the parent opportunity: the serializer reads its opp_id for
+    # every row — without this, a 100-row page costs 100 extra queries.
+    from sqlalchemy.orm import selectinload
+    stmt = stmt.options(selectinload(Requirement.opportunity))
     stmt = stmt.order_by(Requirement.created_at.desc(), Requirement.id.desc())
     items, meta = paginate(db, stmt, p.page, p.limit)
     smap = skills_by_requirement(db, [r.id for r in items])
@@ -231,10 +272,10 @@ def submit_requirement(
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "SUBMITTED", f"Submitted for Sales Head approval (was {previous})")
     notify_role(db, "Sales_Head",
-                f"Requirement {req.req_number} submitted for approval",
+                f"Requirement {requirement_label(req)} submitted for approval",
                 f"'{req.title}' awaits your approval.",
                 f"/requirements/{req.id}", exclude_user_id=user.id,
-                event="requirement.submitted")
+                event="requirement.submitted", actor=user)
     db.commit()
     return envelope(_one(db, req), message="Submitted for Sales Head approval")
 
@@ -255,14 +296,15 @@ def sales_head_approve(
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "SALES_HEAD_APPROVED", comment or "Approved by Sales Head")
     notify_role(db, "RMG",
-                f"Requirement {req.req_number} pending engineering review",
+                f"Requirement {requirement_label(req)} pending engineering review",
                 f"'{req.title}' was approved by Sales Head and needs engineering review.",
                 f"/requirements/{req.id}", exclude_user_id=user.id,
-                event="requirement.sales_approved")
+                event="requirement.sales_approved", actor=user)
     if req.created_by != user.id:
         notify_user(db, req.created_by,
-                    f"Requirement {req.req_number} approved by Sales Head",
-                    "Moved to engineering review.", f"/requirements/{req.id}")
+                    f"Requirement {requirement_label(req)} approved by Sales Head",
+                    "Moved to engineering review.", f"/requirements/{req.id}",
+                    actor=user)
     db.commit()
     return envelope(_one(db, req), message="Approved; moved to engineering review")
 
@@ -285,8 +327,8 @@ def sales_head_reject(
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "SALES_HEAD_REJECTED", reason)
     notify_user(db, req.created_by,
-                f"Requirement {req.req_number} rejected by Sales Head",
-                reason, f"/requirements/{req.id}")
+                f"Requirement {requirement_label(req)} rejected by Sales Head",
+                reason, f"/requirements/{req.id}", actor=user)
     db.commit()
     return envelope(_one(db, req), message="Requirement rejected by Sales Head")
 
@@ -337,13 +379,14 @@ def engineering_approve(
                  "ENGINEERING_APPROVED", comment or "Approved by Engineering (RMG)")
     notify_role(db, "TA",
                 "New requirement open for sourcing",
-                f"Requirement {req.req_number} '{req.title}' is open for sourcing.",
+                f"Requirement {requirement_label(req)} '{req.title}' is open for sourcing.",
                 f"/requirements/{req.id}", exclude_user_id=user.id,
-                event="requirement.engineering_approved")
+                event="requirement.engineering_approved", actor=user)
     if req.created_by != user.id:
         notify_user(db, req.created_by,
-                    f"Requirement {req.req_number} approved by Engineering",
-                    "Now open for sourcing.", f"/requirements/{req.id}")
+                    f"Requirement {requirement_label(req)} approved by Engineering",
+                    "Now open for sourcing.", f"/requirements/{req.id}",
+                    actor=user)
     db.commit()
     return envelope(_one(db, req), message="Approved; open for sourcing")
 
@@ -366,8 +409,8 @@ def engineering_reject(
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "ENGINEERING_REJECTED", reason)
     notify_user(db, req.created_by,
-                f"Requirement {req.req_number} rejected by Engineering",
-                reason, f"/requirements/{req.id}")
+                f"Requirement {requirement_label(req)} rejected by Engineering",
+                reason, f"/requirements/{req.id}", actor=user)
     db.commit()
     return envelope(_one(db, req), message="Requirement rejected by Engineering")
 
@@ -408,8 +451,8 @@ def _manual_terminal(db: Session, requirement_id: int, user: CurrentUser,
                  action, comment or f"{new_status.value} (was {previous})")
     if req.created_by != user.id:
         notify_user(db, req.created_by,
-                    f"Requirement {req.req_number} {new_status.value.lower()}",
-                    comment or "", f"/requirements/{req.id}")
+                    f"Requirement {requirement_label(req)} {new_status.value.lower()}",
+                    comment or "", f"/requirements/{req.id}", actor=user)
     db.commit()
     return envelope(_one(db, req), message=f"Requirement {new_status.value.lower()}")
 

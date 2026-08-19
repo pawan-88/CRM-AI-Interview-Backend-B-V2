@@ -115,11 +115,27 @@ def serialize_attachment_row(a) -> dict:
     }
 
 
+def requirement_label(req: Requirement) -> str:
+    """The id humans see for a requirement (18 Aug 2026).
+
+    ONE id follows the deal from Sales to TA: the opportunity's own id
+    (OPP-2026-007). `req_number` still exists as the internal key — nothing in
+    the DB changed — but it no longer appears in the UI, emails or bell
+    notifications, because two numbers for one piece of work meant every role
+    quoted a different one. Falls back to req_number defensively.
+    """
+    return str(getattr(getattr(req, "opportunity", None), "opp_id", None) or req.req_number)
+
+
 def serialize_requirement(req: Requirement, skills: list[dict] | None = None) -> dict:
     return {
         "id": req.id,
         "req_number": req.req_number,
         "opportunity_id": req.opportunity_id,
+        # One ID across roles (18 Aug 2026): the parent opportunity's public
+        # ID travels with every requirement so the number Sales quoted is the
+        # number RMG/TA see and search.
+        "opportunity_opp_id": getattr(req.opportunity, "opp_id", None),
         "customer_id": req.customer_id,
         "title": req.title,
         "description": req.description,

@@ -67,4 +67,4 @@ browser (offline/locked-down env), the Markdown diagrams still render everywhere
 - Role names match `models/rbac.py::RoleName` exactly.
 - Endpoint paths and table/column names match the code exactly so diagrams are greppable.
 
-_Last synced: 2026-08-17 — Holidays tab + branch calendar prefill on Opportunities; leave policy seeds Project Employees (sync adds missing types only); rate cards, email outbox, payroll._
+_Last synced: 2026-08-19 — Opportunity/requirement pipeline + CTC/policy prefill; session keep-alive and CRM dashboard/UI polish._

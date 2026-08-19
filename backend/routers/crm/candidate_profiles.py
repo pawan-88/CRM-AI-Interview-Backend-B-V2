@@ -351,7 +351,7 @@ def schedule_l2_face_to_face(
                 f"L2 face-to-face scheduled: {cname}",
                 " — ".join(parts[1:]) or "RMG will take a face-to-face L2 round.",
                 f"/admin?view=crm&p=profiles/{profile.id}", exclude_user_id=user.id,
-                event="candidate.l2_scheduled")
+                event="candidate.l2_scheduled", actor=user)
 
     # Best-effort email to the candidate with the call details + calendar invite.
     email_sent = False

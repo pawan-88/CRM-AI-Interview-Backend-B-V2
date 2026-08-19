@@ -1159,7 +1159,7 @@ def generate_invoice_from_timesheet(
         f"Timesheet {ts.year}-{ts.month:02d} (project #{ts.project_id}, "
         f"employee #{ts.employee_id}) was invoiced for {float(grand_total):.2f}.",
         f"/invoices/{invoice.id}", exclude_user_id=user.id,
-        event="invoice.generated",
+        event="invoice.generated", actor=user,
     )
     db.commit()
     db.refresh(invoice)
@@ -1283,7 +1283,7 @@ def remind_timesheets_due(
             f"Timesheet due for {period_label(year, month)} — {project_label}",
             f"Your timesheet for {period_label(year, month)} on {project_label} is "
             f"{row['status'].lower()}. Please create/submit it.",
-            "/timesheets",
+            "/timesheets", actor=user,
         )
         notified += 1
     db.commit()

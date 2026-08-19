@@ -21,14 +21,36 @@ BASE = {
 }
 
 
-def test_billing_bases_subtract_only_non_billable_values():
+def test_billing_bases_user_confirmed_scenarios():
+    """BILLABLE = customer pays that day = stays IN the base (user-confirmed
+    18 Aug 2026, four exact scenarios). Paid leaves add back capped at what
+    leave deducted."""
+    # Nothing billable, no paid leaves: 365 − 10 − 104 − 24 = 227.
     days, hours = calculate_billing_bases(BASE)
     assert float(days) == 227
     assert float(hours) == 1816
 
-    days, hours = calculate_billing_bases({**BASE, "holidays_billable": True})
-    assert float(days) == 237
-    assert float(hours) == 1896
+    # Nothing billable + 12 paid: 227 + 12 = 239.
+    days, _ = calculate_billing_bases({**BASE, "paid_leaves": 12})
+    assert float(days) == 239
+
+    # Holidays + Weekoff billable, 24 leave, 12 paid: 365 − 24 + 12 = 353.
+    days, _ = calculate_billing_bases({
+        **BASE, "holidays_billable": True, "weekoff_billable": True,
+        "paid_leaves": 12,
+    })
+    assert float(days) == 353
+
+    # Everything billable: full 365 (and no paid add-back — leave deducted 0).
+    days, _ = calculate_billing_bases({
+        **BASE, "holidays_billable": True, "weekoff_billable": True,
+        "leave_billable": True, "paid_leaves": 12,
+    })
+    assert float(days) == 365
+
+    # Add-back cap: paid can never exceed what leave deducted.
+    days, _ = calculate_billing_bases({**BASE, "paid_leaves": 99})
+    assert float(days) == 251
 
 
 @pytest.mark.parametrize(

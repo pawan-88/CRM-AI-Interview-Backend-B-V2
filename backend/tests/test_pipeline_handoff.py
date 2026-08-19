@@ -76,32 +76,34 @@ def test_the_notified_role_owns_the_stage_it_is_notified_about():
 
 # ------------------------------------------------------------ Sales visibility
 
-def test_sales_does_not_see_work_still_with_ta_or_rmg():
-    visible = visible_statuses_for(FakeUser(["Sales"]))
-    assert visible is not None
-    for hidden in (PS.SOURCING.value, PS.TECHNICAL_SCREENING.value, PS.RMG_REVIEW.value):
-        assert hidden not in visible, hidden
+def test_every_role_sees_the_whole_pipeline():
+    """18 Aug 2026 (user decision): the profile list is no longer scoped.
+
+    Sales used to see only Sales_Screening onward, so a candidate TA had just
+    applied (Sourcing) was invisible to them — it read as the record being
+    lost. _SALES_VISIBLE stays as the documented definition of the stages
+    Sales OWNS (the filter chips use it); it just no longer hides rows.
+    """
+    for role in ("Sales", "Sales_Head", "TA", "RMG", "HR", "Finance"):
+        assert visible_statuses_for(FakeUser([role])) is None, role
 
 
-def test_sales_sees_everything_from_the_handoff_onward():
-    visible = visible_statuses_for(FakeUser(["Sales"]))
+def test_early_stages_are_visible_to_sales():
+    """The regression that prompted the change: a TA-applied candidate."""
+    assert visible_statuses_for(FakeUser(["Sales"])) is None
+    for stage in (PS.SOURCING.value, PS.TECHNICAL_SCREENING.value, PS.RMG_REVIEW.value):
+        assert stage not in (visible_statuses_for(FakeUser(["Sales"])) or set())
+
+
+def test_sales_stage_set_still_documents_what_sales_owns():
+    """Kept for the filter chips — and so restoring the scope stays one line."""
+    from services.candidate_profiles import _SALES_VISIBLE
+
     for shown in (PS.SALES_SCREENING.value, PS.CUSTOMER_SCREENING.value,
                   PS.CUSTOMER_INTERVIEW.value, PS.SHORTLISTED.value,
-                  PS.CUSTOMER_APPROVAL.value, PS.JOINED.value):
-        assert shown in visible, shown
-
-
-def test_sales_keeps_sight_of_its_own_rejections():
-    """A rejection must not vanish from the person who made it."""
-    visible = visible_statuses_for(FakeUser(["Sales"]))
-    assert PS.SALES_REJECTED.value in visible
-    assert PS.CUSTOMER_REJECTED.value in visible
-    # RMG's rejections are not Sales's business — they never reached Sales.
-    assert PS.RMG_REJECTED.value not in visible
-
-
-def test_sales_head_sees_the_same_as_sales():
-    assert visible_statuses_for(FakeUser(["Sales_Head"])) == visible_statuses_for(FakeUser(["Sales"]))
+                  PS.CUSTOMER_APPROVAL.value, PS.JOINED.value,
+                  PS.SALES_REJECTED.value, PS.CUSTOMER_REJECTED.value):
+        assert shown in _SALES_VISIBLE, shown
 
 
 def test_ta_and_rmg_are_unrestricted():
@@ -119,8 +121,8 @@ def test_a_second_unscoped_role_lifts_the_restriction():
     assert visible_statuses_for(FakeUser(["Sales", "RMG"])) is None
 
 
-def test_only_sales_roles_are_scoped():
-    assert set(PROFILE_VISIBILITY) == {"Sales", "Sales_Head"}
+def test_no_role_is_scoped_any_more():
+    assert PROFILE_VISIBILITY == {}
 
 
 def test_no_roles_at_all_is_not_treated_as_a_scope():

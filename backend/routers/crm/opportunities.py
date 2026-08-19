@@ -123,7 +123,7 @@ def _spawn_requirement_from_opportunity(db: Session, opp: Opportunity, approver:
                 f"Requirement {req.req_number} pending engineering review",
                 f"'{req.title}' (from opportunity {opp.opp_id}) needs engineering review.",
                 f"/requirements/{req.id}", exclude_user_id=approver.id,
-                event="opportunity.approved")
+                event="opportunity.approved", actor=approver)
     return req
 
 
@@ -136,6 +136,8 @@ def list_opportunities(
     pipeline_stage: str | None = None,
     approval_status: str | None = None,
     customer_id: int | None = None,
+    #: Branch hub (18 Aug 2026) — deals belonging to ONE customer branch.
+    branch_id: int | None = None,
     opp_type: str | None = None,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
@@ -143,11 +145,16 @@ def list_opportunities(
 ):
     stmt = select(Opportunity)
     if pipeline_stage:
+        # CSV accepted (18 Aug 2026) so the list's "All stages" default can ask
+        # for the tab's stages in ONE query and keep server-side pagination.
+        wanted = [s.strip() for s in pipeline_stage.split(",") if s.strip()]
         valid = {s.value for s in PipelineStage}
-        if pipeline_stage not in valid:
+        bad = [s for s in wanted if s not in valid]
+        if bad:
             raise HTTPException(status_code=400,
                                 detail=f"Invalid pipeline_stage. Allowed: {', '.join(s.value for s in PipelineStage)}")
-        stmt = stmt.where(Opportunity.pipeline_stage == pipeline_stage)
+        if wanted:
+            stmt = stmt.where(Opportunity.pipeline_stage.in_(wanted))
     if approval_status:
         valid_appr = {s.value for s in OpportunityApprovalStatus}
         if approval_status not in valid_appr:
@@ -156,6 +163,8 @@ def list_opportunities(
         stmt = stmt.where(Opportunity.approval_status == approval_status)
     if customer_id is not None:
         stmt = stmt.where(Opportunity.customer_id == customer_id)
+    if branch_id is not None:
+        stmt = stmt.where(Opportunity.branch_id == branch_id)
     if opp_type:
         # "SOW" = everything that is NOT T&M (Work Package / Fixed Price /
         # Retainer) — the Pipeline T&M / Pipeline SOW workspace split.
@@ -217,7 +226,25 @@ def _existing_ctc_rows(db: Session, opportunity_id: int) -> list[dict]:
 # to a person, a field and both values. Purely descriptive — the log write
 # already existed; only the comment got richer.
 
+def _validated_opp_id(db: Session, raw: str | None,
+                      exclude_id: int | None = None) -> str | None:
+    """Custom opportunity IDs (18 Aug 2026): auto-numbered by default, but the
+    user may type their own — the customer's reference often IS the ID people
+    search by. Uniqueness is the only hard rule; format is theirs to choose."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    q = select(Opportunity.id).where(Opportunity.opp_id == value)
+    if exclude_id is not None:
+        q = q.where(Opportunity.id != exclude_id)
+    if db.execute(q.limit(1)).scalar_one_or_none() is not None:
+        raise HTTPException(status_code=400,
+                            detail=f"Opportunity ID '{value}' is already in use")
+    return value
+
+
 _UPDATE_LABELS = {
+    "opp_id": "Opportunity ID",
     "title": "Title", "customer_id": "Customer", "branch_id": "Branch",
     "contact_person_id": "Contact person", "hiring_manager_id": "Hiring manager",
     "opp_type": "Type", "pipeline_stage": "Pipeline stage",
@@ -284,7 +311,8 @@ def create_opportunity(
     if opp_type_value == "T&M":
         clean_details = normalize_tm_billing_details(clean_details)
     opp = Opportunity(
-        opp_id=next_sequence_number(db, Opportunity, Opportunity.opp_id, "OPP"),
+        opp_id=_validated_opp_id(db, payload.opp_id)
+        or next_sequence_number(db, Opportunity, Opportunity.opp_id, "OPP"),
         title=payload.title.strip(),
         customer_id=payload.customer_id,
         branch_id=payload.branch_id,
@@ -328,10 +356,30 @@ def create_opportunity(
                     f"Opportunity {opp.opp_id} awaiting approval",
                     f"'{opp.title}' was created and needs your approval.",
                     f"/opportunities/{opp.id}", exclude_user_id=user.id,
-                    event="opportunity.submitted")
+                    event="opportunity.submitted", actor=user)
     db.commit()
     db.refresh(opp)
     return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity created")
+
+
+@router.get("/next-id")
+def preview_next_opp_id(
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_opportunities),
+):
+    """The ID the next auto-numbered opportunity would take (18 Aug 2026).
+
+    A PREVIEW for the create form, which shows it instead of an empty box.
+    Not a reservation: if the user leaves it untouched the form drops it and
+    the server numbers the record at save time, so two people creating at
+    once can never collide on the previewed value.
+
+    Declared BEFORE `/{opportunity_id}` — literal routes must precede
+    parametric ones or FastAPI matches "next-id" as an id.
+    """
+    return envelope(data={
+        "opp_id": next_sequence_number(db, Opportunity, Opportunity.opp_id, "OPP"),
+    })
 
 
 @router.get("/{opportunity_id}/suggested-candidates")
@@ -396,6 +444,11 @@ def update_opportunity(
             status_code=409,
             detail="This opportunity was changed by someone else. Reload and re-apply your edits.",
         )
+
+    # Custom-ID edit: blank means "keep as is"; a new value must be unused.
+    if "opp_id" in changes:
+        changes["opp_id"] = _validated_opp_id(
+            db, changes["opp_id"], exclude_id=opp.id) or opp.opp_id
 
     # Audit snapshots BEFORE any mutation — the log compares against these.
     audit_top_old = {f: getattr(opp, f) for f in changes
@@ -546,6 +599,19 @@ def approve_opportunity(
     opp.sales_head_approved_at = _now()
     opp.approval_rejection_reason = None
     comment = (payload.comment if payload else None) or None
+    # NN customers (18 Aug 2026): a brand-new-relationship deal isn't won on
+    # approval — it enters BIDDING. Sales Head's approve moves an NN
+    # opportunity's onboarding status to "Sales Bidding" automatically
+    # (reject stays reject). The deal's own customer_type detail wins; the
+    # customer master is the fallback.
+    ctype = str((opp.details or {}).get("customer_type") or "").strip().upper()
+    if not ctype:
+        from models import Customer
+        cust = db.get(Customer, opp.customer_id)
+        ctype = str(getattr(cust, "customer_type", "") or "").strip().upper()
+    if ctype == "NN":
+        opp.onboarding_status = "Sales Bidding"
+        comment = (comment + " — " if comment else "") + "NN customer → moved to Sales Bidding"
     log_activity(db, OpportunityActivityLog, "opportunity_id", opp.id, user.id,
                  "Approved", comment or "Approved by Sales Head")
     # Bridge into the Requirements chain → RMG (Engineering Review) → TA.
@@ -555,7 +621,7 @@ def approve_opportunity(
                     f"Opportunity {opp.opp_id} approved",
                     "Approved by Sales Head; sent to engineering review."
                     if spawned else "Approved by Sales Head.",
-                    f"/opportunities/{opp.id}")
+                    f"/opportunities/{opp.id}", actor=user)
     db.commit()
     db.refresh(opp)
     return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity approved")
@@ -581,7 +647,7 @@ def reject_opportunity(
     if opp.created_by != user.id:
         notify_user(db, opp.created_by,
                     f"Opportunity {opp.opp_id} rejected by Sales Head",
-                    reason, f"/opportunities/{opp.id}")
+                    reason, f"/opportunities/{opp.id}", actor=user)
     db.commit()
     db.refresh(opp)
     return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity rejected")
@@ -605,7 +671,7 @@ def resubmit_opportunity(
                 f"Opportunity {opp.opp_id} resubmitted for approval",
                 f"'{opp.title}' was resubmitted and needs your approval.",
                 f"/opportunities/{opp.id}", exclude_user_id=user.id,
-                event="opportunity.submitted")
+                event="opportunity.submitted", actor=user)
     db.commit()
     db.refresh(opp)
     return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity resubmitted for approval")

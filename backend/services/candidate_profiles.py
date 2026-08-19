@@ -164,10 +164,14 @@ _SALES_VISIBLE: set[str] = {
 #: Roles whose profile list is scoped. Any role absent from this map sees
 #: everything — TA and RMG work across the early stages and need the full view,
 #: and Admin/CEO/HR/Finance are unrestricted by design.
-PROFILE_VISIBILITY: dict[str, set[str]] = {
-    "Sales": _SALES_VISIBLE,
-    "Sales_Head": _SALES_VISIBLE,
-}
+#:
+#: EMPTY since 18 Aug 2026 (user decision): every CRM role now sees the whole
+#: pipeline. The Sales scope above meant a candidate TA had just applied (stage
+#: = Sourcing) was invisible to Sales — they could see the opportunity but not
+#: who was being lined up for it, which read as data loss. `_SALES_VISIBLE` is
+#: kept as the documented definition of "the stages Sales owns" (used by the
+#: stage filter chips); re-adding the entries below restores the old scoping.
+PROFILE_VISIBILITY: dict[str, set[str]] = {}
 
 
 def visible_statuses_for(user: CurrentUser) -> set[str] | None:
@@ -363,6 +367,7 @@ def _notify_stage_owner(db: Session, profile: CandidateProfile, previous: str,
             f"/admin?view=crm&p=profiles/{profile.id}",
             # Don't notify the person who just made the change.
             exclude_user_id=user.id,
+            actor=user,
             event="candidate.stage_arrival",
         )
     except Exception:  # pragma: no cover — never break a transition

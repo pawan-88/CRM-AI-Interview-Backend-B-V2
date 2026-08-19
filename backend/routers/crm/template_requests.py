@@ -157,7 +157,7 @@ def create_request(
                 f"Template request {tr.tr_number} for {tr.role_title}",
                 f"TA requested an interview template (exp {tr.experience_level or 'n/a'}). Skills: {tr.skills or 'n/a'}.",
                 f"/template-requests/{tr.id}", exclude_user_id=user.id,
-                event="template_request.created")
+                event="template_request.created", actor=user)
     db.commit()
     db.refresh(tr)
     return envelope(_serialize(db, tr), message=f"Template request {tr.tr_number} raised")
@@ -240,7 +240,7 @@ def fulfill_request(
         notify_user(db, tr.requested_by,
                     f"Template ready for {tr.tr_number}",
                     f"RMG linked template '{tr.template_name}' ({job_id}). Trigger AI L1 when ready.",
-                    f"/template-requests/{tr.id}")
+                    f"/template-requests/{tr.id}", actor=user)
     db.commit()
     db.refresh(tr)
     return envelope(_serialize(db, tr), message="Template linked to opportunity; back to TA")
@@ -267,7 +267,7 @@ def prepare_request(
         notify_user(db, tr.fulfilled_by,
                     f"L1 prepared for {tr.tr_number}",
                     f"TA attached candidate {email} to template '{tr.template_name}'.",
-                    f"/template-requests/{tr.id}")
+                    f"/template-requests/{tr.id}", actor=user)
     db.commit()
     db.refresh(tr)
     return envelope(
