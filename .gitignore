@@ -20,3 +20,6 @@ data/crm_uploads/
 data/*.tmp
 data/question_bank/
 _to_delete/
+# Bulk archives of exported candidate data and rotated logs. Local only -
+# same PII reasoning as logs/openai-prompts/ and data/*.tmp above.
+_archive/
